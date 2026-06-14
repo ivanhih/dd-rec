@@ -139,11 +139,12 @@ def _send_notify(event: str, room_id: str, uname: str, title: str, extra: dict =
         "url": f"https://live.bilibili.com/{room_id}",
         "service_url": notify_url,
         "start_time": now_str,
-        "avatar": "",
-        "cover": "",
+        "avatar": extra.get("face", "") if extra else "",
+        "cover": extra.get("cover", "") if extra else "",
         "error": extra.get("error", "") if extra else "",
     }
 
+    logging.info(f"debug cover_url={repr(liquid_ctx.get("cover",""))}")
     default_titles = {"recording_started": "\U0001f534 \u5f00\u59cb\u5f55\u5236", "recording_stopped": "\u23f9\ufe0f \u5f55\u5236\u7ed3\u675f", "error": "\u26a0\ufe0f \u5f55\u5236\u51fa\u9519"}
     default_bodies = {"recording_started": "{uname} \u5f00\u59cb\u76f4\u64ad\uff1a{title}", "recording_stopped": "{uname} \u5df2\u4e0b\u64ad\uff0c\u5f55\u5236\u7ed3\u675f", "error": "{uname}\uff08\u623f\u95f4 {room_id}\uff09\u5f55\u5236\u51fa\u9519"}
 
@@ -768,5 +769,5 @@ class BiliRecorder(QObject):
                 self._live_first_seen = 0.0   # 下播，重置 debounce
                 time.sleep(_parse_monitor_seconds("monitor_interval", 20))
 
-        self.current_cover = room_info.get("cover", "")
-        self.current_face = room_info.get("face", "")
+        self.current_cover = self.room_info.get("cover", "")
+        self.current_face = self.room_info.get("face", "")

@@ -1,5 +1,6 @@
 # ui/settings_dialog.py
 import threading
+import logging
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, 
     QComboBox, QPushButton, QCheckBox, QScrollArea, QFrame,
@@ -638,6 +639,10 @@ class GlobalSettingsOldStyleReplicaPage(QWidget):
         content_layout.addWidget(right_wrap, 1)
         scroll.setWidget(content)
         root.addWidget(scroll, 1)
+
+    # 通知模板默认值
+    # Template defaults are now in config.py
+    # Template defaults are now in config.py
 
     def _setting_card(self, title_text, color, items):
         card = QFrame()
@@ -1386,12 +1391,103 @@ class GlobalSettingsOldStyleReplicaPage(QWidget):
             self._setting_item("直播时段", "仅在指定时段录制（格式: 08:00-23:00，留空不限）", self._line_edit("condition_time_range", "如: 08:00-23:00", 140)),
         ])
 
+    def _update_template_summary(self, key):
+        if not hasattr(self, "_template_summary_labels"):
+            return
+        label = self._template_summary_labels.get(key)
+        if not label:
+            return
+        value = (get_global_setting(key) or "").strip()
+        if not value:
+            label.setText("(未设置)")
+            label.setStyleSheet("color: #64748B; font-size: 12px;")
+        else:
+            first_line = value.split("\n")[0][:60]
+            display = first_line + ("..." if len(first_line) >= 60 else "")
+            label.setText(display)
+            label.setStyleSheet("color: #E2E8F0; font-size: 12px;")
+
+    def _build_notify_template_item(self, key):
+        wrapper = QWidget()
+        layout = QHBoxLayout(wrapper)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(8)
+        summary = QLabel("(未设置)")
+        summary.setStyleSheet("color: #64748B; font-size: 12px;")
+        edit_btn = QPushButton("\u25b6")
+        edit_btn.setFixedSize(32, 32)
+        edit_btn.setToolTip("编辑模板")
+        edit_btn.setStyleSheet("""QPushButton { background: transparent; border: none; color: #94A3B8; font-size: 14px; } QPushButton:hover { color: #3B82F6; }""")
+        if not hasattr(self, "_template_summary_labels"):
+            self._template_summary_labels = {}
+        self._template_summary_labels[key] = summary
+        self._update_template_summary(key)
+        edit_btn.clicked.connect(lambda checked=False, k=key: self._open_notify_template_overlay(k, "编辑"))
+        layout.addWidget(summary, 1)
+        layout.addWidget(edit_btn)
+        return wrapper
+
+    def _open_notify_template_overlay(self, key, window_title):
+        root = self
+        while root.parent() and not isinstance(root.parent(), QScrollArea):
+            root = root.parent()
+        mask = QWidget(root)
+        mask.setStyleSheet("background: rgba(0,0,0,0.6);")
+        mask.resize(root.size())
+        mask.move(0, 0)
+        mask.show()
+        mask.raise_()
+        panel = QFrame(root)
+        panel.setObjectName("notifyTemplatePanel")
+        panel.setFixedSize(680, 480)
+        panel.setStyleSheet('''QFrame#notifyTemplatePanel { background: #1A1B21; border: 1px solid #2D2E3A; border-radius: 14px; } QLabel { background: transparent; }''')
+        cx = (root.width() - panel.width()) // 2
+        cy = (root.height() - panel.height()) // 2
+        panel.move(cx, cy)
+        panel.show()
+        panel.raise_()
+        vbox = QVBoxLayout(panel)
+        vbox.setContentsMargins(24, 20, 24, 20)
+        vbox.setSpacing(14)
+        title = QLabel("编辑" + window_title)
+        title.setStyleSheet("color: #E2E8F0; font-size: 16px; font-weight: 600;")
+        vbox.addWidget(title)
+        editor = QTextEdit()
+        val = str(get_global_setting(key) or "")
+        logging.info(f"TPL_OVERLAY key={key} len={len(val)}")
+        editor.setPlainText(val)
+        editor.setPlaceholderText("请输入 Liquid 模板...")
+        editor.setStyleSheet('''QTextEdit { background-color: #15161D; border: 1px solid #2D2E3A; border-radius: 10px; padding: 12px; color: #E2E8F0; font-size: 12px; } QTextEdit:focus { border: 1px solid #3B82F6; }''')
+        vbox.addWidget(editor, 1)
+        btn_row = QHBoxLayout()
+        cancel_btn = QPushButton("取消")
+        cancel_btn.setFixedWidth(90)
+        cancel_btn.setFixedHeight(36)
+        cancel_btn.setStyleSheet("QPushButton { background: #2D2E3A; border: none; border-radius: 8px; color: #94A3B8; font-size: 13px; } QPushButton:hover { background: #374151; color: white; }")
+        save_btn = QPushButton("保存")
+        save_btn.setFixedWidth(90)
+        save_btn.setFixedHeight(36)
+        save_btn.setStyleSheet("QPushButton { background: #3B82F6; border: none; border-radius: 8px; color: white; font-size: 13px; font-weight: 600; } QPushButton:hover { background: #2563EB; }")
+        def _close():
+            panel.hide(); panel.deleteLater()
+            mask.hide(); mask.deleteLater()
+        def _save():
+            self._save_setting(key, editor.toPlainText())
+            self._update_template_summary(key)
+            _close()
+        cancel_btn.clicked.connect(_close)
+        save_btn.clicked.connect(_save)
+        btn_row.addStretch()
+        btn_row.addWidget(cancel_btn)
+        btn_row.addWidget(save_btn)
+        vbox.addLayout(btn_row)
+
     def _build_notify_card(self):
         return self._setting_card("🔔 通知", "#56CCF2", [
             self._setting_item("启用通知", "开播/下播/错误时发送通知", self._check("notify_enabled")),
             self._setting_item("通知地址", "通知服务的 Webhook 地址", self._line_edit("notify_url", "https://...", 220)),
-            self._setting_item("标题模板", "通知标题的模板（{uname}, {room_id}, {title}, {time}）", self._line_edit("notify_title_template", "{uname} 开播了", 200)),
-            self._setting_item("正文模板", "通知正文的模板（{uname}, {room_id}, {title}, {time}）", self._line_edit("notify_body_template", "{title}", 200)),
+                        self._setting_item("标题模板", "通知标题的模板（{uname}, {room_id}, {title}, {time}）", self._build_notify_template_item("notify_title_template")),
+                        self._setting_item("正文模板", "通知正文的模板（{uname}, {room_id}, {title}, {time}）", self._build_notify_template_item("notify_body_template")),
             self._setting_item("直播结束通知", "直播结束时发送通知", self._check("notify_on_live_end")),
             self._setting_item("错误通知", "发生录制错误时发送通知", self._check("notify_on_error")),
         ])
