@@ -1,0 +1,67 @@
+{
+    "channels": [
+        {
+            "room_id": "23259710",
+            "uname": "小紫才没有摸鱼",
+            "title": "鼻炎小妹今天还淋雨了！先来杂杂的谈再说！",
+            "enabled": false,
+            "face": "https://i0.hdslb.com/bfs/face/e880352f68dc5d589d841bc618cfaeb7a3f4e3d5.jpg",
+            "parent_area_name": "手游",
+            "area_name": "绝区零"
+        },
+        {
+            "room_id": "23121424",
+            "uname": "企鹅带带北极熊",
+            "title": "狗熊：方舟莱塔尼亚线",
+            "enabled": false,
+            "face": "https://i0.hdslb.com/bfs/face/f74ed16ba54d227abe8127cd53f52b3a19940716.jpg",
+            "parent_area_name": "手游",
+            "area_name": "明日方舟"
+        },
+        {
+            "room_id": "3044248",
+            "uname": "魔法Zc目录",
+            "title": "【Zc】十点看EDG比赛！",
+            "enabled": false,
+            "face": "https://i0.hdslb.com/bfs/face/a84fa10f90f7060d0336384954ee1cde7a8e9bc6.jpg",
+            "parent_area_name": "手游",
+            "area_name": "明日方舟"
+        },
+        {
+            "room_id": "1016",
+            "uname": "神奇陆夫人",
+            "title": "《根本没有游戏》新作《时空迷踪》！",
+            "enabled": false,
+            "face": "https://i0.hdslb.com/bfs/face/ea80f09f64b66a0fa97646043a49f6c2f294d855.jpg",
+            "parent_area_name": "单机游戏",
+            "area_name": "独立游戏"
+        },
+        {
+            "room_id": "23459804",
+            "uname": "自由魂儿儿儿",
+            "title": "勇哥时间！",
+            "enabled": false,
+            "face": "https://i2.hdslb.com/bfs/face/77143d096edccfe3bdb6606b7ca743f59ae7b5e7.jpg",
+            "parent_area_name": "手游",
+            "area_name": "洛克王国：世界"
+        },
+        {
+            "room_id": "22637261",
+            "uname": "嘉然今天吃什么",
+            "title": "【突击】亚当重锤挑战赛！！！",
+            "enabled": false,
+            "face": "https://i2.hdslb.com/bfs/face/619f378852ebac9fdf87e20418d6f99bfa750c7f.jpg",
+            "parent_area_name": "手游",
+            "area_name": "鸣潮"
+        },
+        {
+            "room_id": "1856171886",
+            "uname": "_黑羽翎_",
+            "title": "周末懒鸦上线",
+            "enabled": false,
+            "face": "https://i1.hdslb.com/bfs/face/55bbd5ae7bc83d987ad554c3d51977d0bfe302ba.jpg",
+            "parent_area_name": "虚拟主播",
+            "area_name": "虚拟Gamer"
+        }
+    ]
+}

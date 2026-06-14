@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg
+*.egg-info/
+dist/
+build/
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# PyCharm
+.idea/
+
+# Logs & debug
+*.log
+debug.log
+dlog.txt
+
+# Misc
+*.bak
+Thumbs.db
+.DS_Store
+
+# ffmpeg binaries
+ffmpeg.exe
+ffmpeg
+ffprobe.exe
+ffprobe
+
+# Recorded files
+录播文件/

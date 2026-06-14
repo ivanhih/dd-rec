@@ -1,0 +1,96 @@
+{
+    "global_settings": {
+        "language": "简体中文",
+        "theme": "深色",
+        "split_by_size": "",
+        "split_by_duration": "01:00:00",
+        "split_on_codec_change": false,
+        "split_on_stream_discontinuity": false,
+        "split_on_title_change": false,
+        "split_on_category_change": false,
+        "proxy": "",
+        "proxy_mode": "自定义",
+        "proxy_bypass": "",
+        "stream_record_enabled": true,
+        "allow_audio_only": false,
+        "auto_switch_stream": false,
+        "stream_priority_param": "网址",
+        "stream_resolution": "高清",
+        "stream_fps": "30 fps",
+        "stream_bitrate": "30.0 Mb/s",
+        "stream_codec": "av1",
+        "stream_format": "fmp4",
+        "stream_url_priority": "",
+        "chat_record_enabled": true,
+        "chat_credential": "",
+        "chat_format": "xml",
+        "schedule_timezone": "UTC",
+        "schedule_start": "",
+        "schedule_stop": "",
+        "webhooks": "",
+        "advanced_parsing": false,
+        "save_dir": "C:/Users/user/PycharmProjects/bilirec/录播文件",
+        "path_template": "{%- if out_dir != '' -%}\n{{ out_dir }}\n{%- else -%}\n{{ download_dir }}\n{%- endif -%}\n{%- if user_name != '' and user_name != channel -%}\n/{{ channel }}-{{ user_name }}\n{%- else -%}\n/{{ channel }}\n{%- endif -%}\n/{{ ctime | date: '%Y-%m-%d', 'local' }}\n{%- if platform != 'unknown' -%}\n/{{ platform }}-{{ channel }}\n{%- else -%}\n/{{ channel }}\n{%- endif -%}\n{%- if user_name != '' and user_name != channel -%}\n-{{ user_name }}\n{%- endif -%}\n{%- if title != '' -%}\n-{{ title | truncate: 40 }}\n{%- endif -%}\n-{{ ctime | date: '%Y-%m-%d-%H%M%S-%3f', 'local' }}.{{ format }}",
+        "convert_enabled": true,
+        "convert_delete_source": true,
+        "convert_format": "mp4",
+        "monitor_delay": "自动",
+        "monitor_interval": "自动",
+        "monitor_concurrency": "自动",
+        "monitor_debounce": "5 分钟",
+        "monitor_proxy": "",
+        "download_cover": true,
+        "condition_title": "",
+        "condition_category": "",
+        "condition_time_range": "",
+        "notify_enabled": false,
+        "notify_url": "",
+        "notify_title_template": "",
+        "notify_body_template": "",
+        "notify_on_live_end": false,
+        "notify_on_error": false,
+        "auto_start": true,
+        "prevent_sleep": true
+    },
+    "global": {
+        "default_save_dir": "C:\\Users\\user\\PycharmProjects\\bilirec\\录播文件"
+    },
+    "rooms": {
+        "23459804": {
+            "sessdata": "",
+            "format": "",
+            "quality": 10000,
+            "custom_dir": ""
+        },
+        "3044248": {
+            "sessdata": "",
+            "format": "",
+            "quality": 10000,
+            "custom_dir": ""
+        },
+        "23259710": {
+            "sessdata": "",
+            "format": "",
+            "quality": 10000,
+            "custom_dir": ""
+        },
+        "23121424": {
+            "sessdata": "",
+            "format": "",
+            "quality": 10000,
+            "custom_dir": ""
+        },
+        "1016": {
+            "sessdata": "",
+            "format": "",
+            "quality": 10000,
+            "custom_dir": ""
+        },
+        "1856171886": {
+            "sessdata": "",
+            "format": "",
+            "quality": 10000,
+            "custom_dir": ""
+        }
+    }
+}
