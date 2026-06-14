@@ -113,8 +113,8 @@ DEFAULT_GLOBAL_SETTINGS = {
     "notify_url": "",
     "notify_title_template": "",
     "notify_body_template": "",
-    "notify_on_live_end": False,
-    "notify_on_error": False,
+    "notify_on_live_end": True,
+    "notify_on_error": True,
 
     # 系统
     "auto_start": True,

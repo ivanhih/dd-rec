@@ -1,8 +1,9 @@
-# core/bili_api.py
+﻿# core/bili_api.py
 import re
 import logging
 from curl_cffi import requests
 from .config import get_headers, get_global_setting, get_room_config, get_effective_format
+
 
 
 def extract_room_id(url_or_id):
@@ -45,12 +46,15 @@ def get_bili_info(url_or_id, room_id_for_cookie=None, silent=False):
         title = "未知标题"
         parent_area_name = "未知分区"
         area_name = "未知内容"
+        cover = ""
 
         if res_info.get("code") == 0:
             data = res_info.get("data", {})
             title = data.get("title", "未知标题")
             parent_area_name = data.get("parent_area_name", "未知分区")
             area_name = data.get("area_name", "未知内容")
+            # user_cover 是主播设置的直播间封面，优先使用；keyframe 是实时截帧作备选
+            cover = (data.get("user_cover") or data.get("keyframe") or "").strip()
 
         # anchor info
         res_anchor = requests.get(
@@ -64,7 +68,6 @@ def get_bili_info(url_or_id, room_id_for_cookie=None, silent=False):
         if res_anchor.get("code") == 0:
             uname = res_anchor.get("data", {}).get("info", {}).get("uname", uname)
             face = res_anchor.get("data", {}).get("info", {}).get("face", "")
-            # 清理头像链接，去掉反引号和空格
             if face:
                 face = face.strip().strip('`').strip('"').strip("'")
 
@@ -78,7 +81,8 @@ def get_bili_info(url_or_id, room_id_for_cookie=None, silent=False):
             "live_status": live_status,
             "parent_area_name": parent_area_name,
             "area_name": area_name,
-            "face": face
+            "face": face,
+            "cover": cover
         }
     except Exception as e:
         if not silent:

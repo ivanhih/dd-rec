@@ -1390,8 +1390,8 @@ class GlobalSettingsOldStyleReplicaPage(QWidget):
         return self._setting_card("🔔 通知", "#56CCF2", [
             self._setting_item("启用通知", "开播/下播/错误时发送通知", self._check("notify_enabled")),
             self._setting_item("通知地址", "通知服务的 Webhook 地址", self._line_edit("notify_url", "https://...", 220)),
-            self._setting_item("标题模板", "通知标题的 Liquid 模板", self._line_edit("notify_title_template", "{{ uname }} 开播了", 200)),
-            self._setting_item("正文模板", "通知正文的 Liquid 模板", self._line_edit("notify_body_template", "{{ title }}", 200)),
+            self._setting_item("标题模板", "通知标题的模板（{uname}, {room_id}, {title}, {time}）", self._line_edit("notify_title_template", "{uname} 开播了", 200)),
+            self._setting_item("正文模板", "通知正文的模板（{uname}, {room_id}, {title}, {time}）", self._line_edit("notify_body_template", "{title}", 200)),
             self._setting_item("直播结束通知", "直播结束时发送通知", self._check("notify_on_live_end")),
             self._setting_item("错误通知", "发生录制错误时发送通知", self._check("notify_on_error")),
         ])

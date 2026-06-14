@@ -1,4 +1,4 @@
-﻿# core/recorder.py
+# core/recorder.py
 import time
 import datetime
 import threading
@@ -109,6 +109,87 @@ def _send_webhooks(event: str, room_id: str, uname: str, title: str, extra: dict
     threading.Thread(target=_fire, daemon=True).start()
 
 
+def _send_notify(event: str, room_id: str, uname: str, title: str, extra: dict = None):
+    """使用 apprise 发送推送通知。event: recording_started / recording_stopped / error"""
+    if not get_global_setting("notify_enabled"):
+        return
+    if event == "recording_stopped" and not get_global_setting("notify_on_live_end"):
+        return
+    if event == "error" and not get_global_setting("notify_on_error"):
+        return
+
+    notify_url = (get_global_setting("notify_url") or "").strip()
+    if not notify_url:
+        notify_url = (get_global_setting("webhooks") or "").strip()
+    if not notify_url:
+        return
+
+    # 映射 apprise 模板变量
+    event_map = {"recording_started": "live_start", "recording_stopped": "live_end", "error": "error"}
+    now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    liquid_ctx = {
+        "event": event_map.get(event, event),
+        "platform": "bilibili",
+        "user_name": uname,
+        "channel": room_id,
+        "user_id": room_id,
+        "title": title,
+        "live_id": room_id,
+        "categories": [],
+        "url": f"https://live.bilibili.com/{room_id}",
+        "service_url": notify_url,
+        "start_time": now_str,
+        "avatar": "",
+        "cover": "",
+        "error": extra.get("error", "") if extra else "",
+    }
+
+    default_titles = {"recording_started": "\U0001f534 \u5f00\u59cb\u5f55\u5236", "recording_stopped": "\u23f9\ufe0f \u5f55\u5236\u7ed3\u675f", "error": "\u26a0\ufe0f \u5f55\u5236\u51fa\u9519"}
+    default_bodies = {"recording_started": "{uname} \u5f00\u59cb\u76f4\u64ad\uff1a{title}", "recording_stopped": "{uname} \u5df2\u4e0b\u64ad\uff0c\u5f55\u5236\u7ed3\u675f", "error": "{uname}\uff08\u623f\u95f4 {room_id}\uff09\u5f55\u5236\u51fa\u9519"}
+
+    title_tpl_raw = (get_global_setting("notify_title_template") or "").strip()
+    body_tpl_raw = (get_global_setting("notify_body_template") or "").strip()
+
+    from liquid import Template as LqTpl
+    try:
+        if title_tpl_raw:
+            notify_title = LqTpl(title_tpl_raw).render(**liquid_ctx)
+        else:
+            notify_title = default_titles.get(event, event)
+    except Exception:
+        notify_title = default_titles.get(event, event)
+
+    try:
+        if body_tpl_raw:
+            notify_body = LqTpl(body_tpl_raw).render(**liquid_ctx)
+        else:
+            ctx = {"uname": uname, "room_id": room_id, "title": title, "time": now_str}
+            notify_body = default_bodies.get(event, event).format(**ctx)
+    except Exception:
+        notify_body = default_bodies.get(event, event)
+
+    def _fire():
+        try:
+            import apprise
+            ap = apprise.Apprise()
+            for url in [u.strip() for u in notify_url.splitlines() if u.strip()]:
+                ap.add(url)
+            ap.notify(title=notify_title, body=notify_body)
+            logging.info(f"\U0001f4e3 \u901a\u77e5\u5df2\u53d1\u9001 [{event}] {uname}")
+        except ImportError:
+            logging.info(f"apprise \u672a\u5b89\u88c5\uff0c\u5df2\u964d\u7ea7\u4f7f\u7528 urllib \u53d1\u9001\u901a\u77e5 [{event}] {uname}")
+            payload = {"event": event, "room_id": room_id, "uname": uname, "title": notify_title, "body": notify_body, "time": datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")}
+            body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            for url in [u.strip() for u in notify_url.splitlines() if u.strip()]:
+                try:
+                    req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json; charset=utf-8"}, method="POST")
+                    with urllib.request.urlopen(req, timeout=10) as resp:
+                        logging.debug(f"Notify {url} -> {resp.status}")
+                except Exception as e2:
+                    logging.warning(f"\u901a\u77e5\u53d1\u9001\u5931\u8d25 {url}: {e2}")
+        except Exception as e:
+            logging.warning(f"\u901a\u77e5\u53d1\u9001\u5931\u8d25: {e}")
+    threading.Thread(target=_fire, daemon=True).start()
 def _run_convert(src_path: str):
     """录制结束后将源文件转换为目标格式，可选删除原文件。在后台线程中运行。"""
     if not get_global_setting("convert_enabled"):
@@ -146,6 +227,46 @@ def _run_convert(src_path: str):
                 logging.error(f"❌ 转换失败 (returncode={result.returncode}): {os.path.basename(src_path)}")
         except Exception as e:
             logging.error(f"❌ 转换异常: {e}")
+
+    threading.Thread(target=_do, daemon=True).start()
+
+
+def _parse_monitor_seconds(key: str, default: float) -> float:
+    """将 monitor_* 设置的文字值解析为秒数，无法解析则返回 default。"""
+    raw = (get_global_setting(key) or "").strip()
+    if not raw or raw == "自动":
+        return default
+    # 匹配 "30 秒" / "1 分钟" / "5 分钟" 等格式
+    import re as _re
+    m = _re.match(r"^(\d+(?:\.\d+)?)\s*(秒|分钟|s|m)?$", raw)
+    if not m:
+        return default
+    val = float(m.group(1))
+    unit = m.group(2) or "秒"
+    if unit in ("分钟", "m"):
+        val *= 60
+    return max(1.0, val)
+
+
+def _download_cover(cover_url: str, save_dir: str, filename_base: str):
+    """后台下载直播封面，保存为 <filename_base>.jpg 到 save_dir。"""
+    if not cover_url or not save_dir:
+        return
+
+    def _do():
+        try:
+            import urllib.request as _req
+            ext = cover_url.rsplit(".", 1)[-1].split("?")[0].lower()
+            if ext not in ("jpg", "jpeg", "png", "webp"):
+                ext = "jpg"
+            dest = os.path.join(save_dir, f"{filename_base}.{ext}")
+            req = _req.Request(cover_url, headers={"User-Agent": "Mozilla/5.0"})
+            with _req.urlopen(req, timeout=15) as resp:
+                with open(dest, "wb") as f:
+                    f.write(resp.read())
+            logging.info(f"🖼️ 封面已保存: {os.path.basename(dest)}")
+        except Exception as e:
+            logging.warning(f"封面下载失败: {e}")
 
     threading.Thread(target=_do, daemon=True).start()
 
@@ -556,11 +677,13 @@ class BiliRecorder(QObject):
             self.current_parent_area = info["parent_area_name"]
             self.current_area = info["area_name"]
 
+            self.current_cover = info.get("cover", "")
+            self.current_face = info.get("face", "")
             if not self._check_record_conditions(info):
                 self.status_updated.emit("🟢 监控中", "📡 直播中", "⏸️ 条件过滤",
                                         self.current_title, "", "", "",
                                         self.current_parent_area, self.current_area)
-                time.sleep(20)
+                time.sleep(_parse_monitor_seconds("monitor_interval", 20))
                 continue
 
             if info["live_status"] == 1:
@@ -615,14 +738,23 @@ class BiliRecorder(QObject):
                     _send_webhooks("recording_started", self.room_id, self.uname, self.current_title,
                                    {"file": os.path.basename(save_path)})
 
+                    _send_notify("recording_started", self.room_id, self.uname, self.current_title, {"cover": info.get("cover", ""), "face": info.get("face", "")})
+
+                    # 下载直播封面
+                    if get_global_setting("download_cover"):
+                        _cover_url = info.get("cover", "")
+                        _cover_dir = os.path.dirname(save_path)
+                        _cover_base = os.path.splitext(os.path.basename(save_path))[0]
+                        _download_cover(_cover_url, _cover_dir, _cover_base)
                     self.status_updated.emit("🟢 监控中", "📡 直播中", "🔴 录制中",
                                             self.current_title, "00:00:00", "0 B/s", "0 B",
                                             self.current_parent_area, self.current_area)
-                    time.sleep(3)
+                    time.sleep(_parse_monitor_seconds("monitor_delay", 3))
                 else:
                     self.status_updated.emit("🟢 监控中", "📡 直播中", "❌ 出错了",
                                             self.current_title, "", "", "",
                                             self.current_parent_area, self.current_area)
+                    _send_notify("error", self.room_id, self.uname, self.current_title, {"cover": self.current_cover, "face": self.current_face})
                     time.sleep(5)
             else:
                 self.status_updated.emit("🟢 监控中", "🌙 未开播", "⏳ 闲置中",
@@ -631,5 +763,10 @@ class BiliRecorder(QObject):
                 if self.is_recording:
                     _send_webhooks("recording_stopped", self.room_id, self.uname, self.current_title,
                                    {"file": os.path.basename(self.current_save_path) if self.current_save_path else ""})
+                    _send_notify("recording_stopped", self.room_id, self.uname, self.current_title, {"cover": self.current_cover, "face": self.current_face})
                 self.stop_recording(reset_time=True)
-                time.sleep(20)
+                self._live_first_seen = 0.0   # 下播，重置 debounce
+                time.sleep(_parse_monitor_seconds("monitor_interval", 20))
+
+        self.current_cover = room_info.get("cover", "")
+        self.current_face = room_info.get("face", "")
