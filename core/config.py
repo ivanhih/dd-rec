@@ -58,6 +58,7 @@ DEFAULT_GLOBAL_SETTINGS = {
 
     # 自动化
     "webhooks": "",
+    "webhook_format": "blrec",
 
     # 解析
     "advanced_parsing": False,

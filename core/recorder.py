@@ -9,6 +9,7 @@ import platform
 import re
 import json
 import urllib.request
+import uuid
 from typing import Optional
 from PySide6.QtCore import QObject, Signal, QThread
 
@@ -70,8 +71,7 @@ def _build_save_path(room_id, uname, title, now_dt):
 
 def _send_webhooks(event: str, room_id: str, uname: str, title: str, extra: dict = None):
     """Fire-and-forget POST to each configured webhook URL.
-
-    Payload JSON keys: event, room_id, uname, title, time (UTC ISO-8601), plus any extra fields.
+    When webhook_format is 'blrec', payload matches BililiveRecorder v2 format.
     """
     raw = (get_global_setting("webhooks") or "").strip()
     if not raw:
@@ -80,15 +80,48 @@ def _send_webhooks(event: str, room_id: str, uname: str, title: str, extra: dict
     if not urls:
         return
 
-    payload = {
-        "event": event,
-        "room_id": room_id,
-        "uname": uname,
-        "title": title,
-        "time": datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
-    }
-    if extra:
-        payload.update(extra)
+    fmt = (get_global_setting("webhook_format") or "blrec").strip()
+
+    if fmt == "blrec":
+        # BililiveRecorder Webhook v2 payload
+        evt_map = {
+            "recording_started": "StreamStarted",
+            "recording_stopped": "SessionEnded",
+            "recording_split": "FileClosed",
+        }
+        payload = {
+            "EventType": evt_map.get(event, event),
+            "EventTimestamp": datetime.datetime.now().astimezone().isoformat(timespec="microseconds"),
+            "EventId": str(uuid.uuid4()),
+            "EventData": {
+                "SessionId": str(uuid.uuid4()),
+                "RoomId": int(room_id),
+                "ShortId": 0,
+                "Name": uname,
+                "Title": title,
+                "AreaNameParent": "",
+                "AreaNameChild": "",
+                "Recording": event == "recording_started" or event == "recording_split",
+                "Streaming": event == "recording_started",
+                "DanmakuConnected": True,
+            },
+        }
+        if extra and extra.get("file"):
+            payload["EventData"]["RelativePath"] = extra["file"]
+            payload["EventData"]["FileSize"] = 0
+            payload["EventData"]["Duration"] = 0
+            payload["EventData"]["FileOpenTime"] = datetime.datetime.now().astimezone().isoformat(timespec="microseconds")
+            payload["EventData"]["FileCloseTime"] = datetime.datetime.now().astimezone().isoformat(timespec="microseconds")
+    else:
+        payload = {
+            "event": event,
+            "room_id": room_id,
+            "uname": uname,
+            "title": title,
+            "time": datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+        }
+        if extra:
+            payload.update(extra)
 
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
 
@@ -102,13 +135,11 @@ def _send_webhooks(event: str, room_id: str, uname: str, title: str, extra: dict
                     method="POST",
                 )
                 with urllib.request.urlopen(req, timeout=10) as resp:
-                    logging.debug(f"Webhook {url} -> {resp.status}")
+                    logging.info(f"Webhook OK {url} -> {resp.status}")
             except Exception as e:
-                logging.warning(f"Webhook 发送失败 {url}: {e}")
+                logging.warning(f"Webhook fail {url}: {e}")
 
     threading.Thread(target=_fire, daemon=True).start()
-
-
 def _send_notify(event: str, room_id: str, uname: str, title: str, extra: dict = None):
     """使用 apprise 发送推送通知。event: recording_started / recording_stopped / error"""
     if not get_global_setting("notify_enabled"):

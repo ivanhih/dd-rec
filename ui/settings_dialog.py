@@ -9,7 +9,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QFont
 
-from core.config import get_room_config, get_global_setting, get_effective_format, VIDEO_SAVE_DIR, save_config
+from core.config import DEFAULT_GLOBAL_SETTINGS, get_room_config, get_global_setting, get_effective_format, VIDEO_SAVE_DIR, save_config
 from core.config import set_global_setting
 from ui.room_card import ToggleSwitch
 
@@ -1408,23 +1408,67 @@ class GlobalSettingsOldStyleReplicaPage(QWidget):
             label.setStyleSheet("color: #E2E8F0; font-size: 12px;")
 
     def _build_notify_template_item(self, key):
+        reset_btn = QPushButton("重置")
+        reset_btn.setFixedSize(60, 28)
+        reset_btn.setToolTip("重置为默认模板")
+        reset_btn.setStyleSheet("""
+            QPushButton {
+                background: transparent;
+                border: 1px solid #3D3E4A;
+                border-radius: 6px;
+                color: #94A3B8;
+                font-size: 11px;
+                padding: 0 8px;
+            }
+            QPushButton:hover {
+                background: #2D2E3A;
+                color: #F87171;
+                border-color: #F87171;
+            }
+        """)
+        confirm_btn = QPushButton("确认重置")
+        confirm_btn.setFixedSize(60, 28)
+        confirm_btn.setStyleSheet("""
+            QPushButton {
+                background: #EF4444;
+                border: none;
+                border-radius: 6px;
+                color: white;
+                font-size: 11px;
+                padding: 0 8px;
+            }
+            QPushButton:hover {
+                background: #DC2626;
+            }
+        """)
+        confirm_btn.hide()
+        def on_reset():
+            reset_btn.hide()
+            confirm_btn.show()
+        def do_confirm():
+            default_value = DEFAULT_GLOBAL_SETTINGS.get(key, "")
+            self._save_setting(key, default_value)
+            self._update_template_summary(key)
+            confirm_btn.hide()
+            reset_btn.show()
+        reset_btn.clicked.connect(on_reset)
+        confirm_btn.clicked.connect(do_confirm)
         wrapper = QWidget()
         layout = QHBoxLayout(wrapper)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(8)
-        summary = QLabel("(未设置)")
-        summary.setStyleSheet("color: #64748B; font-size: 12px;")
+        if not hasattr(self, "_template_summary_labels"):
+            self._template_summary_labels = {}
+        # No summary label preview - user didn't want template text shown
         edit_btn = QPushButton("\u25b6")
         edit_btn.setFixedSize(32, 32)
         edit_btn.setToolTip("编辑模板")
-        edit_btn.setStyleSheet("""QPushButton { background: transparent; border: none; color: #94A3B8; font-size: 14px; } QPushButton:hover { color: #3B82F6; }""")
-        if not hasattr(self, "_template_summary_labels"):
-            self._template_summary_labels = {}
-        self._template_summary_labels[key] = summary
-        self._update_template_summary(key)
+        edit_btn.setStyleSheet("QPushButton { background: transparent; border: none; color: #94A3B8; font-size: 14px; } QPushButton:hover { color: #3B82F6; }")
         edit_btn.clicked.connect(lambda checked=False, k=key: self._open_notify_template_overlay(k, "编辑"))
-        layout.addWidget(summary, 1)
+        layout.addStretch()
+        layout.addWidget(reset_btn)
         layout.addWidget(edit_btn)
+        layout.addWidget(confirm_btn)
         return wrapper
 
     def _open_notify_template_overlay(self, key, window_title):
