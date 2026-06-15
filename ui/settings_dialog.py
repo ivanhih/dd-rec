@@ -1,4 +1,4 @@
-# ui/settings_dialog.py
+﻿# ui/settings_dialog.py
 import threading
 import logging
 from PySide6.QtWidgets import (
@@ -10,7 +10,7 @@ from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QFont
 
 from core.config import DEFAULT_GLOBAL_SETTINGS, get_room_config, get_global_setting, get_effective_format, VIDEO_SAVE_DIR, save_config
-from core.config import set_global_setting
+from core.config import set_global_setting, get_room_setting, set_room_setting, has_room_override
 from ui.room_card import ToggleSwitch
 
 
@@ -748,10 +748,23 @@ class GlobalSettingsOldStyleReplicaPage(QWidget):
         return wrapper
 
     def _template_editor_button(self, key):
+        wrapper = QWidget()
+        layout = QHBoxLayout(wrapper)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(8)
+        summary = QLabel()
+        summary.setStyleSheet("color: #64748B; font-size: 12px;")
+        if not hasattr(self, "_template_summary_labels"):
+            self._template_summary_labels = {}
+        self._template_summary_labels[key] = summary
+        self._update_template_summary(key)
         button = QPushButton("编辑路径模板")
         button.setFixedWidth(140)
-        button.clicked.connect(lambda: self._open_template_editor_dialog(key))
-        return button
+        button.clicked.connect(lambda: self._open_path_template_overlay(key))
+        layout.addStretch()
+        layout.addWidget(summary)
+        layout.addWidget(button)
+        return wrapper
 
     def _build_appearance_card(self):
         return self._setting_card("外观", "#7B61FF", [
@@ -1553,58 +1566,61 @@ class GlobalSettingsOldStyleReplicaPage(QWidget):
             line_edit.setText(selected)
             self._save_setting(key, selected)
 
-    def _open_template_editor_dialog(self, key):
-        dialog = QDialog(self)
-        dialog.setWindowTitle("编辑路径模板")
-        dialog.setModal(True)
-        dialog.resize(760, 560)
-        dialog.setStyleSheet("""
-            QDialog {
-                background-color: #1A1B21;
-            }
-            QTextEdit {
-                background-color: #15161D;
-                border: 1px solid #2D2E3A;
-                border-radius: 12px;
-                padding: 12px;
-                color: #E2E8F0;
-                font-size: 12px;
-            }
-        """)
-
-        layout = QVBoxLayout(dialog)
-        layout.setContentsMargins(20, 20, 20, 20)
-        layout.setSpacing(16)
-
-        title = QLabel("路径模板")
-        title.setStyleSheet("color: #F8FAFC; font-size: 18px; font-weight: 700;")
+    def _open_path_template_overlay(self, key):
+        root = self
+        while root.parent() and not isinstance(root.parent(), QScrollArea):
+            root = root.parent()
+        mask = QWidget(root)
+        mask.setStyleSheet("background: rgba(0,0,0,0.6);")
+        mask.resize(root.size())
+        mask.move(0, 0)
+        mask.show()
+        mask.raise_()
+        panel = QFrame(root)
+        panel.setObjectName("pathTemplatePanel")
+        panel.setFixedSize(680, 480)
+        panel.setStyleSheet('''QFrame#pathTemplatePanel { background: #1A1B21; border: 1px solid #2D2E3A; border-radius: 14px; } QLabel { background: transparent; }''')
+        cx = (root.width() - panel.width()) // 2
+        cy = (root.height() - panel.height()) // 2
+        panel.move(cx, cy)
+        panel.show()
+        panel.raise_()
+        vbox = QVBoxLayout(panel)
+        vbox.setContentsMargins(24, 20, 24, 20)
+        vbox.setSpacing(14)
+        title = QLabel("编辑路径模板")
+        title.setStyleSheet("color: #E2E8F0; font-size: 16px; font-weight: 600;")
         desc = QLabel("修改 Liquid 路径模板后，点击保存立即生效。")
         desc.setStyleSheet("color: #94A3B8; font-size: 12px;")
-
+        vbox.addWidget(title)
+        vbox.addWidget(desc)
         editor = QTextEdit()
         editor.setPlainText(str(get_global_setting(key) or ""))
         editor.setPlaceholderText("请输入路径模板")
-
-        button_row = QHBoxLayout()
-        button_row.addStretch()
-
+        editor.setStyleSheet('''QTextEdit { background-color: #15161D; border: 1px solid #2D2E3A; border-radius: 10px; padding: 12px; color: #E2E8F0; font-size: 12px; } QTextEdit:focus { border: 1px solid #3B82F6; }''')
+        vbox.addWidget(editor, 1)
+        btn_row = QHBoxLayout()
         cancel_btn = QPushButton("取消")
-        cancel_btn.setFixedWidth(100)
-        cancel_btn.clicked.connect(dialog.reject)
-
+        cancel_btn.setFixedWidth(90)
+        cancel_btn.setFixedHeight(36)
+        cancel_btn.setStyleSheet("QPushButton { background: #2D2E3A; border: none; border-radius: 8px; color: #94A3B8; font-size: 13px; } QPushButton:hover { background: #374151; color: white; }")
         save_btn = QPushButton("保存")
-        save_btn.setObjectName("primaryBtn")
-        save_btn.setFixedWidth(100)
-        save_btn.clicked.connect(lambda: self._save_template_and_close(dialog, key, editor.toPlainText()))
-
-        button_row.addWidget(cancel_btn)
-        button_row.addWidget(save_btn)
-
-        layout.addWidget(title)
-        layout.addWidget(desc)
-        layout.addWidget(editor, 1)
-        layout.addLayout(button_row)
-        dialog.exec()
+        save_btn.setFixedWidth(90)
+        save_btn.setFixedHeight(36)
+        save_btn.setStyleSheet("QPushButton { background: #3B82F6; border: none; border-radius: 8px; color: white; font-size: 13px; font-weight: 600; } QPushButton:hover { background: #2563EB; }")
+        def _close():
+            panel.hide(); panel.deleteLater()
+            mask.hide(); mask.deleteLater()
+        def _save():
+            self._save_setting(key, editor.toPlainText())
+            self._update_template_summary(key)
+            _close()
+        cancel_btn.clicked.connect(_close)
+        save_btn.clicked.connect(_save)
+        btn_row.addStretch()
+        btn_row.addWidget(cancel_btn)
+        btn_row.addWidget(save_btn)
+        vbox.addLayout(btn_row)
 
     def _save_template_and_close(self, dialog, key, value):
         self._save_setting(key, value)
@@ -1658,3 +1674,552 @@ class GlobalSettingsDialog(QDialog):
         self.page = GlobalSettingsPage(self)
         self.page.saved.connect(self.accept)
         layout.addWidget(self.page)
+
+
+# ==================== Per-Room Settings ====================
+
+class RoomSettingsPage(GlobalSettingsOldStyleReplicaPage):
+    """Per-room settings page.
+    
+    Inherits all card-builder helpers from GlobalSettingsOldStyleReplicaPage but:
+    - Shows only the cards relevant to per-room config (no Appearance/Network/Automation/System).
+    - Reads values via get_room_setting (falls back to global).
+    - Writes values via set_room_setting (stores only overrides).
+    - Adds a Cookie card for per-room SESSDATA.
+    - Hides the "????" page header (the overlay has its own top bar).
+    """
+
+    def __init__(self, room_id, uname, parent=None):
+        self.room_id = str(room_id)
+        self.uname = uname
+        self._template_summary_labels = {}   # must exist before super().__init__ calls _build_ui
+        super().__init__(parent)
+
+    # ------------------------------------------------------------------
+    # Override _build_ui: show only per-room relevant cards, no header
+    # ------------------------------------------------------------------
+    def _build_ui(self):
+        self.setStyleSheet("""
+            QWidget { background-color: transparent; color: #E2E8F0; }
+            QFrame#settingsCard {
+                background-color: #1A1B21;
+                border: 1px solid #272833;
+                border-radius: 14px;
+            }
+            QFrame#settingDivider {
+                background-color: #252631;
+                min-height: 1px; max-height: 1px; border: none;
+            }
+            QLabel[role="title"]     { color: #F8FAFC; font-size: 15px; font-weight: 700; }
+            QLabel[role="desc"]      { color: #94A3B8; font-size: 12px; }
+            QLabel[role="itemTitle"] { color: #E2E8F0; font-size: 13px; font-weight: 600; }
+            QLabel[role="itemDesc"]  { color: #94A3B8; font-size: 12px; }
+            QLineEdit, QComboBox, QTextEdit {
+                background-color: #15161D;
+                border: 1px solid #2D2E3A;
+                border-radius: 10px;
+                padding: 8px 10px;
+                color: #E2E8F0;
+                font-size: 13px;
+            }
+            QLineEdit:focus, QComboBox:focus, QTextEdit:focus { border: 1px solid #3B82F6; }
+            QCheckBox { color: #CBD5E1; spacing: 8px; font-size: 13px; }
+            QPushButton {
+                background-color: #252631; color: #E2E8F0;
+                border: none; border-radius: 10px;
+                padding: 9px 14px; font-size: 13px; font-weight: 600;
+            }
+            QPushButton:hover { background-color: #2D2E3A; }
+            QPushButton#primaryBtn { background-color: #3B82F6; color: white; }
+            QPushButton#primaryBtn:hover { background-color: #2563EB; }
+        """)
+
+        self._controls = {}
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setStyleSheet("""
+            QScrollArea { border: none; background: transparent; }
+            QScrollBar:vertical {
+                background-color: #15161D; width: 8px; border-radius: 4px;
+            }
+            QScrollBar::handle:vertical {
+                background-color: #3B3D4F; border-radius: 4px; min-height: 40px;
+            }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0px; }
+        """)
+
+        content = QWidget()
+        content_layout = QHBoxLayout(content)
+        content_layout.setContentsMargins(0, 0, 0, 0)
+        content_layout.setSpacing(20)
+
+        left_col = QVBoxLayout()
+        left_col.setSpacing(18)
+        left_col.addWidget(self._build_file_split_card())
+        left_col.addWidget(self._build_stream_record_card())
+        left_col.addWidget(self._build_chat_record_card())
+        left_col.addWidget(self._build_schedule_card())
+        left_col.addStretch()
+
+        right_col = QVBoxLayout()
+        right_col.setSpacing(18)
+        right_col.addWidget(self._build_cookie_card())
+        right_col.addWidget(self._build_file_location_card())
+        right_col.addWidget(self._build_convert_card())
+        right_col.addWidget(self._build_monitor_card())
+        right_col.addWidget(self._build_cover_card())
+        right_col.addWidget(self._build_conditions_card())
+        right_col.addWidget(self._build_notify_card())
+        right_col.addStretch()
+
+        left_wrap = QWidget()
+        left_wrap.setLayout(left_col)
+        right_wrap = QWidget()
+        right_wrap.setLayout(right_col)
+
+        content_layout.addWidget(left_wrap, 1)
+        content_layout.addWidget(right_wrap, 1)
+        scroll.setWidget(content)
+        root.addWidget(scroll, 1)
+
+    # ------------------------------------------------------------------
+    # Route all reads/writes to per-room config
+    # ------------------------------------------------------------------
+    def _save_setting(self, key, value):
+        set_room_setting(self.room_id, key, value)
+        self.saved.emit(key)
+
+    def _load_values(self):
+        for key, widget in self._controls.items():
+            value = get_room_setting(self.room_id, key)
+            if isinstance(widget, tuple):          # split_by_duration triple
+                h_box, m_box, s_box = widget
+                raw = "" if value is None else str(value)
+                parts = raw.split(":") if raw else []
+                try:
+                    hh = int(parts[0]) if len(parts) > 0 else 1
+                    mm = int(parts[1]) if len(parts) > 1 else 0
+                    ss = int(parts[2]) if len(parts) > 2 else 0
+                except (ValueError, IndexError):
+                    hh, mm, ss = 1, 0, 0
+                h_box.setText(str(hh))
+                m_box.setText(f"{mm:02d}")
+                s_box.setText(f"{ss:02d}")
+            elif key == "split_by_size" and isinstance(widget, QLineEdit):
+                raw = "" if value is None else str(value)
+                widget.setText(raw if raw.isdigit() and int(raw) > 0 else "")
+            elif isinstance(widget, QLineEdit):
+                widget.setText("" if value is None else str(value))
+            elif isinstance(widget, QTextEdit):
+                widget.setPlainText("" if value is None else str(value))
+            elif isinstance(widget, ToggleSwitch):
+                widget.setChecked(bool(value))
+            elif isinstance(widget, QComboBox):
+                text = "" if value is None else str(value)
+                idx = widget.findText(text)
+                if idx >= 0:
+                    widget.setCurrentIndex(idx)
+
+    # ------------------------------------------------------------------
+    # Override template / overlay helpers to use room-scoped values
+    # ------------------------------------------------------------------
+    def _update_template_summary(self, key):
+        if not hasattr(self, "_template_summary_labels"):
+            return
+        label = self._template_summary_labels.get(key)
+        if not label:
+            return
+        value = (get_room_setting(self.room_id, key) or "").strip()
+        if not value:
+            label.setText("(\u672a\u8bbe\u7f6e)")
+            label.setStyleSheet("color: #64748B; font-size: 12px;")
+        else:
+            first_line = value.split("\n")[0][:60]
+            label.setText(first_line + ("..." if len(first_line) >= 60 else ""))
+            label.setStyleSheet("color: #E2E8F0; font-size: 12px;")
+
+    def _open_notify_template_overlay(self, key, window_title):
+        self._open_text_overlay(
+            key,
+            "\u7f16\u8f91" + window_title,
+            "\u8bf7\u8f93\u5165 Liquid \u6a21\u677f...",
+            "notifyTemplatePanel",
+        )
+
+    def _open_path_template_overlay(self, key):
+        self._open_text_overlay(
+            key,
+            "\u7f16\u8f91\u8def\u5f84\u6a21\u677f",
+            "\u8bf7\u8f93\u5165\u8def\u5f84\u6a21\u677f",
+            "pathTemplatePanel",
+            extra_desc="\u4fee\u6539 Liquid \u8def\u5f84\u6a21\u677f\u540e\uff0c\u70b9\u51fb\u4fdd\u5b58\u7acb\u5373\u751f\u6548\u3002",
+        )
+
+    def _open_text_overlay(self, key, title_text, placeholder, obj_name, extra_desc=None):
+        """Generic text-editor overlay for template editing."""
+        root = self
+        while root.parent() and not isinstance(root.parent(), QScrollArea):
+            root = root.parent()
+        mask = QWidget(root)
+        mask.setStyleSheet("background: rgba(0,0,0,0.6);")
+        mask.resize(root.size())
+        mask.move(0, 0)
+        mask.show(); mask.raise_()
+
+        panel = QFrame(root)
+        panel.setObjectName(obj_name)
+        panel.setFixedSize(680, 480)
+        panel.setStyleSheet(
+            f"QFrame#{obj_name} {{ background: #1A1B21; border: 1px solid #2D2E3A; border-radius: 14px; }} "
+            "QLabel { background: transparent; }"
+        )
+        cx = (root.width() - panel.width()) // 2
+        cy = (root.height() - panel.height()) // 2
+        panel.move(cx, cy)
+        panel.show(); panel.raise_()
+
+        vbox = QVBoxLayout(panel)
+        vbox.setContentsMargins(24, 20, 24, 20)
+        vbox.setSpacing(14)
+
+        title_lbl = QLabel(title_text)
+        title_lbl.setStyleSheet("color: #E2E8F0; font-size: 16px; font-weight: 600;")
+        vbox.addWidget(title_lbl)
+        if extra_desc:
+            desc_lbl = QLabel(extra_desc)
+            desc_lbl.setStyleSheet("color: #94A3B8; font-size: 12px;")
+            vbox.addWidget(desc_lbl)
+
+        editor = QTextEdit()
+        editor.setPlainText(str(get_room_setting(self.room_id, key) or ""))
+        editor.setPlaceholderText(placeholder)
+        editor.setStyleSheet(
+            "QTextEdit { background-color: #15161D; border: 1px solid #2D2E3A; border-radius: 10px; "
+            "padding: 12px; color: #E2E8F0; font-size: 12px; } "
+            "QTextEdit:focus { border: 1px solid #3B82F6; }"
+        )
+        vbox.addWidget(editor, 1)
+
+        btn_row = QHBoxLayout()
+        cancel_btn = QPushButton("\u53d6\u6d88")
+        cancel_btn.setFixedWidth(90); cancel_btn.setFixedHeight(36)
+        cancel_btn.setStyleSheet(
+            "QPushButton { background: #2D2E3A; border: none; border-radius: 8px; "
+            "color: #94A3B8; font-size: 13px; } "
+            "QPushButton:hover { background: #374151; color: white; }"
+        )
+        save_btn = QPushButton("\u4fdd\u5b58")
+        save_btn.setFixedWidth(90); save_btn.setFixedHeight(36)
+        save_btn.setStyleSheet(
+            "QPushButton { background: #3B82F6; border: none; border-radius: 8px; "
+            "color: white; font-size: 13px; font-weight: 600; } "
+            "QPushButton:hover { background: #2563EB; }"
+        )
+
+        def _close():
+            panel.hide(); panel.deleteLater()
+            mask.hide(); mask.deleteLater()
+
+        def _save():
+            self._save_setting(key, editor.toPlainText())
+            self._update_template_summary(key)
+            _close()
+
+        cancel_btn.clicked.connect(_close)
+        save_btn.clicked.connect(_save)
+        btn_row.addStretch()
+        btn_row.addWidget(cancel_btn)
+        btn_row.addWidget(save_btn)
+        vbox.addLayout(btn_row)
+
+    def _open_cookie_overlay(self):
+        """Cookie editor writing to room config sessdata field."""
+        root = self
+        while root.parent() and not isinstance(root.parent(), QScrollArea):
+            root = root.parent()
+        mask = QWidget(root)
+        mask.setStyleSheet("background: rgba(0,0,0,0.6);")
+        mask.resize(root.size())
+        mask.move(0, 0)
+        mask.show(); mask.raise_()
+
+        panel = QFrame(root)
+        panel.setObjectName("cookiePanel")
+        panel.setFixedSize(520, 380)
+        panel.setStyleSheet(
+            "QFrame#cookiePanel { background: #1A1B21; border: 1px solid #2D2E3A; border-radius: 14px; } "
+            "QLabel { background: transparent; }"
+        )
+        cx = (root.width() - panel.width()) // 2
+        cy = (root.height() - panel.height()) // 2
+        panel.move(cx, cy)
+        panel.show(); panel.raise_()
+
+        vbox = QVBoxLayout(panel)
+        vbox.setContentsMargins(28, 24, 28, 20)
+        vbox.setSpacing(14)
+
+        title_lbl = QLabel("\u7f16\u8f91 B\u7aef Cookie \u51ed\u8bc1")
+        title_lbl.setStyleSheet("color:#E2E8F0; font-size:16px; font-weight:600;")
+        vbox.addWidget(title_lbl)
+
+        hint_lbl = QLabel("\u8f93\u5165\u4f60\u7684 SESSDATA\uff08\u5728\u6d4f\u89c8\u5668 B\u7aef cookie \u4e2d\u627e\u5230\uff09")
+        hint_lbl.setStyleSheet("color:#64748B; font-size:12px;")
+        vbox.addWidget(hint_lbl)
+
+        inp = QLineEdit()
+        inp.setPlaceholderText("\u7c98\u8d34\u4f60\u7684 SESSDATA \u2026")
+        inp.setEchoMode(QLineEdit.Password)
+        inp.setStyleSheet(
+            "QLineEdit { background:#252631; border:1px solid #2D2E3A; border-radius:8px; "
+            "padding:10px 14px; color:#E2E8F0; font-size:14px; } "
+            "QLineEdit:focus { border:1px solid #3B82F6; }"
+        )
+        from core.config import get_room_config as _grc
+        inp.setText(_grc(self.room_id).get("sessdata", ""))
+
+        show_btn = QPushButton("\u663e\u793a")
+        show_btn.setFixedWidth(52); show_btn.setFixedHeight(36)
+        show_btn.setStyleSheet(
+            "QPushButton { background:#2D2E3A; border:none; border-radius:8px; color:#94A3B8; font-size:12px; } "
+            "QPushButton:hover { background:#374151; color:white; }"
+        )
+        def _toggle_show():
+            if inp.echoMode() == QLineEdit.Password:
+                inp.setEchoMode(QLineEdit.Normal); show_btn.setText("\u9690\u85cf")
+            else:
+                inp.setEchoMode(QLineEdit.Password); show_btn.setText("\u663e\u793a")
+        show_btn.clicked.connect(_toggle_show)
+
+        inp_row = QHBoxLayout()
+        inp_row.setSpacing(6)
+        inp_row.addWidget(inp, 1)
+        inp_row.addWidget(show_btn)
+        vbox.addLayout(inp_row)
+
+        verify_btn = QPushButton("\u9a8c\u8bc1 Cookie")
+        verify_btn.setFixedHeight(36)
+        verify_btn.setStyleSheet(
+            "QPushButton { background:#374151; border:none; border-radius:8px; color:#CBD5E1; font-size:13px; } "
+            "QPushButton:hover { background:#4B5563; }"
+        )
+        vbox.addWidget(verify_btn)
+
+        account_frame = QFrame()
+        account_frame.setStyleSheet("background:#131419; border-radius:8px;")
+        acct_layout = QVBoxLayout(account_frame)
+        acct_layout.setContentsMargins(12, 10, 12, 10)
+        acct_layout.setSpacing(4)
+        acct_name = QLabel("\u2014 \u5c1a\u672a\u9a8c\u8bc1 \u2014")
+        acct_name.setStyleSheet("color:#94A3B8; font-size:13px; background:transparent;")
+        acct_mid = QLabel("")
+        acct_mid.setStyleSheet("color:#64748B; font-size:11px; background:transparent;")
+        acct_layout.addWidget(acct_name)
+        acct_layout.addWidget(acct_mid)
+        vbox.addWidget(account_frame, 1)
+
+        def _verify():
+            sessdata = inp.text().strip()
+            if not sessdata:
+                acct_name.setText("\u274c \u8bf7\u5148\u8f93\u5165 SESSDATA"); acct_mid.setText(""); return
+            verify_btn.setEnabled(False); verify_btn.setText("\u9a8c\u8bc1\u4e2d\u2026")
+            acct_name.setText("\u23f3 \u9a8c\u8bc1\u4e2d\u2026"); acct_mid.setText("")
+            def _do():
+                import urllib.request as _ur, json as _j
+                try:
+                    req = _ur.Request("https://api.bilibili.com/x/web-interface/nav",
+                                      headers={"User-Agent": "Mozilla/5.0",
+                                               "Cookie": f"SESSDATA={sessdata}"})
+                    with _ur.urlopen(req, timeout=10) as resp:
+                        data = _j.loads(resp.read())
+                    if data["code"] == 0 and data["data"]["isLogin"]:
+                        acct_name.setText(f"\u2705 {data['data']['uname']}")
+                        acct_mid.setText(f"UID: {data['data']['mid']}")
+                        acct_name.setStyleSheet("color:#4ADE80; font-size:14px; font-weight:600; background:transparent;")
+                    else:
+                        acct_name.setText("\u274c Cookie \u65e0\u6548\u6216\u5df2\u8fc7\u671f")
+                        acct_name.setStyleSheet("color:#F87171; font-size:13px; background:transparent;")
+                except Exception as e:
+                    acct_name.setText(f"\u274c \u7f51\u7edc\u9519\u8bef: {e}")
+                    acct_name.setStyleSheet("color:#F87171; font-size:13px; background:transparent;")
+                finally:
+                    verify_btn.setEnabled(True); verify_btn.setText("\u9a8c\u8bc1 Cookie")
+            import threading as _t
+            _t.Thread(target=_do, daemon=True).start()
+        verify_btn.clicked.connect(_verify)
+
+        btn_row = QHBoxLayout()
+        cancel_btn = QPushButton("\u53d6\u6d88")
+        cancel_btn.setFixedWidth(90); cancel_btn.setFixedHeight(36)
+        cancel_btn.setStyleSheet(
+            "QPushButton { background:#2D2E3A; border:none; border-radius:8px; color:#94A3B8; font-size:13px; } "
+            "QPushButton:hover { background:#374151; color:white; }"
+        )
+        save_btn2 = QPushButton("\u4fdd\u5b58")
+        save_btn2.setFixedWidth(90); save_btn2.setFixedHeight(36)
+        save_btn2.setStyleSheet(
+            "QPushButton { background:#3B82F6; border:none; border-radius:8px; color:white; "
+            "font-size:13px; font-weight:600; } "
+            "QPushButton:hover { background:#2563EB; }"
+        )
+
+        def _close():
+            panel.hide(); panel.deleteLater()
+            mask.hide(); mask.deleteLater()
+
+        def _save():
+            from core.config import CONFIG as _CFG, save_config as _sc
+            val = inp.text().strip()
+            if self.room_id not in _CFG["rooms"]:
+                _CFG["rooms"][self.room_id] = {
+                    "sessdata": "", "format": "", "quality": 10000,
+                    "custom_dir": "", "overrides": {}
+                }
+            _CFG["rooms"][self.room_id]["sessdata"] = val
+            _sc()
+            if val:
+                masked = val[:6] + "..." + val[-4:] if len(val) > 10 else "\u5df2\u8bbe\u7f6e"
+                self._cred_summary_label.setText(masked)
+            else:
+                self._cred_summary_label.setText("\u672a\u8bbe\u7f6e")
+            _close()
+
+        cancel_btn.clicked.connect(_close)
+        save_btn2.clicked.connect(_save)
+        btn_row.addStretch()
+        btn_row.addWidget(cancel_btn)
+        btn_row.addWidget(save_btn2)
+        vbox.addLayout(btn_row)
+
+    # ------------------------------------------------------------------
+    # Cookie card (new, room-only)
+    # ------------------------------------------------------------------
+    def _build_cookie_card(self):
+        cred_widget = QWidget()
+        cred_row = QHBoxLayout(cred_widget)
+        cred_row.setContentsMargins(0, 0, 0, 0)
+        cred_row.setSpacing(8)
+        from core.config import get_room_config as _grc
+        saved_val = _grc(self.room_id).get("sessdata", "")
+        summary_text = (saved_val[:6] + "..." + saved_val[-4:] if len(saved_val) > 10 else "\u5df2\u8bbe\u7f6e") if saved_val else "\u672a\u8bbe\u7f6e"
+        cred_summary = QLabel(summary_text)
+        cred_summary.setStyleSheet("color: #64748B; font-size: 13px; background: transparent;")
+        self._cred_summary_label = cred_summary
+        edit_btn = QPushButton("\u7f16\u8f91")
+        edit_btn.setFixedWidth(52); edit_btn.setFixedHeight(30)
+        edit_btn.setStyleSheet(
+            "QPushButton { background:#2D2E3A; border:none; border-radius:8px; color:#94A3B8; font-size:12px; } "
+            "QPushButton:hover { background:#3B82F6; color:white; }"
+        )
+        edit_btn.clicked.connect(self._open_cookie_overlay)
+        cred_row.addWidget(cred_summary)
+        cred_row.addStretch()
+        cred_row.addWidget(edit_btn)
+        return self._setting_card("\U0001f511 Cookie \u51ed\u8bc1", "#F59E0B", [
+            self._setting_item(
+                "SESSDATA",
+                "\u8f93\u5165 B\u7ad9 Cookie \u4ee5\u83b7\u53d6\u66f4\u9ad8\u753b\u8d28\u76f4\u64ad\u6d41",
+                cred_widget,
+            ),
+        ])
+
+
+# ------------------------------------------------------------------
+# Overlay entry point called from MainWindow.on_settings
+# ------------------------------------------------------------------
+def open_room_settings_overlay(room_id, uname, main_window):
+    """Open a full-screen overlay on main_window with per-room settings."""
+    from PySide6.QtGui import QFont as _QFont
+
+    overlay = QWidget(main_window)
+    overlay.setStyleSheet("background: rgba(0,0,0,0.72);")
+    overlay.resize(main_window.size())
+    overlay.move(0, 0)
+    overlay.show(); overlay.raise_()
+
+    panel_w = min(main_window.width() - 80, 1340)
+    panel_h = min(main_window.height() - 60, 920)
+    panel = QFrame(main_window)
+    panel.setObjectName("roomSettingsPanel")
+    panel.setFixedSize(panel_w, panel_h)
+    panel.setStyleSheet("""
+        QFrame#roomSettingsPanel {
+            background: #13141A;
+            border: 1px solid #2D2E3A;
+            border-radius: 16px;
+        }
+    """)
+    panel.move(
+        (main_window.width() - panel_w) // 2,
+        (main_window.height() - panel_h) // 2,
+    )
+    panel.show(); panel.raise_()
+
+    outer = QVBoxLayout(panel)
+    outer.setContentsMargins(0, 0, 0, 0)
+    outer.setSpacing(0)
+
+    # ---- top bar ----
+    top_bar = QWidget()
+    top_bar.setFixedHeight(56)
+    top_bar.setStyleSheet(
+        "background: #1A1B21; border-top-left-radius: 16px; border-top-right-radius: 16px; "
+        "border-bottom: 1px solid #272833;"
+    )
+    top_layout = QHBoxLayout(top_bar)
+    top_layout.setContentsMargins(24, 0, 16, 0)
+    top_layout.setSpacing(10)
+
+    icon_lbl = QLabel("\U0001f4f9")
+    icon_lbl.setStyleSheet("color: #3B82F6; font-size: 18px;")
+
+    room_title_lbl = QLabel(f"\u9891\u9053\u8bbe\u7f6e  \u2014  {uname}")
+    room_title_lbl.setFont(_QFont("Microsoft YaHei UI", 14, _QFont.Bold))
+    room_title_lbl.setStyleSheet("color: #F8FAFC;")
+
+    badge_lbl = QLabel(f"Room {room_id}")
+    badge_lbl.setStyleSheet(
+        "color: #60A5FA; background: #1E2E45; border: 1px solid #1D3A5E; "
+        "border-radius: 6px; padding: 3px 8px; font-size: 12px;"
+    )
+
+    note_lbl = QLabel("\u672a\u4fee\u6539\u7684\u9879\u76ee\u7ee7\u627f\u5168\u5c40\u8bbe\u5b9a")
+    note_lbl.setStyleSheet(
+        "color: #4ADE80; background: #15251A; border: 1px solid #1E3A26; "
+        "border-radius: 6px; padding: 4px 10px; font-size: 12px;"
+    )
+
+    close_btn = QPushButton("\u2715")
+    close_btn.setFixedSize(34, 34)
+    close_btn.setToolTip("\u5173\u95ed")
+    close_btn.setStyleSheet("""
+        QPushButton { background: transparent; border: none; color: #64748B; font-size: 16px; border-radius: 8px; }
+        QPushButton:hover { background: #2D2E3A; color: #F87171; }
+    """)
+
+    top_layout.addWidget(icon_lbl)
+    top_layout.addWidget(room_title_lbl)
+    top_layout.addWidget(badge_lbl)
+    top_layout.addStretch()
+    top_layout.addWidget(note_lbl)
+    top_layout.addSpacing(8)
+    top_layout.addWidget(close_btn)
+    outer.addWidget(top_bar)
+
+    # ---- content: RoomSettingsPage (has its own internal scroll) ----
+    page = RoomSettingsPage(room_id, uname, panel)
+    page.setContentsMargins(24, 18, 24, 18)
+    outer.addWidget(page, 1)
+
+    def _close():
+        overlay.hide(); overlay.deleteLater()
+        panel.hide(); panel.deleteLater()
+
+    close_btn.clicked.connect(_close)
+    overlay.mousePressEvent = lambda e: _close()

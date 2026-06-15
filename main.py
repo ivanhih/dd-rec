@@ -1,4 +1,4 @@
-# main.py
+﻿# main.py
 import sys
 import os
 import platform
@@ -17,7 +17,7 @@ from core.config import load_app_data, save_app_data, VIDEO_SAVE_DIR, get_room_c
 from core.bili_api import get_bili_info
 from core.recorder import BiliRecorder
 from ui.room_card import RoomCard
-from ui.settings_dialog import RoomSettingsDialog, GlobalSettingsOldStyleReplicaPage, AddChannelDialog
+from ui.settings_dialog import RoomSettingsDialog, GlobalSettingsOldStyleReplicaPage, AddChannelDialog, open_room_settings_overlay, open_room_settings_overlay
 
 
 # 日志配置
@@ -907,8 +907,7 @@ class MainWindow(QMainWindow):
     def on_settings(self, room_id):
         if room_id in self.cards:
             uname = self.cards[room_id].room_info.get('uname', '房间')
-            dialog = RoomSettingsDialog(room_id, uname, self)
-            dialog.exec()
+            open_room_settings_overlay(room_id, uname, self)
 
     def on_open_folder(self, room_id):
         try:

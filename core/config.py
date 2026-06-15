@@ -240,3 +240,37 @@ def save_app_data(channels):
             json.dump(data, f, ensure_ascii=False, indent=4)
     except Exception as e:
         logging.error(f"保存数据失败: {e}")
+
+
+# ==================== room per-settings API ====================
+def get_room_setting(room_id, key):
+    room_id = str(room_id)
+    if room_id not in CONFIG["rooms"]:
+        return get_global_setting(key)
+    overrides = CONFIG["rooms"][room_id].get("overrides", {})
+    if key in overrides:
+        return overrides[key]
+    return get_global_setting(key)
+
+def set_room_setting(room_id, key, value):
+    room_id = str(room_id)
+    if room_id not in CONFIG["rooms"]:
+        CONFIG["rooms"][room_id] = {
+            "sessdata": "", "format": "", "quality": 10000,
+            "custom_dir": "", "overrides": {}
+        }
+    defaults = DEFAULT_GLOBAL_SETTINGS.get(key)
+    if value == defaults:
+        if "overrides" in CONFIG["rooms"][room_id] and key in CONFIG["rooms"][room_id]["overrides"]:
+            del CONFIG["rooms"][room_id]["overrides"][key]
+    else:
+        if "overrides" not in CONFIG["rooms"][room_id]:
+            CONFIG["rooms"][room_id]["overrides"] = {}
+        CONFIG["rooms"][room_id]["overrides"][key] = value
+    save_config()
+
+def has_room_override(room_id, key):
+    room_id = str(room_id)
+    if room_id not in CONFIG["rooms"]:
+        return False
+    return key in CONFIG["rooms"][room_id].get("overrides", {})
