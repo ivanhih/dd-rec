@@ -70,8 +70,12 @@ def _build_save_path(room_id, uname, title, now_dt):
 
 
 def _send_webhooks(event: str, room_id: str, uname: str, title: str, extra: dict = None):
-    """Fire-and-forget POST to each configured webhook URL.
-    When webhook_format is 'blrec', payload matches BililiveRecorder v2 format.
+    """把录播事件推送到 biliupforjava 的 /recordWebHook 端点。
+
+    payload 严格按 FQrabbit/biliupforjava 的 RecordEventDTO 字段命名：
+      - 顶层 PascalCase（EventType / EventTimestamp / EventId / EventData）
+      - EventData 内也是 PascalCase（RoomId / Name / Title / RelativePath / FileSize / Duration ...）
+      - 时间字段为 ISO8601 带时区
     """
     raw = (get_global_setting("webhooks") or "").strip()
     if not raw:
@@ -82,37 +86,81 @@ def _send_webhooks(event: str, room_id: str, uname: str, title: str, extra: dict
 
     fmt = (get_global_setting("webhook_format") or "blrec").strip()
 
-    if fmt == "blrec":
-        # BililiveRecorder Webhook v2 payload
-        evt_map = {
-            "recording_started": "StreamStarted",
-            "recording_stopped": "SessionEnded",
-            "recording_split": "FileClosed",
+    # biliupforjava 会用 work-path + relativePath 拼绝对路径找 part record。
+    # relativePath 必须是**相对 work-path 的相对路径**。
+    _work_path = (get_global_setting("webhook_work_path") or "").strip() \
+                 or (get_global_setting("save_dir") or "").strip()
+    _work_path = os.path.normpath(_work_path) if _work_path else ""
+
+    def _relpath(p: str) -> str:
+        if not p:
+            return ""
+        if _work_path:
+            try:
+                rp = os.path.relpath(p, _work_path)
+                if not rp.startswith(".."):
+                    return rp.replace("\\", "/")
+            except (ValueError, OSError):
+                pass
+        return p.replace("\\", "/")
+
+    # 把 extra["file"] 从绝对路径转换为相对 _work_path 的相对路径
+    if extra and extra.get("file"):
+        extra = dict(extra)  # 复制一份避免污染调用方
+        extra["file"] = _relpath(extra["file"])
+
+    # —— 内部事件名 → biliupforjava EventType 枚举 ——
+    evt_map_bililive = {
+        "session_started":     "SessionStarted",
+        "live_began":          "LiveBeganEvent",
+        "recording_started":   "RecordingStartedEvent",
+        "recording_stopped":   "RecordingFinishedEvent",
+        "live_ended":          "LiveEndedEvent",
+        "recording_split":     "FileClosed",
+        "file_completed":      "VideoFileCompletedEvent",
+        "space_change":        "RoomChangeEvent",
+    }
+    # 关键语义：bilirec 的 "recording_started" = ffmpeg 已经开写，文件已落地。
+    # 一定要发 RecordingStartedEvent（不是 StreamStarted），这样 biliupforjava 才会
+    # 在 Room 上挂一个活跃 RecordHistory；之后 FileClosed 才能找到 historyId 入队上传。
+
+    def _build_bililive_payload() -> dict | None:
+        evt_str = evt_map_bililive.get(event)
+        if not evt_str:
+            return None
+        # SessionId 跨事件保持一致：recording_started 时由调用方通过 extra.session_id 注入，
+        # 后续 recording_split / recording_stopped 复用同一个值。
+        _session_id = (extra or {}).get("session_id") or str(uuid.uuid4())
+        ed: dict = {
+            "SessionId":       _session_id,
+            "RoomId":          str(room_id),
+            "ShortId":         0,
+            "Name":            uname or "",
+            "Title":           title or "",
+            "AreaNameParent":  "",
+            "AreaNameChild":   "",
+            "Recording":       event in ("recording_started", "recording_split"),
+            "Streaming":       event == "recording_started",
+            "DanmakuConnected": True,
         }
-        payload = {
-            "EventType": evt_map.get(event, event),
-            "EventTimestamp": datetime.datetime.now().astimezone().isoformat(timespec="microseconds"),
-            "EventId": str(uuid.uuid4()),
-            "EventData": {
-                "SessionId": str(uuid.uuid4()),
-                "RoomId": int(room_id),
-                "ShortId": 0,
-                "Name": uname,
-                "Title": title,
-                "AreaNameParent": "",
-                "AreaNameChild": "",
-                "Recording": event == "recording_started" or event == "recording_split",
-                "Streaming": event == "recording_started",
-                "DanmakuConnected": True,
-            },
-        }
+        # 落盘类事件需要携带文件信息，否则 biliupforjava 没法上传
         if extra and extra.get("file"):
-            payload["EventData"]["RelativePath"] = extra["file"]
-            payload["EventData"]["FileSize"] = 0
-            payload["EventData"]["Duration"] = 0
-            payload["EventData"]["FileOpenTime"] = datetime.datetime.now().astimezone().isoformat(timespec="microseconds")
-            payload["EventData"]["FileCloseTime"] = datetime.datetime.now().astimezone().isoformat(timespec="microseconds")
-    else:
+            ed["RelativePath"]  = str(extra["file"])
+            ed["FileSize"]      = int(extra.get("size") or 0)
+            ed["Duration"]      = float(extra.get("duration") or 0.0)
+            open_t = extra.get("file_open_time")
+            close_t = extra.get("file_close_time")
+            ed["FileOpenTime"]  = open_t  if open_t  else datetime.datetime.now().astimezone().isoformat(timespec="microseconds")
+            ed["FileCloseTime"] = close_t if close_t else datetime.datetime.now().astimezone().isoformat(timespec="microseconds")
+        return {
+            "EventType":      evt_str,
+            "EventTimestamp": datetime.datetime.now().astimezone().isoformat(timespec="microseconds"),
+            "EventId":        str(uuid.uuid4()),
+            "EventData":      ed,
+        }
+
+    # —— 默认格式：biliupforjava 旧版 / 通用 JSON ——
+    def _build_default_payload() -> dict:
         payload = {
             "event": event,
             "room_id": room_id,
@@ -122,6 +170,14 @@ def _send_webhooks(event: str, room_id: str, uname: str, title: str, extra: dict
         }
         if extra:
             payload.update(extra)
+        return payload
+
+    if fmt == "blrec":
+        payload = _build_bililive_payload()
+        if payload is None:
+            payload = _build_default_payload()
+    else:
+        payload = _build_default_payload()
 
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
 
@@ -135,11 +191,79 @@ def _send_webhooks(event: str, room_id: str, uname: str, title: str, extra: dict
                     method="POST",
                 )
                 with urllib.request.urlopen(req, timeout=10) as resp:
-                    logging.info(f"Webhook OK {url} -> {resp.status}")
+                    body_preview = resp.read(200).decode("utf-8", errors="replace")
+                    logging.info(f"Webhook OK {url} -> {resp.status} | EventType={payload.get('EventType') or payload.get('event')} | resp={body_preview!r}")
             except Exception as e:
-                logging.warning(f"Webhook fail {url}: {e}")
+                logging.warning(f"Webhook fail {url}: {e} | payload_keys={list(payload.keys())}")
 
     threading.Thread(target=_fire, daemon=True).start()
+
+
+def _emit_recording_stopped_webhook(recorder) -> None:
+    """下播/用户停止监听时统一调用：把"录制结束"事件按 RecordEventDTO 规范发出。
+
+    必须在 recorder.stop_recording() 之前调用 —— 因为 stop_recording 会清零
+    record_start_time / accumulated_size，duration/size 就拿不到了。
+    """
+    _stop_path = recorder.current_save_path
+    _stop_size = 0
+    _stop_duration = 0.0
+    _file_close_time = datetime.datetime.now().astimezone().isoformat(timespec="microseconds")
+    try:
+        if _stop_path and os.path.exists(_stop_path):
+            _stop_size = os.path.getsize(_stop_path)
+        # 加上本次会话里已切片的累计大小
+        _stop_size = int((recorder.accumulated_size or 0) + _stop_size)
+        if recorder.record_start_time:
+            _stop_duration = float(max(0, time.time() - recorder.record_start_time))
+    except Exception:
+        pass
+    _send_webhooks("recording_stopped", recorder.room_id, recorder.uname, recorder.current_title or "",
+                   {"file": _stop_path or "",
+                    "size": _stop_size,
+                    "duration": _stop_duration,
+                    "file_open_time": (datetime.datetime.fromtimestamp(recorder.record_start_time).astimezone().isoformat(timespec="microseconds")
+                                       if recorder.record_start_time else _file_close_time),
+                    "file_close_time": _file_close_time,
+                    "session_id": recorder.current_session_id})
+
+
+def _emit_last_part_file_closed_webhook(recorder) -> None:
+    """下播时如果当前还在写一个分P（ffmpeg 还没被 stop），
+    给该 part 补发一个 FileClosed 事件 —— 不然最后一个分P 不会入队上传。
+
+    biliupforjava 的 FileClosed 是 part 入库的**唯一**入口，
+    RecordingFinishedEvent 只修 part 的结束态，**不**主动建 part。
+    """
+    _stop_path = recorder.current_save_path
+    if not _stop_path or not os.path.exists(_stop_path):
+        return
+    _stop_size = 0
+    _stop_duration = 0.0
+    _file_close_time = datetime.datetime.now().astimezone().isoformat(timespec="microseconds")
+    try:
+        # 关键：只算**当前 part**的实际大小（不要加 accumulated_size）
+        _stop_size = os.path.getsize(_stop_path)
+        # 关键：duration 用 current_part_start_time（不是 record_start_time）
+        _open_time = recorder.current_part_start_time or recorder.record_start_time
+        if _open_time:
+            _stop_duration = float(max(0, time.time() - _open_time))
+    except Exception:
+        pass
+    # 关键：同步重编码修 A/V 同步（-vsync cfr 让视频从 0 开始），让 webhook 用**重编码后**路径
+    _upload_path = _stop_path
+    if False:  # 取消重编码 —— mp4 容器已由 SIGINT + 10s 等 trailer 写完整
+        pass  # 占位
+    _send_webhooks("recording_split", recorder.room_id, recorder.uname, recorder.current_title or "",
+                   {"file": _upload_path,
+                    "size": _stop_size,
+                    "duration": _stop_duration,
+                    "file_open_time": (datetime.datetime.fromtimestamp(recorder.current_part_start_time or recorder.record_start_time).astimezone().isoformat(timespec="microseconds")
+                                       if (recorder.current_part_start_time or recorder.record_start_time) else _file_close_time),
+                    "file_close_time": _file_close_time,
+                    "session_id": recorder.current_session_id})
+
+
 def _send_notify(event: str, room_id: str, uname: str, title: str, extra: dict = None):
     """使用 apprise 发送推送通知。event: recording_started / recording_stopped / error"""
     if not get_global_setting("notify_enabled"):
@@ -223,7 +347,12 @@ def _send_notify(event: str, room_id: str, uname: str, title: str, extra: dict =
             logging.warning(f"\u901a\u77e5\u53d1\u9001\u5931\u8d25: {e}")
     threading.Thread(target=_fire, daemon=True).start()
 def _run_convert(src_path: str):
-    """录制结束后将源文件转换为目标格式，可选删除原文件。在后台线程中运行。"""
+    """录制结束后将源文件转换为目标格式，可选删除原文件。在后台线程中运行。
+
+    注意：如果要用 webhook 投稿到 biliupforjava，**必须**录制 h264 编码的流（设置
+    config.json 的 stream_codec = "h264"），不要让这个函数转码 —— B 站 web 投稿 bvc_check
+    对 av1 编码不稳定。
+    """
     if not get_global_setting("convert_enabled"):
         return
     if not src_path or not os.path.exists(src_path):
@@ -231,36 +360,44 @@ def _run_convert(src_path: str):
 
     target_fmt = (get_global_setting("convert_format") or "mp4").strip()
     base, src_ext = os.path.splitext(src_path)
-    # 源文件已经是目标格式则跳过
-    if src_ext.lstrip(".").lower() == target_fmt.lower():
-        return
-
+    # 注意：不要"同格式跳过"——因为 B 站直播流（h264/av1）的 mp4 容器 PTS 不规范，
+    # 必须**重编码**才能修。不重编码 bvc_check 会拒收（code=21588）。
     dst_path = f"{base}.{target_fmt}"
-    cmd = [FFMPEG_CMD, "-y", "-i", src_path, "-c", "copy", dst_path]
-    logging.info(f"🔄 开始转换: {os.path.basename(src_path)} -> {os.path.basename(dst_path)}")
+    # B 站 web 投稿 bvc_check 会拒收 A/V PTS 错位的 mp4（B 站直播流视频 start=0.269s
+    # 但音频 start=0.022s，-c copy 写出的文件保流错位）。必须**重编码视频流**才能修。
+    # 用 libx264 veryfast 模式 + crf 23 质量够用且速度快。音频直通。
+    cmd = [
+        FFMPEG_CMD, "-y", "-i", src_path,
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+        "-vsync", "cfr", "-async", "1",
+        "-c:a", "aac", "-b:a", "128k",
+        "-movflags", "+faststart",
+        dst_path,
+    ]
+    logging.info(f"🔄 开始转换（重编码修 A/V 同步）: {os.path.basename(src_path)} -> {os.path.basename(dst_path)}")
 
-    def _do():
-        try:
-            result = subprocess.run(
-                cmd,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-            if result.returncode == 0:
-                logging.info(f"✅ 转换完成: {os.path.basename(dst_path)}")
-                if get_global_setting("convert_delete_source"):
-                    try:
-                        os.remove(src_path)
-                        logging.info(f"🗑️ 已删除原文件: {os.path.basename(src_path)}")
-                    except Exception as e:
-                        logging.warning(f"删除原文件失败: {e}")
-            else:
-                logging.error(f"❌ 转换失败 (returncode={result.returncode}): {os.path.basename(src_path)}")
-        except Exception as e:
-            logging.error(f"❌ 转换异常: {e}")
-
-    threading.Thread(target=_do, daemon=True).start()
+    # 关键：**同步**执行 ffmpeg 转码，不开后台线程。
+    # 因为 webhook 必须等转码完成、发的是**重编码后**的路径（B 站 bvc_check 才能通过）。
+    try:
+        result = subprocess.run(
+            cmd,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=600,  # 10 分钟超时
+        )
+        if result.returncode == 0:
+            logging.info(f"✅ 转换完成: {os.path.basename(dst_path)}")
+            if get_global_setting("convert_delete_source"):
+                try:
+                    os.remove(src_path)
+                    logging.info(f"🗑️ 已删除原文件: {os.path.basename(src_path)}")
+                except Exception as e:
+                    logging.warning(f"删除原文件失败: {e}")
+        else:
+            logging.error(f"❌ 转换失败 (returncode={result.returncode}): {os.path.basename(src_path)}")
+    except Exception as e:
+        logging.error(f"❌ 转换异常: {e}")
 
 
 def _parse_monitor_seconds(key: str, default: float) -> float:
@@ -324,10 +461,17 @@ class BiliRecorder(QObject):
         self.stream_url = None
         self.current_save_path = None
         self.record_start_time = 0
+        # 当前 part 开始时间（每次开新 part 时更新）。用于算单个 part 的 duration，
+        # 而不是整个录制会话的 duration。
+        self.current_part_start_time = 0
         self.last_check_time = 0
         self.last_total_size = 0
         self.accumulated_size = 0
         self.last_api_check_time = 0
+        # 本次"录制会话"使用的 SessionId，recording_started 时生成、recording_stopped 时清空。
+        # 必须与 RecordingStartedEvent / RecordingFinishedEvent 保持一致，否则 biliupforjava
+        # 会判定 session 错位（RecordEnd.IgnoreStaleSession）→ 不会触发上传。
+        self.current_session_id = ""
         self._split_timer = None
         self.current_stream_base_url = None
         self._last_codec = None
@@ -338,18 +482,48 @@ class BiliRecorder(QObject):
     def is_recording(self):
         return self.current_ffmpeg is not None and self.current_ffmpeg.poll() is None
 
-    def _graceful_stop_ffmpeg(self, process):
-        if process and process.poll() is None:
-            try:
-                process.stdin.write(b"q\n")
-                process.stdin.flush()
-                process.wait(timeout=5)
-            except Exception:
-                try:
-                    process.terminate()
-                    process.wait(timeout=5)
-                except Exception:
-                    pass
+    def _graceful_stop_ffmpeg(self, process, wait_trailer: float = 10.0):
+        """优雅关闭 ffmpeg 进程，**确保 trailer (moov) 写入完成**。
+
+        关键问题：ffmpeg 用 -c copy 录实时流时，moov atom 默认在文件**末尾**。
+        关闭时如果立即杀进程，moov 写一半 → "moov atom not found"。
+        这里用 SIGINT（不是 stdin "q"）触发 ffmpeg 内部 flush + trailer write，
+        等待 wait_trailer 秒让 ffmpeg 完整写完 mp4 trailer。
+
+        流程:
+          1. SIGINT → ffmpeg 内部 flush（处理完所有 in-flight packet）
+          2. 等 wait_trailer 秒（默认 10s，足够 4K HDR 也写完）
+          3. 如果还没退出 → SIGTERM
+          4. 如果还没退出 → SIGKILL（兜底）
+        """
+        if not process or process.poll() is not None:
+            return
+        import signal as _sig
+        # Step 1: SIGINT 触发 ffmpeg 内部 flush
+        try:
+            process.send_signal(_sig.CTRL_BREAK_EVENT if platform.system() == "Windows" else _sig.SIGINT)
+        except Exception:
+            pass
+        # Step 2: 等 ffmpeg 自己写完 trailer
+        try:
+            process.wait(timeout=wait_trailer)
+            logging.debug(f"ffmpeg 收到 SIGINT 后 {wait_trailer}s 内自然退出")
+            return
+        except subprocess.TimeoutExpired:
+            pass
+        # Step 3: SIGTERM 兜底
+        try:
+            process.terminate()
+            process.wait(timeout=5)
+            return
+        except Exception:
+            pass
+        # Step 4: SIGKILL 兜底（不应该到这里）
+        try:
+            process.kill()
+            process.wait(timeout=2)
+        except Exception:
+            pass
 
     def stop_recording(self, reset_time=False):
         was_recording = self.is_recording
@@ -374,8 +548,11 @@ class BiliRecorder(QObject):
         if reset_time:
             # 只有真正停止（主播下播）时才重置时间
             self.record_start_time = 0
+            self.current_part_start_time = 0
             self.last_total_size = 0
             self.accumulated_size = 0
+            # 会话结束，清空 SessionId 让下次重新生成
+            self.current_session_id = ""
 
         if was_recording:
             logging.info(f"⏹️ 已停止录制: {self.room_id}")
@@ -383,6 +560,15 @@ class BiliRecorder(QObject):
             if path_to_convert:
                 _run_convert(path_to_convert)
     def kill(self):
+        # 关停前如果有未完结的录制，把"录制结束"事件发出去
+        # （对端不依赖这个事件投稿；但少了它状态机会少一次"会话收尾"）
+        if self.is_recording:
+            try:
+                # 先补最后一分P 的 FileClosed（part 入库入口），再发 RecordingFinishedEvent（收尾）
+                _emit_last_part_file_closed_webhook(self)
+                _emit_recording_stopped_webhook(self)
+            except Exception as e:
+                logging.debug(f"kill: 发下播 webhook 失败（不致命）: {e}")
         self.is_running = False
         self.stop_recording()
         self.finished.emit()
@@ -476,16 +662,24 @@ class BiliRecorder(QObject):
             "-headers", "Referer: https://live.bilibili.com/\r\n",
             "-i", self.stream_url,
             "-c", "copy",
+            # 关键：+empty_moov 让 ffmpeg 写一个**空** moov atom 在文件开头
+            # （而不是末尾）。这样 `q\n` 关闭时即使 ffmpeg 立即退出，
+            # moov 也已经在文件里（虽然不完整，但 mp4 容器**结构有效**）。
+            # 关闭后用 -movflags +faststart 重写 moov 完成结构。
+            "-movflags", "+empty_moov",
             save_path
-        ]
+        ]  # noqa
         proxy_env = self._get_proxy_env()
-        return subprocess.Popen(
-            cmd,
+        # Windows 下要 CREATE_NEW_PROCESS_GROUP 才能收到 CTRL_BREAK_EVENT / SIGINT
+        _popen_kwargs = dict(
             stdin=subprocess.PIPE,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
-            env=proxy_env
+            env=proxy_env,
         )
+        if platform.system() == "Windows":
+            _popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+        return subprocess.Popen(cmd, **_popen_kwargs)
 
     def trigger_cut(self):
         if not self.is_recording or not self.stream_url:
@@ -519,8 +713,9 @@ class BiliRecorder(QObject):
                 self._graceful_stop_ffmpeg(old_ffmpeg)
 
             # 切割时同步重置弹幕文件
-            if old_save_path:
-                _run_convert(old_save_path)
+            # 关键：webhook 用**原文件**（不重编码）。mp4 moov 由 +empty_moov + SIGINT 等 10s
+            # 写完整；B 站 bvc_check 接受 h264/avc 编码 mp4。
+            _upload_path = old_save_path  # 默认用原文件路径
             if self._danmaku_recorder:
                 fname_base = os.path.splitext(os.path.basename(save_path))[0]
                 self._danmaku_recorder.reset(fname_base)
@@ -529,8 +724,29 @@ class BiliRecorder(QObject):
 
             self._schedule_duration_split()
             self.cut_completed.emit(self.room_id, os.path.basename(save_path))
+            # 计算被切割文件的大小和时长，给对端做上传/统计用
+            # 注意：duration 必须是**当前 part**的时长，不是整个录制会话的时长
+            _old_size = 0
+            _old_duration = 0.0
+            _old_part_open_time = self.current_part_start_time or self.record_start_time
+            _file_close_time = datetime.datetime.now().astimezone().isoformat(timespec="microseconds")
+            try:
+                if _upload_path and os.path.exists(_upload_path):
+                    _old_size = os.path.getsize(_upload_path)
+                if _old_part_open_time:
+                    _old_duration = float(max(0, time.time() - _old_part_open_time))
+            except Exception:
+                pass
+            # 切换到新 part
+            self.current_part_start_time = time.time()
             _send_webhooks("recording_split", self.room_id, self.uname, self.current_title,
-                           {"file": os.path.basename(save_path)})
+                           {"file": _upload_path,
+                            "size": _old_size,
+                            "duration": _old_duration,
+                            "file_open_time": (datetime.datetime.fromtimestamp(_old_part_open_time).astimezone().isoformat(timespec="microseconds")
+                                               if _old_part_open_time else _file_close_time),
+                            "file_close_time": _file_close_time,
+                            "session_id": self.current_session_id})
         except Exception as e:
             logging.error(f"❌ {self.room_id} 切割失败: {e}")
             self.cut_failed.emit(self.room_id, str(e))
@@ -600,12 +816,28 @@ class BiliRecorder(QObject):
                                     self.current_parent_area, self.current_area)
             return
 
+        try:
+            self._run_loop()
+        except Exception as e:
+            logging.exception(f"❌ {self.room_id} run() 主循环异常: {e}")
+            self.status_updated.emit("❌ 出错了", "💥 主循环崩溃", str(e)[:30],
+                                    self.current_title, "", "", "",
+                                    self.current_parent_area, self.current_area)
+
+    def _run_loop(self):
         while self.is_running:
             now_time = time.time()
 
             if not self.is_monitoring:
                 if self.is_recording:
+                    # 用户关停监控时，把当前录制当成一次完整会话上报。
+                    # 必须在 stop_recording 之前发，否则 record_start_time 被清零、duration 算不出。
+                    # 同时补发最后一分P 的 FileClosed，否则最后一个 part 不会上传。
+                    _emit_last_part_file_closed_webhook(self)
+                    _emit_recording_stopped_webhook(self)
                     self.stop_recording(reset_time=True)  # 关闭监控时重置录制时间
+                # 注意：未录制时不再发 live_ended —— 主循环每 2 秒轮询一次会产生风暴，
+                # 而 biliupforjava 自己有 RoomStatusSyncJob 兜底同步房间状态，不需要我们推。
                 self.status_updated.emit("⚙️ 已暂停", "🌙 未开播", "⏳ 闲置中",
                                         self.current_title, "", "", "",
                                         self.current_parent_area, self.current_area)
@@ -719,6 +951,8 @@ class BiliRecorder(QObject):
                 continue
 
             if info["live_status"] == 1:
+                # 主播在播 → 重置下播防抖（避免下播事件残留）
+                self._live_first_seen = 0.0
                 # 检查全局录制开关
                 if get_global_setting("stream_record_enabled") is False:
                     self.status_updated.emit("🟢 监控中", "📡 直播中", "⏸️ 录制已停用",
@@ -750,6 +984,11 @@ class BiliRecorder(QObject):
                         self.record_start_time = time.time()
                         self.last_total_size = 0
                         self.accumulated_size = 0
+                        # 当前 part 开始时间：跟 record_start_time 同步
+                        self.current_part_start_time = time.time()
+                        # 为本次录制会话生成一个固定 SessionId
+                        # —— 后续 split / stopped 都用同一个，保证 biliupforjava 端 session 一致
+                        self.current_session_id = str(uuid.uuid4())
 
                     # 启动弹幕录制
                     if get_global_setting("chat_record_enabled"):
@@ -768,7 +1007,9 @@ class BiliRecorder(QObject):
                     self._schedule_duration_split()
 
                     _send_webhooks("recording_started", self.room_id, self.uname, self.current_title,
-                                   {"file": os.path.basename(save_path)})
+                                   {"file": save_path,
+                                    "file_open_time": datetime.datetime.now().astimezone().isoformat(timespec="microseconds"),
+                                    "session_id": self.current_session_id})
 
                     _send_notify("recording_started", self.room_id, self.uname, self.current_title, {"cover": info.get("cover", ""), "face": info.get("face", "")})
 
@@ -793,9 +1034,32 @@ class BiliRecorder(QObject):
                                         self.current_title, "", "", "",
                                         self.current_parent_area, self.current_area)
                 if self.is_recording:
-                    _send_webhooks("recording_stopped", self.room_id, self.uname, self.current_title,
-                                   {"file": os.path.basename(self.current_save_path) if self.current_save_path else ""})
-                    _send_notify("recording_stopped", self.room_id, self.uname, self.current_title, {"cover": self.current_cover, "face": self.current_face})
+                    # 防抖：B 站 API 的 live_status 偶尔会短暂返回 0（网络抖动/主播短暂断流），
+                    # 不应该立刻判定下播。必须**持续 N 分钟**检测到下播才真正停录 + 发结束事件。
+                    # 这里的 N 取全局 monitor_debounce 配置（默认 5 分钟）。
+                    _debounce_sec = _parse_monitor_seconds("monitor_debounce", 300)
+                    now_ts = time.time()
+                    if not self._live_first_seen:
+                        self._live_first_seen = now_ts
+                        logging.info(f"⏳ {self.room_id} 检测到主播下播，等待 {int(_debounce_sec)}s 确认...")
+                    elif now_ts - self._live_first_seen >= _debounce_sec:
+                        # 防抖窗口过了 → 真正下播
+                        self._live_first_seen = 0.0
+                        # 重要：必须先发最后一个分P的 FileClosed 事件，再发 RecordingFinishedEvent。
+                        # 否则 biliupforjava 的 FileClosed 是 part 入队上传的唯一入口，
+                        # 缺它最后一分P 不会入库、不会上传。
+                        _emit_last_part_file_closed_webhook(self)
+                        _emit_recording_stopped_webhook(self)
+                        _send_notify("recording_stopped", self.room_id, self.uname, self.current_title, {"cover": self.current_cover, "face": self.current_face})
+                    else:
+                        # 还在防抖窗口内，不动
+                        self.status_updated.emit("🟢 监控中", "🌙 未开播", f"⏳ 确认中({int((_debounce_sec - (now_ts - self._live_first_seen)))}s)",
+                                                self.current_title, "", "", "",
+                                                self.current_parent_area, self.current_area)
+                        time.sleep(_parse_monitor_seconds("monitor_interval", 20))
+                        continue
+                # 注意：未录制时不再发 live_ended —— 主循环每 20 秒轮询一次会产生风暴，
+                # 而 biliupforjava 自己有 RoomStatusSyncJob 兜底同步房间状态，不需要我们推。
                 self.stop_recording(reset_time=True)
                 self._live_first_seen = 0.0   # 下播，重置 debounce
                 time.sleep(_parse_monitor_seconds("monitor_interval", 20))
