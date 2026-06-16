@@ -15,7 +15,7 @@
         "allow_audio_only": false,
         "auto_switch_stream": false,
         "stream_priority_param": "分辨率",
-        "stream_resolution": "高清",
+        "stream_resolution": "流畅",
         "stream_fps": "30 fps",
         "stream_bitrate": "30.0 Mb/s",
         "stream_codec": "av1",
@@ -27,7 +27,8 @@
         "schedule_timezone": "UTC",
         "schedule_start": "",
         "schedule_stop": "",
-        "webhooks": "",
+        "webhooks": "http://127.0.0.1:44122/recordWebHook",
+        "webhook_format": "blrec",
         "advanced_parsing": false,
         "save_dir": "C:/Users/user/PycharmProjects/bilirec/录播文件",
         "path_template": "{%- if out_dir != '' -%}\n{{ out_dir }}\n{%- else -%}\n{{ download_dir }}\n{%- endif -%}\n{%- if user_name != '' and user_name != channel -%}\n/{{ channel }}-{{ user_name }}\n{%- else -%}\n/{{ channel }}\n{%- endif -%}\n/{{ ctime | date: '%Y-%m-%d', 'local' }}\n{%- if platform != 'unknown' -%}\n/{{ platform }}-{{ channel }}\n{%- else -%}\n/{{ channel }}\n{%- endif -%}\n{%- if user_name != '' and user_name != channel -%}\n-{{ user_name }}\n{%- endif -%}\n{%- if title != '' -%}\n-{{ title | truncate: 40 }}\n{%- endif -%}\n-{{ ctime | date: '%Y-%m-%d-%H%M%S-%3f', 'local' }}.{{ format }}",
@@ -37,7 +38,7 @@
         "monitor_delay": "自动",
         "monitor_interval": "自动",
         "monitor_concurrency": "自动",
-        "monitor_debounce": "3 分钟",
+        "monitor_debounce": "5 分钟",
         "monitor_proxy": "",
         "download_cover": true,
         "condition_title": "",
@@ -72,25 +73,63 @@
             "sessdata": "",
             "format": "",
             "quality": 10000,
-            "custom_dir": ""
+            "custom_dir": "",
+            "overrides": {
+                "stream_resolution": "原画",
+                "monitor_debounce": "5 分钟",
+                "notify_enabled": true,
+                "save_dir": "C:/Users/user/PycharmProjects/bilirec/录播文件",
+                "chat_format": "xml"
+            }
         },
         "23121424": {
             "sessdata": "",
             "format": "",
             "quality": 10000,
-            "custom_dir": ""
+            "custom_dir": "",
+            "overrides": {
+                "stream_resolution": "流畅",
+                "stream_format": "ts",
+                "chat_format": "xml",
+                "convert_format": "mkv",
+                "monitor_debounce": "5 分钟",
+                "notify_enabled": true,
+                "save_dir": "C:/Users/user/PycharmProjects/bilirec/北极熊"
+            }
         },
         "1016": {
             "sessdata": "",
             "format": "",
             "quality": 10000,
-            "custom_dir": ""
+            "custom_dir": "",
+            "overrides": {
+                "stream_resolution": "流畅",
+                "stream_format": "ts",
+                "chat_format": "xml",
+                "monitor_debounce": "5 分钟",
+                "notify_enabled": true,
+                "save_dir": "C:/Users/user/PycharmProjects/bilirec/北极熊",
+                "convert_format": "mkv"
+            }
         },
         "1856171886": {
             "sessdata": "",
             "format": "",
             "quality": 10000,
             "custom_dir": ""
+        },
+        "25206807": {
+            "sessdata": "",
+            "format": "",
+            "quality": 10000,
+            "custom_dir": "",
+            "overrides": {
+                "stream_resolution": "流畅",
+                "stream_codec": "h264",
+                "chat_format": "xml",
+                "monitor_debounce": "5 分钟",
+                "notify_enabled": true
+            }
         }
     }
 }

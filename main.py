@@ -1,8 +1,10 @@
 ﻿# main.py
 import sys
 import os
+import re
 import platform
 import subprocess
+import datetime
 import logging
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -13,11 +15,54 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import QTimer, Qt, QThread, QPropertyAnimation, QEasingCurve, QPoint, QEvent, Signal
 from PySide6.QtGui import QIcon, QFont, QColor, QActionGroup, QPixmap, QPainter, QPen, QPainterPath
 
-from core.config import load_app_data, save_app_data, VIDEO_SAVE_DIR, get_room_config, get_global_setting
+from core.config import load_app_data, save_app_data, VIDEO_SAVE_DIR, get_room_config, get_global_setting, get_room_setting, get_effective_format
 from core.bili_api import get_bili_info
 from core.recorder import BiliRecorder
+from core.utils import render_path_template
 from ui.room_card import RoomCard
 from ui.settings_dialog import RoomSettingsDialog, GlobalSettingsOldStyleReplicaPage, AddChannelDialog, open_room_settings_overlay, open_room_settings_overlay
+
+
+# ==================== Path preview (mirrors recorder._build_save_path) ====================
+def _preview_save_path(room_id: str, uname: str, title: str, now_dt) -> str:
+    """跟 core/recorder.py 里的 _build_save_path **完全同步**的路径预览。
+
+    用于"打开目录"按钮在还没录过任何文件时，给出跟模板渲染一致的目录。
+    用同样的 path_template / save_dir / custom_dir / get_effective_format 计算。
+    """
+    fmt = get_effective_format(room_id)
+    global_dir = get_global_setting("save_dir") or VIDEO_SAVE_DIR
+    room_cfg = get_room_config(room_id)
+    custom_dir = room_cfg.get("custom_dir", "").strip()
+
+    template_str = get_global_setting("path_template") or (
+        "{{ download_dir }}/{{ channel }}_{{ ctime | date: '%Y%m%d_%H%M%S' }}.{{ format }}"
+    )
+
+    # 清理文件名中的非法字符（保留盘符冒号不处理）
+    invalid_chars = r'[\\/:*?"<>|]' if platform.system() == "Windows" else r'[/]'
+    safe_channel = re.sub(invalid_chars, '_', str(room_id))
+    safe_uname = re.sub(invalid_chars, '_', str(uname))
+    safe_title = re.sub(invalid_chars, '_', str(title))
+
+    try:
+        rendered = render_path_template(
+            template_str,
+            out_dir=custom_dir,
+            download_dir=global_dir,
+            platform="bilibili",
+            channel=safe_channel,
+            user_name=safe_uname,
+            title=safe_title,
+            ctime=now_dt,
+            format=fmt,
+        )
+        return os.path.normpath(rendered.strip())
+    except Exception as e:
+        logging.error(f"模板解析失败，回退到默认路径: {e}")
+        now_str = now_dt.strftime("%Y%m%d_%H%M%S")
+        fallback_dir = custom_dir if custom_dir else global_dir
+        return os.path.join(fallback_dir, f"room_{room_id}_{now_str}.{fmt}")
 
 
 # 日志配置
@@ -911,26 +956,35 @@ class MainWindow(QMainWindow):
 
     def on_open_folder(self, room_id):
         try:
-            # 获取房间信息
-            room_config = get_room_config(room_id)
-            uname = ""
-            if room_id in self.cards:
-                uname = self.cards[room_id].room_info.get('uname', '')
-            
-            # 确定保存目录
+            # 关键：跟实际录制用的 path_template / save_dir 完全同步，不要自己拼。
+            # 1) 如果正在录或刚录过：current_save_path 是模板渲染后的**真实**路径，父目录绝对准
             if room_id in self.recorders and self.recorders[room_id].current_save_path:
                 save_dir = os.path.dirname(self.recorders[room_id].current_save_path)
             else:
-                custom_dir = room_config.get('custom_dir', '').strip()
-                if custom_dir:
-                    save_dir = os.path.join(custom_dir, uname) if uname else custom_dir
-                else:
-                    global_dir = get_global_setting('save_dir') or VIDEO_SAVE_DIR
-                    save_dir = os.path.join(global_dir, uname) if uname else global_dir
-            
+                # 2) 还没录过：用跟 _build_save_path **完全相同**的模板渲染逻辑预览
+                uname = self.cards[room_id].room_info.get('uname', '') if room_id in self.cards else ''
+                now_dt = datetime.datetime.now()
+                save_dir = os.path.dirname(_preview_save_path(room_id, uname, "", now_dt))
+
+                # 2a) 保底：如果日期子目录还不存在（没开播过、或日期变了），
+                #     自动爬到**房间根目录**（`录播文件/<room_id>-<uname>`），
+                #     这样既能看到历史日期的子目录、也不会让用户卡在"空文件夹"
+                if not os.path.isdir(save_dir):
+                    parent = save_dir
+                    while parent and not os.path.isdir(parent):
+                        new_parent = os.path.dirname(parent)
+                        if new_parent == parent:
+                            break  # 已经到根
+                        parent = new_parent
+                    # 如果找到了**包含日期之前的某一级**目录，就用它
+                    if parent and os.path.isdir(parent):
+                        save_dir = parent
+                    # 如果连上一级都不存在（房间从来没录过），save_dir 就是房间根目录
+                    #   os.makedirs 下面会创建
+
             # 确保目录存在
             os.makedirs(save_dir, exist_ok=True)
-            
+
             # 打开文件夹
             if platform.system() == 'Windows':
                 os.startfile(save_dir)
@@ -938,7 +992,7 @@ class MainWindow(QMainWindow):
                 subprocess.Popen(['open', save_dir])
             else:
                 subprocess.Popen(['xdg-open', save_dir])
-                
+
         except Exception as e:
             logging.error(f"打开文件夹失败: {e}")
             self.show_notification("打开文件夹失败", "错误", "error", merge_key="open-folder:error")
