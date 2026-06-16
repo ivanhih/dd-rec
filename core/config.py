@@ -1,5 +1,6 @@
 # core/config.py
 import os
+import re
 import sys
 import json
 import logging
@@ -145,6 +146,37 @@ if os.path.exists(CONFIG_FILE):
         logging.error(f"读取配置失败: {e}")
 
 
+def reload_config() -> bool:
+    """从磁盘重新加载 config.json，覆盖内存中的 CONFIG。
+
+    用途：用户修改 config.json 后不重启 bilirec 也能立即生效（在开始录制/开始监控时调用）。
+    返回 True 表示 reload 成功，False 表示失败。
+    """
+    if not os.path.exists(CONFIG_FILE):
+        return False
+    try:
+        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+            loaded = json.load(f)
+        if not isinstance(loaded, dict):
+            return False
+        # 整体替换 rooms（per-room 删了的也跟着删）
+        CONFIG["rooms"] = loaded.get("rooms", {})
+        # 全局变量
+        CONFIG["global"] = loaded.get("global", CONFIG["global"])
+        # 全局设置：保留 DEFAULT_GLOBAL_SETTINGS 的所有 key，但用磁盘值覆盖
+        saved_gs = loaded.get("global_settings", {})
+        for k, v in DEFAULT_GLOBAL_SETTINGS.items():
+            CONFIG["global_settings"][k] = saved_gs.get(k, v)
+        # 用户新增的 key 也带上
+        for k, v in saved_gs.items():
+            if k not in CONFIG["global_settings"]:
+                CONFIG["global_settings"][k] = v
+        return True
+    except Exception as e:
+        logging.error(f"reload_config 失败: {e}")
+        return False
+
+
 def save_config():
     with open(CONFIG_FILE, "w", encoding="utf-8") as f:
         json.dump(CONFIG, f, ensure_ascii=False, indent=4)
@@ -180,10 +212,36 @@ def get_effective_format(room_id):
 
 def get_effective_save_dir(room_id, uname):
     room_cfg = get_room_config(room_id)
-    base_dir = room_cfg.get("custom_dir", "").strip() or get_global_setting("save_dir") or VIDEO_SAVE_DIR
+    # custom_dir wins; then per-room override; then global; then built-in default
+    base_dir = (
+        room_cfg.get("custom_dir", "").strip()
+        or get_room_setting(room_id, "save_dir")
+        or get_global_setting("save_dir")
+        or VIDEO_SAVE_DIR
+    )
     save_dir = os.path.join(base_dir, uname)
     os.makedirs(save_dir, exist_ok=True)
     return save_dir
+
+
+def _extract_sessdata(raw):
+    """从用户粘贴的 SESSDATA 字符串中提取真正的 SESSDATA 值。
+
+    支持两种粘贴方式：
+      1) 裸 SESSDATA 值：5011cd87%2C1797158105%2C4ce7a%2A61CjAtEsoMxbrV9iE1oGgJZLn7VY1U73wPUn-...
+      2) 完整 cookie 串：buvid_fp=...; SESSDATA=5011cd87%2C...; bili_jct=...; sid=...
+    """
+    if not raw:
+        return ""
+    s = str(raw).strip().strip(';').strip()
+    if not s:
+        return ""
+    # 情况 2：粘了完整 cookie，抠出 SESSDATA= 后面到分号/结尾之间的值
+    m = re.search(r"(?:^|[\s;,])SESSDATA=([^;,\s]+)", s)
+    if m:
+        return m.group(1).strip()
+    # 情况 1：裸值，原样返回
+    return s
 
 
 def get_headers(room_id=None, monitor=False):
@@ -193,7 +251,7 @@ def get_headers(room_id=None, monitor=False):
     }
     if room_id:
         room_cfg = CONFIG["rooms"].get(str(room_id), {})
-        sessdata = room_cfg.get("sessdata", "").strip()
+        sessdata = _extract_sessdata(room_cfg.get("sessdata", ""))
         if sessdata:
             headers["Cookie"] = f"SESSDATA={sessdata};"
     # 如果为监控请求且专用监控代理已设置，则优先使用之

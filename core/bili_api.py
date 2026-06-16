@@ -1,8 +1,8 @@
-﻿# core/bili_api.py
+# core/bili_api.py
 import re
 import logging
 from curl_cffi import requests
-from .config import get_headers, get_global_setting, get_room_config, get_effective_format
+from .config import get_headers, get_global_setting, get_room_config, get_effective_format, get_room_setting, reload_config
 
 
 
@@ -91,16 +91,33 @@ def get_bili_info(url_or_id, room_id_for_cookie=None, silent=False):
 
 
 def get_stream_info(real_room_id):
-    cfg_codec = get_global_setting("stream_codec") or "av1"
-    cfg_format = get_global_setting("stream_format") or "fmp4"
+    # 关键：每次录制/查询都从磁盘 reload 配置 —— 这样用户在 UI 上修改 stream_codec 后
+    # 下次录制立即生效，无需重启 bilirec。
+    reload_config()
+
+    cfg_codec = get_room_setting(real_room_id, "stream_codec") or get_global_setting("stream_codec") or "av1"
+    cfg_format = get_room_setting(real_room_id, "stream_format") or get_global_setting("stream_format") or "fmp4"
     cfg_url_priority = get_global_setting("stream_url_priority") or ""
     priority_param = get_global_setting("stream_priority_param") or "分辨率"
     cfg_fps = get_global_setting("stream_fps") or ""
     cfg_bitrate = get_global_setting("stream_bitrate") or ""
     allow_audio_only = get_global_setting("allow_audio_only")
 
+    # 关键：B 站 API 的 codec 名称跟我们 UI 用的不一样
+    #   - h264  → "avc"
+    #   - h265  → "hevc"
+    #   - av1   → "av1"
+    # 把 UI 配置的 codec 翻译成 B 站 API 实际用的名字再匹配
+    _codec_alias = {"h264": "avc", "h265": "hevc", "hevc": "hevc", "avc": "avc", "av1": "av1"}
+    cfg_codec_api = _codec_alias.get(cfg_codec.lower(), cfg_codec.lower())
+
     res_map = {"原画": 10000, "超清": 400, "高清": 250, "流畅": 150}
-    cfg_res_str = get_global_setting("stream_resolution") or "原画"
+    # 关键：先读房间级覆盖，缺失再回退全局；没有覆盖时按全局走（保持向后兼容）
+    cfg_res_str = (
+        get_room_setting(real_room_id, "stream_resolution")
+        or get_global_setting("stream_resolution")
+        or "原画"
+    )
     qn = res_map.get(cfg_res_str, 10000)
 
     url = f"https://api.live.bilibili.com/xlive/web-room/v2/index/getRoomPlayInfo?room_id={real_room_id}&protocol=0,1&format=0,1,2&codec=0,1,2&qn={qn}&platform=web"
@@ -142,7 +159,7 @@ def get_stream_info(real_room_id):
 
         def sort_stream(s):
             score = 0
-            if priority_param == "编码" and s["codec"] == cfg_codec:
+            if priority_param == "编码" and s["codec"] == cfg_codec_api:
                 score += 10000
             elif priority_param == "格式" and s["format"] == cfg_format:
                 score += 10000
@@ -180,7 +197,10 @@ def get_stream_info(real_room_id):
                     pass
             elif priority_param == "网址" and cfg_url_priority and cfg_url_priority in s["url"]:
                 score += 10000
-            if s["codec"] == cfg_codec: score += 100
+            # 关键：把 cfg_codec 编码（用户配置的，比如 h264）的优先级**大幅**提高。
+            # 否则 B 站 API 默认返回 av1 在前，按 +100 加分也排不赢 av1。
+            if s["codec"] == cfg_codec_api:
+                score += 100000  # 大幅超过 qn 维度（qn*10 最多 10000）
             if s["format"] == cfg_format: score += 100
             score += s["qn"]
             return score
