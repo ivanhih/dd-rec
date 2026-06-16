@@ -35,3 +35,6 @@ ffprobe
 
 # Recorded files
 录播文件/
+
+# User runtime state (per-machine live room cache + commit-时含真实信息)
+data.json
