@@ -13,10 +13,10 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QScrollArea, QLineEdit, QPushButton, QLabel, QGridLayout,
     QFrame, QToolButton, QGraphicsDropShadowEffect, QSizePolicy,
-    QGraphicsOpacityEffect, QMenu, QStackedWidget
+    QGraphicsOpacityEffect, QMenu, QStackedWidget, QSystemTrayIcon
 )
 from PySide6.QtCore import QTimer, Qt, QThread, QPropertyAnimation, QEasingCurve, QPoint, QEvent, Signal
-from PySide6.QtGui import QIcon, QFont, QColor, QActionGroup, QPixmap, QPainter, QPen, QPainterPath
+from PySide6.QtGui import QIcon, QFont, QColor, QActionGroup, QPixmap, QPainter, QPen, QPainterPath, QAction
 
 from core.config import load_app_data, save_app_data, VIDEO_SAVE_DIR, get_room_config, get_global_setting, get_room_setting, get_effective_format
 from core.bili_api import get_bili_info
@@ -342,7 +342,9 @@ class MainWindow(QMainWindow):
         self.cards = {}           # room_id -> RoomCard
         self.threads = {}         # room_id -> QThread
         self.recorders = {}       # room_id -> BiliRecorder
-        
+        # 关监听/删除时,QThread 不能立即销毁(还在跑会段错误),先移到这里异步等退出
+        self._dying_threads = []  # [(thread, recorder), ...]
+
         # 通知队列
         self.notifications = []
         self.notification_lookup = {}
@@ -351,8 +353,10 @@ class MainWindow(QMainWindow):
         self._last_grid_signature = None
         self._layout_ready = False
         self.current_page = "channels"
-        
+        self._is_shutting_down = False
+
         self.setup_ui()
+        self._setup_tray()
         self.load_saved_data()
         self.start_refresh_timer()
 
@@ -659,6 +663,75 @@ class MainWindow(QMainWindow):
         # 初始定位
         self._position_notification_container()
 
+    def _setup_tray(self):
+        """系统托盘：X 隐藏到托盘，右键菜单显示/退出。"""
+        self._tray_menu = QMenu()
+
+        self._tray_show_action = QAction("显示")
+        self._tray_show_action.triggered.connect(self._tray_show)
+        self._tray_menu.addAction(self._tray_show_action)
+
+        self._tray_quit_action = QAction("退出")
+        self._tray_quit_action.triggered.connect(self._tray_quit)
+        self._tray_menu.addAction(self._tray_quit_action)
+
+        self._tray_icon = QSystemTrayIcon(self)
+        self._tray_icon.setToolTip("B站高级录播机")
+        self._tray_icon.setContextMenu(self._tray_menu)
+        self._tray_icon.activated.connect(self._on_tray_activated)
+
+        # 用程序图标（没有时用文字 emoji 生成）
+        icon = QIcon()
+        pix = QPixmap(32, 32)
+        pix.fill(Qt.transparent)
+        p = QPainter(pix)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.setBrush(QColor("#3B82F6"))
+        p.setPen(Qt.NoPen)
+        p.drawEllipse(4, 4, 24, 24)
+        p.setPen(QColor("white"))
+        p.setFont(QFont("Segoe UI Emoji", 14))
+        p.drawText(pix.rect(), Qt.AlignCenter, "B")
+        p.end()
+        icon.addPixmap(pix)
+        self._tray_icon.setIcon(icon)
+        self._tray_icon.show()
+
+    def _on_tray_activated(self, reason):
+        if reason == QSystemTrayIcon.DoubleClick:
+            self._tray_show()
+
+    def _tray_show(self):
+        """托盘 -> 显示窗口"""
+        self.showNormal()
+        self.activateWindow()
+        self.raise_()
+
+    def _tray_quit(self):
+        """托盘 -> 退出程序（异步停 recorder 后退出）"""
+        self._is_shutting_down = True
+        # 停所有 recorder
+        for room_id in list(self.recorders.keys()):
+            self._stop_recorder(room_id)
+        # 隐藏窗口 + 托盘
+        self.hide()
+        if self._tray_icon:
+            self._tray_icon.hide()
+        # 后台轮询线程，全退出后 app.quit()
+        self._shutdown_elapsed = 0
+        self._shutdown_timer = QTimer(self)
+        self._shutdown_timer.timeout.connect(self._async_shutdown)
+        self._shutdown_timer.start(500)
+
+    def _async_shutdown(self):
+        self._shutdown_elapsed += 0.5
+        dying = getattr(self, "_dying_threads", [])
+        all_done = all(t.isFinished() for t, _ in dying)
+
+        if all_done or self._shutdown_elapsed >= 30:  # 30s 硬超时
+            self._shutdown_timer.stop()
+            QApplication.instance().quit()
+
     def show_notification(self, message, title="提示", level="info", merge_key=None, duration_ms=3200):
         """显示通知"""
         key = merge_key or f"{level}|{title}|{message}"
@@ -702,6 +775,109 @@ class MainWindow(QMainWindow):
         notification.deleteLater()
         self._position_notification_container()
 
+    def _start_recorder(self, room_id, room_info):
+        """启动房间的录播监控 — 创建 BiliRecorder + QThread,只在用户开监听时调用。
+
+        QThread + moveToThread 是为了让 BiliRecorder.run() 的长循环不阻塞主线程。
+        """
+        if room_id in self.recorders:
+            return  # 已经在跑
+
+        card = self.cards.get(room_id)
+        if not card:
+            return
+
+        recorder = BiliRecorder(room_info)
+        thread = QThread()
+        recorder.moveToThread(thread)
+
+        # 状态信号连到卡片
+        recorder.status_updated.connect(
+            lambda m, l, r, t, d, sp, sz, p, a:
+            card.update_status(m, l, r, t, d, sp, sz, p, a)
+        )
+        recorder.cut_completed.connect(self.on_cut_completed)
+        recorder.cut_failed.connect(self.on_cut_failed)
+
+        thread.started.connect(recorder.run)
+        thread.start()
+
+        self.recorders[room_id] = recorder
+        self.threads[room_id] = thread
+
+    def _stop_recorder(self, room_id):
+        """停掉房间的录播监控 — 异步销毁 BiliRecorder + QThread,不阻塞 GUI。
+
+        关键策略 — 用户视角立即响应,QThread 后台异步退出:
+          1) 主线程关 ffmpeg(stdin 'q',跨线程安全)
+          2) 清空 current_save_path / current_session_id 避免 run loop 触发转码
+          3) 设 is_monitoring=False + is_running=False
+          4) **不调 thread.wait()** — 立即从 self.recorders / self.threads 移到
+             self._dying_threads(主窗口持有,避免 GC 销毁还在跑的 QThread)
+          5) 用 thread.finished 信号异步清理 _dying_threads
+          6) 主窗口 closeEvent 时 wait 所有 _dying_threads
+        """
+        if room_id not in self.recorders:
+            return
+
+        recorder = self.recorders[room_id]
+        thread = self.threads.get(room_id)
+
+        # 1) 主线程关 ffmpeg(stdin 'q')
+        if recorder.current_ffmpeg is not None:
+            try:
+                if recorder.current_ffmpeg.stdin and not recorder.current_ffmpeg.stdin.closed:
+                    recorder.current_ffmpeg.stdin.write(b"q\n")
+                    recorder.current_ffmpeg.stdin.flush()
+            except Exception as e:
+                logging.debug(f"主线程关 ffmpeg 失败: {e}")
+
+        # 2) 清空触发转码的状态（ffmpeg 已收到 stdin 'q', 不再阻塞等待）
+        recorder.current_ffmpeg = None
+        recorder.current_save_path = None
+        recorder.current_session_id = ""
+
+        # 3) 设标志让 run loop 自然退
+        recorder.is_monitoring = False
+        recorder.is_running = False
+
+        # 4) 立即从 self.recorders / self.threads 删除(用户视角"已停止")
+        #    QThread 移到 self._dying_threads,主窗口持有它避免 Python GC 销毁
+        del self.recorders[room_id]
+        if room_id in self.threads:
+            del self.threads[room_id]
+
+        # 卡片状态更新 — recorder 已停不会再发 status_updated 信号,手动设
+        if room_id in self.cards:
+            card = self.cards[room_id]
+            card.update_status(
+                "⚙️ 已暂停", "🌙 未开播", "⏳ 闲置中",
+                card.room_info.get("title", ""), "", "", "",
+                card.room_info.get("parent_area_name", ""),
+                card.room_info.get("area_name", "")
+            )
+
+        if thread is not None:
+            # 用 list 持有(避免 dict key 冲突)
+            if not hasattr(self, '_dying_threads'):
+                self._dying_threads = []
+            self._dying_threads.append((thread, recorder))
+
+            # 5) thread.finished 信号触发时,从 _dying_threads 移除并 deleteLater
+            def _cleanup(t=thread, r=recorder):
+                try:
+                    self._dying_threads = [
+                        (tt, rr) for (tt, rr) in self._dying_threads if tt is not t
+                    ]
+                except Exception:
+                    pass
+                t.deleteLater()
+                r.deleteLater()
+
+            thread.finished.connect(_cleanup)
+        else:
+            recorder.deleteLater()
+
     def load_saved_data(self):
         data = load_app_data()
         self._layout_ready = False
@@ -722,24 +898,11 @@ class MainWindow(QMainWindow):
         card.settings_signal.connect(self.on_settings)
         card.open_folder_signal.connect(self.on_open_folder)
 
-        # 创建 Recorder 和线程
-        recorder = BiliRecorder(room_info)
-        thread = QThread()
-        recorder.moveToThread(thread)
-
-        recorder.status_updated.connect(
-            lambda m, l, r, t, d, sp, sz, p, a:
-            card.update_status(m, l, r, t, d, sp, sz, p, a)
-        )
-        recorder.cut_completed.connect(self.on_cut_completed)
-        recorder.cut_failed.connect(self.on_cut_failed)
-
-        thread.started.connect(recorder.run)
-        thread.start()
-
         self.cards[room_id] = card
-        self.recorders[room_id] = recorder
-        self.threads[room_id] = thread
+
+        # 只有 enabled=True 才启 QThread(节省资源 + 避免卡顿)
+        if room_info.get("enabled", True):
+            self._start_recorder(room_id, room_info)
 
         if rearrange:
             self.request_rearrange_cards(0)
@@ -964,12 +1127,16 @@ class MainWindow(QMainWindow):
 
     # ==================== 信号槽 ====================
     def on_card_toggle(self, room_id, enabled):
-        if room_id in self.recorders:
-            self.recorders[room_id].is_monitoring = enabled
         uname = self.cards[room_id].room_info.get("uname", room_id) if room_id in self.cards else room_id
         if enabled:
+            # 启监听 — 创建 QThread
+            if room_id in self.cards:
+                room_info = self.cards[room_id].room_info
+                self._start_recorder(room_id, room_info)
             self.show_notification(f"{uname} 已开始监控", "开始监控", "info", merge_key=f"monitor:on:{room_id}")
         else:
+            # 关监听 — 销毁 QThread
+            self._stop_recorder(room_id)
             self.show_notification(f"{uname} 已关闭监控", "关闭监控", "info", merge_key=f"monitor:off:{room_id}")
         self.save_data()
 
@@ -991,22 +1158,25 @@ class MainWindow(QMainWindow):
         self.show_notification(f"{uname} 切割失败：{error}", "切割失败", "error", merge_key=f"cut:error:{room_id}:{error}", duration_ms=4500)
 
     def on_delete(self, room_id):
-        if room_id in self.cards:
-            self.cards[room_id].setParent(None)
-            self.recorders[room_id].kill()
-            self.threads[room_id].quit()
-            self.threads[room_id].wait()
-            
-            # 获取主播名用于通知
-            uname = self.cards[room_id].room_info.get('uname', '房间')
-            
-            del self.cards[room_id]
-            del self.recorders[room_id]
-            del self.threads[room_id]
-            
-            self.request_rearrange_cards(0)
-            self.save_data()
-            self.show_notification(f"已删除 {uname}", "删除成功", "success", merge_key=f"delete:{room_id}")
+        if room_id not in self.cards:
+            return
+
+        uname = self.cards[room_id].room_info.get('uname', '房间')
+
+        # 如果在监听,先停掉(走 _stop_recorder 干净退出,会 wait QThread 退出)
+        if room_id in self.recorders:
+            self._stop_recorder(room_id)
+        # 不在监听时,没 QThread,直接走 UI 清理
+
+        # UI 清理 — 立即把卡片从 UI 拿掉(用户立刻看到反馈)
+        self.cards[room_id].setParent(None)
+        self.cards[room_id].deleteLater()
+        del self.cards[room_id]
+
+        # 重排 + 存盘 + 通知
+        self.request_rearrange_cards(0)
+        self.save_data()
+        self.show_notification(f"已删除 {uname}", "删除成功", "success", merge_key=f"delete:{room_id}")
 
     def on_settings(self, room_id):
         if room_id in self.cards:
@@ -1097,16 +1267,21 @@ class MainWindow(QMainWindow):
         pass
 
     def closeEvent(self, event):
-        for recorder in self.recorders.values():
-            recorder.kill()
-        for thread in self.threads.values():
-            thread.quit()
-            thread.wait()
-        event.accept()
+        """点 X → 隐藏到系统托盘（不退出）。
+
+        只有通过托盘右键"退出"才会真正退出进程。
+        """
+        if self._is_shutting_down:
+            event.accept()
+            return
+        # 阻止窗口关闭，隐藏到托盘
+        event.ignore()
+        self.hide()
 
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
+    app.setQuitOnLastWindowClosed(False)  # X 隐藏到托盘时不退出
     window = MainWindow()
     window.show()
     sys.exit(app.exec())

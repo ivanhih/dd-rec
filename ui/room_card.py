@@ -582,6 +582,24 @@ class RoomCard(QFrame):
         if area_name:
             self.room_info["area_name"] = area_name
 
+        # 关键守卫: 当卡片监控已关闭时, 无论收到什么信号都显示"已暂停/闲置中"。
+        # 防止 _stop_recorder 手动设完状态后, recorder 线程残留在 Qt 事件队列中
+        # 的 status_updated 信号又覆盖成"监控中/录制中"。
+        if not self._is_monitoring:
+            self.lbl_m.setText("⏸ 已暂停")
+            self.lbl_m.setStyleSheet("color: #F59E0B; font-size: 13px; font-weight: 500; border: none; background: transparent;")
+            self.lbl_l.setText("🌙 未开播")
+            self.lbl_l.setStyleSheet("color: #64748B; font-size: 13px; font-weight: 500; border: none; background: transparent;")
+            self.lbl_r.setText("⏳ 闲置中")
+            self.lbl_r.setStyleSheet("color: #64748B; font-size: 13px; font-weight: 500; border: none; background: transparent;")
+            self.lbl_title.setText(title)
+            self.lbl_duration.fade_out()
+            self.lbl_speed.fade_out()
+            self.lbl_size.fade_out()
+            self._is_recording = False
+            self._refresh_cut_button_state()
+            return
+
         if "出错" in m:
             self.lbl_m.setText("❌ 出错")
             self.lbl_m.setStyleSheet("color: #EF4444; font-size: 13px; font-weight: 500; border: none; background: transparent;")
@@ -641,6 +659,7 @@ class RoomCard(QFrame):
 
     def on_toggle(self, checked):
         self._is_monitoring = checked
+        self.room_info["enabled"] = checked   # 关键：同步 room_info，否则 _start_recorder 拿到 stale False
         # 关闭监控时，不管什么状态，都立即隐藏统计信息！
         if not checked:
             self._is_recording = False
