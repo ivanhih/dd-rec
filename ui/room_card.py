@@ -1,8 +1,8 @@
 # ui/room_card.py
-from PySide6.QtWidgets import (QFrame, QVBoxLayout, QHBoxLayout, QLabel, 
-                              QPushButton, QToolButton, QSizePolicy, 
-                              QGraphicsDropShadowEffect, QWidget)
-from PySide6.QtCore import (Qt, Signal, QTimer, QPoint, QRect, QSize, QPropertyAnimation, QEasingCurve)
+from PySide6.QtWidgets import (QFrame, QVBoxLayout, QHBoxLayout, QLabel,
+                              QPushButton, QToolButton, QSizePolicy,
+                              QGraphicsDropShadowEffect, QWidget, QApplication)
+from PySide6.QtCore import (Qt, Signal, QTimer, QPoint, QRect, QSize, QPropertyAnimation, QEasingCurve, QObject, QEvent)
 from PySide6.QtGui import QPixmap, QFont, QColor, QCursor, QPainter, QBrush, QPainterPath
 from PySide6.QtWidgets import QGraphicsOpacityEffect
 import os
@@ -12,6 +12,162 @@ import threading
 import requests
 
 from core.config import get_global_setting, get_effective_save_dir, VIDEO_SAVE_DIR, get_room_config
+
+
+class _HoverToolButton(QToolButton):
+    """自带 hover tip 的 QToolButton — 用 override enterEvent/leaveEvent
+
+    为什么不用 eventFilter: QToolButton 自己处理 enterEvent(autoRaise 等),
+    eventFilter 顺序上在 QToolButton.enterEvent 之前/之后不可控,经常丢事件。
+    直接 subclass override 是最稳的。
+    """
+    def __init__(self, text, tip_text, parent=None):
+        super().__init__(parent)
+        self._hover_tip = None  # 延迟创建(需要 anchor.window() 存在)
+        self._hover_text = tip_text
+        self.setText(text)
+        # 强制 mouse tracking,确保 enter/leave 事件能稳定分发
+        self.setMouseTracking(True)
+        self.setAttribute(Qt.WA_Hover, True)
+
+    def attach_tip(self, tip):
+        self._hover_tip = tip
+
+    def enterEvent(self, event):
+        super().enterEvent(event)
+        if self._hover_tip is not None:
+            self._hover_tip.show()
+
+    def leaveEvent(self, event):
+        super().leaveEvent(event)
+        if self._hover_tip is not None:
+            self._hover_tip.hide()
+
+
+class _HoverPushButton(QPushButton):
+    """带 hover tip 的 QPushButton — 给"添加"按钮用。"""
+    def __init__(self, text, tip_text, parent=None):
+        super().__init__(text, parent)
+        self._hover_tip = None
+        self._hover_text = tip_text
+        self.setMouseTracking(True)
+        self.setAttribute(Qt.WA_Hover, True)
+
+    def attach_tip(self, tip):
+        self._hover_tip = tip
+
+    def enterEvent(self, event):
+        super().enterEvent(event)
+        if self._hover_tip is not None:
+            self._hover_tip.show()
+
+    def leaveEvent(self, event):
+        super().leaveEvent(event)
+        if self._hover_tip is not None:
+            self._hover_tip.hide()
+
+
+class HoverLabel(QLabel):
+    """自定义 hover 浮动文字 — 鼠标进入目标 widget 时显示,离开时消失。
+
+    关键修复:
+      1. WA_TransparentForMouseEvents 会让 widget 在某些情况下被 QSS 颜色覆盖,
+         所以 paintEvent 完全自绘背景+文字+边框,绕开 stylesheet。
+      2. WA_ShowWithoutActivating 防止 tip 抢焦点(导致按钮 enter 事件丢失)。
+      3. parent 必须是顶层 window(anchor.window())而不是 anchor 自己,
+         否则会被父 widget 的 z-order 遮挡。
+      4. setWindowFlags(Qt.Tool | Qt.FramelessWindowHint) 让它永远是顶层,
+         不被 QFrame 卡片遮挡。
+    """
+    def __init__(self, anchor: QWidget, text: str):
+        # parent = 顶层 window,确保 tip 在最上层不被卡片遮挡
+        super().__init__(anchor.window())
+        self._anchor = anchor
+        # Qt.Tool 让 tip 是独立顶层窗口,不被父 widget 的 paint 覆盖
+        # FramelessWindowHint 不要标题栏
+        self.setWindowFlags(Qt.Tool | Qt.FramelessWindowHint)
+        # 不要激活窗口(防止按钮失焦后 enter 事件链断掉)
+        self.setAttribute(Qt.WA_ShowWithoutActivating)
+        # 不抢鼠标事件
+        self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+
+        from PySide6.QtGui import QFont
+        f = QFont("Microsoft YaHei UI", 10, QFont.Medium)
+        f.setStyleHint(QFont.SansSerif)
+        self.setFont(f)
+        # 边距用 setContentsMargins(让 _resize_to_text 算对尺寸)
+        self.setContentsMargins(10, 4, 10, 4)
+        # 关键: paintEvent 完全自绘,这里 setStyleSheet 是兜底(以防 paintEvent 出 bug)
+        self.setStyleSheet("""
+            QLabel {
+                background-color: #1F2030;
+                color: #FFFFFF;
+                border: 1px solid #3D3E4F;
+                border-radius: 6px;
+                font-weight: 600;
+            }
+        """)
+        self.setAlignment(Qt.AlignCenter)
+        self.setText(text)
+        self._resize_to_text()
+        self.hide()
+
+    def setText(self, text):
+        super().setText(text)
+        self._resize_to_text()
+
+    def _resize_to_text(self):
+        from PySide6.QtCore import QSize
+        from PySide6.QtGui import QFontMetrics
+        fm = QFontMetrics(self.font())
+        text_w = fm.horizontalAdvance(self.text())
+        text_h = fm.height()
+        m = self.contentsMargins()
+        self.resize(QSize(text_w + m.left() + m.right() + 2,
+                          text_h + m.top() + m.bottom() + 2))
+
+    def paintEvent(self, event):
+        """完全自绘 — 背景 + 边框 + 文字,绕开 stylesheet 色彩坑。"""
+        from PySide6.QtGui import QPainter, QColor, QPen, QPainterPath
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        rect = self.rect()
+        path = QPainterPath()
+        path.addRoundedRect(rect.adjusted(1, 1, -1, -1), 5, 5)
+        p.fillPath(path, QColor("#1F2030"))
+        pen = QPen(QColor("#3D3E4F"))
+        pen.setWidth(1)
+        p.setPen(pen)
+        p.drawPath(path)
+        p.setPen(QColor("#FFFFFF"))
+        p.drawText(rect, Qt.AlignCenter, self.text())
+        p.end()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        # 把标签放到 anchor 下方居中,必要时上移防溢出
+        rect = self._anchor.rect()
+        gp = self._anchor.mapToGlobal(rect.bottomLeft())
+        x = gp.x() + (rect.width() - self.width()) // 2
+        y = gp.y() + 8
+        screen = QApplication.primaryScreen().availableGeometry()
+        if y + self.height() > screen.bottom():
+            y = self._anchor.mapToGlobal(rect.topLeft()).y() - self.height() - 8
+        self.move(x, y)
+        self.raise_()
+
+
+class _HoverFilter(QObject):
+    """把鼠标 enter/leave 事件桥接到 HoverLabel 的 show/hide。"""
+    def __init__(self, tip: HoverLabel):
+        super().__init__()
+        self._tip = tip
+    def eventFilter(self, obj, event):
+        if event.type() == QEvent.Enter:
+            self._tip.show()
+        elif event.type() == QEvent.Leave:
+            self._tip.hide()
+        return False
 
 
 class ToggleSwitch(QFrame):
@@ -238,10 +394,10 @@ class RoomCard(QFrame):
         self.switch_btn.setChecked(room_info.get("enabled", True))
         self.switch_btn.toggled.connect(self.on_toggle)
 
-        btn_folder = QToolButton()
-        btn_folder.setText("📁")
+        btn_folder = _HoverToolButton("📁", "打开文件夹")
         btn_folder.setFixedSize(40, 40)
-        btn_folder.setToolTip("打开文件夹")
+        # 关键: 不再 setToolTip — 系统 tooltip 在 Win11 暗色主题下是黑底黑字,
+        # 会盖在自定义 HoverLabel 上面,看起来像"全黑"。完全用 HoverLabel 替代。
         btn_folder.setStyleSheet("""
             QToolButton {
                 background-color: transparent;
@@ -259,11 +415,11 @@ class RoomCard(QFrame):
         """)
         btn_folder.setCursor(QCursor(Qt.PointingHandCursor))
         btn_folder.clicked.connect(lambda: self.open_folder_signal.emit(self.room_id))
+        self._tip_folder = HoverLabel(btn_folder, "打开文件夹")
+        btn_folder.attach_tip(self._tip_folder)
 
-        self.btn_cut = QToolButton()
-        self.btn_cut.setText("✂️")
+        self.btn_cut = _HoverToolButton("✂️", "未在录制")
         self.btn_cut.setFixedSize(40, 40)
-        self.btn_cut.setToolTip("立即切割")
         self.btn_cut.setStyleSheet("""
             QToolButton {
                 background-color: transparent;
@@ -285,11 +441,11 @@ class RoomCard(QFrame):
         """)
         self.btn_cut.setCursor(QCursor(Qt.PointingHandCursor))
         self.btn_cut.clicked.connect(lambda: self.cut_signal.emit(self.room_id))
+        self._tip_cut = HoverLabel(self.btn_cut, "未在录制")
+        self.btn_cut.attach_tip(self._tip_cut)
 
-        btn_delete = QToolButton()
-        btn_delete.setText("🗑️")
+        btn_delete = _HoverToolButton("🗑️", "删除该频道")
         btn_delete.setFixedSize(40, 40)
-        btn_delete.setToolTip("删除")
         btn_delete.setStyleSheet("""
             QToolButton {
                 background-color: transparent;
@@ -307,11 +463,11 @@ class RoomCard(QFrame):
         """)
         btn_delete.setCursor(QCursor(Qt.PointingHandCursor))
         btn_delete.clicked.connect(lambda: self.delete_signal.emit(self.room_id))
+        self._tip_delete = HoverLabel(btn_delete, "删除该频道")
+        btn_delete.attach_tip(self._tip_delete)
 
-        btn_settings = QToolButton()
-        btn_settings.setText("⚙️")
+        btn_settings = _HoverToolButton("⚙️", "频道设置")
         btn_settings.setFixedSize(40, 40)
-        btn_settings.setToolTip("房间设置")
         btn_settings.setStyleSheet("""
             QToolButton {
                 background-color: transparent;
@@ -329,6 +485,8 @@ class RoomCard(QFrame):
         """)
         btn_settings.setCursor(QCursor(Qt.PointingHandCursor))
         btn_settings.clicked.connect(lambda: self.settings_signal.emit(self.room_id))
+        self._tip_settings = HoverLabel(btn_settings, "频道设置")
+        btn_settings.attach_tip(self._tip_settings)
 
         btn_layout.addWidget(self.switch_btn)
         btn_layout.addStretch()
@@ -496,9 +654,11 @@ class RoomCard(QFrame):
         can_cut = self.is_recording_active()
         self.btn_cut.setEnabled(can_cut)
         if can_cut:
-            self.btn_cut.setToolTip("立即切割")
+            if hasattr(self, "_tip_cut"):
+                self._tip_cut.setText("立即切割")
         else:
-            self.btn_cut.setToolTip("仅在录制中时可切割")
+            if hasattr(self, "_tip_cut"):
+                self._tip_cut.setText("未在录制")
 
     def is_monitoring_enabled(self):
         return self._is_monitoring

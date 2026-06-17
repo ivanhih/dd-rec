@@ -38,7 +38,7 @@
         "monitor_delay": "自动",
         "monitor_interval": "自动",
         "monitor_concurrency": "自动",
-        "monitor_debounce": "5 分钟",
+        "monitor_debounce": "30 秒",
         "monitor_proxy": "",
         "download_cover": true,
         "condition_title": "",
@@ -128,6 +128,18 @@
                 "stream_codec": "h264",
                 "chat_format": "xml",
                 "monitor_debounce": "5 分钟",
+                "notify_enabled": true
+            }
+        },
+        "1993290946": {
+            "sessdata": "",
+            "format": "",
+            "quality": 10000,
+            "custom_dir": "",
+            "overrides": {
+                "stream_resolution": "流畅",
+                "chat_format": "xml",
+                "monitor_debounce": "30 秒",
                 "notify_enabled": true
             }
         }

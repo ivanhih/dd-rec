@@ -6,6 +6,9 @@ import platform
 import subprocess
 import datetime
 import logging
+import threading as _threading
+import traceback as _traceback
+from logging.handlers import RotatingFileHandler
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QScrollArea, QLineEdit, QPushButton, QLabel, QGridLayout,
@@ -19,7 +22,7 @@ from core.config import load_app_data, save_app_data, VIDEO_SAVE_DIR, get_room_c
 from core.bili_api import get_bili_info
 from core.recorder import BiliRecorder
 from core.utils import render_path_template
-from ui.room_card import RoomCard
+from ui.room_card import RoomCard, HoverLabel, _HoverToolButton, _HoverPushButton
 from ui.settings_dialog import RoomSettingsDialog, GlobalSettingsOldStyleReplicaPage, AddChannelDialog, open_room_settings_overlay, open_room_settings_overlay
 
 
@@ -65,16 +68,51 @@ def _preview_save_path(room_id: str, uname: str, title: str, now_dt) -> str:
         return os.path.join(fallback_dir, f"room_{room_id}_{now_str}.{fmt}")
 
 
-# 日志配置
+# 日志配置 —— 写到文件 + stdout 双输出，方便关窗后回溯崩溃
+PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+LOG_DIR = os.path.join(PROJECT_ROOT, "录播文件", "log")
+os.makedirs(LOG_DIR, exist_ok=True)
+LOG_FILE = os.path.join(LOG_DIR, "bilirec.log")
+
 _stdout_handler = logging.StreamHandler(stream=sys.stdout)
 if hasattr(_stdout_handler.stream, 'reconfigure'):
     _stdout_handler.stream.reconfigure(encoding='utf-8')
+
+_file_handler = RotatingFileHandler(
+    LOG_FILE,
+    maxBytes=5 * 1024 * 1024,  # 5MB
+    backupCount=5,             # 保留 5 个备份
+    encoding="utf-8",
+)
+
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
+    format="%(asctime)s [%(levelname)s] %(name)s | %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
-    handlers=[_stdout_handler]
+    handlers=[_stdout_handler, _file_handler],
 )
+
+
+# —— 兜底 1：主线程未捕获异常（Qt 事件循环内 / QThread run() 顶层）——
+def _bilirec_excepthook(exc_type, exc_value, exc_tb):
+    msg = "".join(_traceback.format_exception(exc_type, exc_value, exc_tb))
+    logging.error(f"[main] 未捕获异常:\n{msg}")
+    sys.__excepthook__(exc_type, exc_value, exc_tb)
+
+sys.excepthook = _bilirec_excepthook
+
+
+# —— 兜底 2：子线程 (QThread / daemon) 未捕获异常 ——
+# Python 3.8+ 把子线程异常投递到 threading.excepthook 而不是 sys.excepthook，
+# 不接住的话会"静默崩 + 进程存活但房间监控死掉"，看起来就是"软件自己关了"。
+def _thread_excepthook(args):
+    msg = "".join(_traceback.format_exception(args.exc_type, args.exc_value, args.exc_traceback))
+    logging.error(
+        f"[thread {args.thread.name}] 未捕获异常:\n{msg}"
+    )
+    sys.__excepthook__(args.exc_type, args.exc_value, args.exc_traceback)
+
+_threading.excepthook = _thread_excepthook
 
 
 class Notification(QWidget):
@@ -352,12 +390,29 @@ class MainWindow(QMainWindow):
         return QIcon(pixmap)
 
     def _create_sidebar_nav_button(self, text, tooltip):
-        button = QToolButton()
-        button.setText(text)
-        button.setToolTip(tooltip)
+        # tooltip 参数保留 API 兼容,但不调 setToolTip — 系统 tooltip 在 Win11 暗色
+        # 主题下是黑底黑字,盖在自定义 HoverLabel 上看不到字。完全用 HoverLabel。
+        del tooltip
+        button = _HoverToolButton(text, "")
         button.setFixedSize(56, 56)
         button.setCursor(Qt.PointingHandCursor)
         return button
+
+    def _wire_hover(self, button, text, attr_name=None):
+        """给 sidebar / 顶部按钮挂自定义 hover tip。
+
+        attr_name: 可选, 把 tip 引用存到 self.<attr_name>, 后续可动态 setText。
+        """
+        tip = HoverLabel(button, text)
+        # 兼容两种 button: _HoverToolButton (有 attach_tip) / 普通 QToolButton
+        if hasattr(button, "attach_tip"):
+            button.attach_tip(tip)
+        else:
+            from ui.room_card import _HoverFilter
+            button.installEventFilter(_HoverFilter(tip))
+        if attr_name:
+            setattr(self, attr_name, tip)
+        return tip
 
     def _update_sidebar_nav_styles(self):
         active_style = """
@@ -418,8 +473,10 @@ class MainWindow(QMainWindow):
         """)
         
         self.nav_channels_btn = self._create_sidebar_nav_button("📋", "频道")
+        self._wire_hover(self.nav_channels_btn, "频道")
         self.nav_channels_btn.clicked.connect(self.show_channels_page)
         self.nav_settings_btn = self._create_sidebar_nav_button("⚙️", "全局设置")
+        self._wire_hover(self.nav_settings_btn, "全局设置")
         self.nav_settings_btn.clicked.connect(self.show_global_settings_page)
 
         sidebar_layout.addWidget(logo_btn)
@@ -465,12 +522,12 @@ class MainWindow(QMainWindow):
         self.search_input.textChanged.connect(self.filter_cards)
 
         # 过滤和排序按钮
-        self.filter_btn = QToolButton()
+        self.filter_btn = _HoverToolButton("", "过滤")
         self.filter_btn.setFixedSize(44, 44)
         self.filter_btn.setIcon(self._create_toolbar_icon("filter"))
         self.filter_btn.setIconSize(QPixmap(20, 20).size())
         self.filter_btn.setPopupMode(QToolButton.InstantPopup)
-        self.filter_btn.setToolTip("过滤")
+        self._wire_hover(self.filter_btn, "过滤", attr_name="_filter_tip")
         self.filter_btn.setStyleSheet("""
             QToolButton {
                 background-color: #181920;
@@ -481,13 +538,13 @@ class MainWindow(QMainWindow):
                 background-color: #252631;
             }
         """)
-        
-        self.sort_btn = QToolButton()
+
+        self.sort_btn = _HoverToolButton("", "排序")
         self.sort_btn.setFixedSize(44, 44)
         self.sort_btn.setIcon(self._create_toolbar_icon("sort"))
         self.sort_btn.setIconSize(QPixmap(20, 20).size())
         self.sort_btn.setPopupMode(QToolButton.InstantPopup)
-        self.sort_btn.setToolTip("排序")
+        self._wire_hover(self.sort_btn, "排序", attr_name="_sort_tip")
         self.sort_btn.setStyleSheet("""
             QToolButton {
                 background-color: #181920;
@@ -500,7 +557,7 @@ class MainWindow(QMainWindow):
         """)
         
         # 添加按钮
-        self.btn_add = QPushButton("添加")
+        self.btn_add = _HoverPushButton("添加", "添加直播间")
         self.btn_add.setFixedHeight(44)
         self.btn_add.setMinimumWidth(100)
         self.btn_add.setStyleSheet("""
@@ -516,6 +573,7 @@ class MainWindow(QMainWindow):
                 background-color: #2563EB;
             }
         """)
+        self._wire_hover(self.btn_add, "添加直播间")
         self.btn_add.clicked.connect(self.add_channel)
 
         top_bar.addWidget(title_label)
@@ -860,7 +918,10 @@ class MainWindow(QMainWindow):
             "live": "过滤: 直播中",
             "paused": "过滤: 已暂停",
         }
-        self.filter_btn.setToolTip(labels.get(self.filter_mode, "过滤"))
+        # 关键: 不再 setToolTip — 系统 tooltip 在 Win11 暗色主题下是黑底黑字。
+        # 改用 _filter_tip / _sort_tip(由 _wire_hover 创建)动态更新文字。
+        if hasattr(self, "_filter_tip"):
+            self._filter_tip.setText(labels.get(self.filter_mode, "过滤"))
 
     def _update_sort_button(self):
         labels = {
@@ -869,7 +930,8 @@ class MainWindow(QMainWindow):
             "name": "排序: 名称",
             "room_id": "排序: 房间号",
         }
-        self.sort_btn.setToolTip(labels.get(self.sort_mode, "排序"))
+        if hasattr(self, "_sort_tip"):
+            self._sort_tip.setText(labels.get(self.sort_mode, "排序"))
     
     def _position_notification_container(self):
         """将通知容器定位到右下角"""
@@ -897,11 +959,8 @@ class MainWindow(QMainWindow):
         return super().eventFilter(obj, event)
 
     def add_channel(self):
-        dialog = AddChannelDialog(self)
-        if dialog.exec() and dialog.result:
-            info = dialog.result
-            self.add_card(info)
-            self.show_notification(f"已添加 {info['uname']}", "添加成功", "success", merge_key=f"add:{info['room_id']}")
+        from ui.settings_dialog import open_add_channel_overlay
+        open_add_channel_overlay(self)
 
     # ==================== 信号槽 ====================
     def on_card_toggle(self, room_id, enabled):

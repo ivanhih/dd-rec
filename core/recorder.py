@@ -243,11 +243,18 @@ def _emit_last_part_file_closed_webhook(recorder) -> None:
     _file_close_time = datetime.datetime.now().astimezone().isoformat(timespec="microseconds")
     try:
         # 关键：只算**当前 part**的实际大小（不要加 accumulated_size）
-        _stop_size = os.path.getsize(_stop_path)
-        # 关键：duration 用 current_part_start_time（不是 record_start_time）
+        # 优先用 stop_recording 时记下的"停止瞬间大小"（防抖期内不会被虚涨）
+        if recorder._last_part_size_at_stop and recorder._last_part_stop_time:
+            _stop_size = recorder._last_part_size_at_stop
+        else:
+            _stop_size = os.path.getsize(_stop_path)
+        # 关键：duration 用 current_part_start_time（不是 record_start_time），
+        # 但**截止时间**用 stop_recording 时记下的"停止瞬间时间戳"，
+        # 避免防抖 5 分钟内 duration 被虚涨。
         _open_time = recorder.current_part_start_time or recorder.record_start_time
+        _close_time = recorder._last_part_stop_time or time.time()
         if _open_time:
-            _stop_duration = float(max(0, time.time() - _open_time))
+            _stop_duration = float(max(0, _close_time - _open_time))
     except Exception:
         pass
     # 关键：同步重编码修 A/V 同步（-vsync cfr 让视频从 0 开始），让 webhook 用**重编码后**路径
@@ -477,6 +484,11 @@ class BiliRecorder(QObject):
         self._last_codec = None
         self._ffmpeg_exit_count = 0
         self._danmaku_recorder: Optional[DanmakuRecorder] = None
+        # 防抖期内关停录播后，记下"停止瞬间"的时间戳和 part 大小，
+        # 让防抖到期发 FileClosed 时能算出"停止瞬间那一刻的 duration/size"，
+        # 而不是"防抖结束后 5 分钟 + 实际 part 时长"的虚高值。
+        self._last_part_stop_time = 0.0
+        self._last_part_size_at_stop = 0
 
     @property
     def is_recording(self):
@@ -487,30 +499,51 @@ class BiliRecorder(QObject):
 
         关键问题：ffmpeg 用 -c copy 录实时流时，moov atom 默认在文件**末尾**。
         关闭时如果立即杀进程，moov 写一半 → "moov atom not found"。
-        这里用 SIGINT（不是 stdin "q"）触发 ffmpeg 内部 flush + trailer write，
+        这里用 stdin 'q'（不是 signal）触发 ffmpeg 内部 flush + trailer write，
         等待 wait_trailer 秒让 ffmpeg 完整写完 mp4 trailer。
 
+        修复：之前直接 send_signal(CTRL_BREAK_EVENT) 在部分 Windows 11 build 上
+        会触发 PySide6 主进程收到 SIGINT 退出，导致 GUI "神秘消失"。
+        现在改成 stdin 'q' 优先（ffmpeg 软关闭 + flush），失败再用 SIGINT 兜底。
+
         流程:
-          1. SIGINT → ffmpeg 内部 flush（处理完所有 in-flight packet）
+          1. stdin 'q' → ffmpeg 内部 flush（处理完所有 in-flight packet）
           2. 等 wait_trailer 秒（默认 10s，足够 4K HDR 也写完）
-          3. 如果还没退出 → SIGTERM
-          4. 如果还没退出 → SIGKILL（兜底）
+          3. 如果还没退出 → SIGINT（兜底，不影响主进程，因为 ffmpeg 走的是
+             CREATE_NEW_PROCESS_GROUP 自己的 process group）
+          4. 如果还没退出 → SIGTERM
+          5. 如果还没退出 → SIGKILL（兜底）
         """
         if not process or process.poll() is not None:
             return
         import signal as _sig
-        # Step 1: SIGINT 触发 ffmpeg 内部 flush
+
+        # Step 1: stdin 'q' 触发 ffmpeg 内部 flush（最安全，不动 signal）
+        try:
+            if process.stdin and not process.stdin.closed:
+                process.stdin.write(b"q\n")
+                process.stdin.flush()
+            try:
+                process.wait(timeout=wait_trailer)
+                logging.debug(f"ffmpeg 收到 stdin q 后 {wait_trailer}s 内自然退出")
+                return
+            except subprocess.TimeoutExpired:
+                pass
+        except Exception as e:
+            logging.debug(f"ffmpeg stdin q 关闭失败，降级到 signal: {e}")
+
+        # Step 2: SIGINT 兜底（CREATE_NEW_PROCESS_GROUP 隔离，不会误伤主进程）
         try:
             process.send_signal(_sig.CTRL_BREAK_EVENT if platform.system() == "Windows" else _sig.SIGINT)
         except Exception:
             pass
-        # Step 2: 等 ffmpeg 自己写完 trailer
         try:
             process.wait(timeout=wait_trailer)
             logging.debug(f"ffmpeg 收到 SIGINT 后 {wait_trailer}s 内自然退出")
             return
         except subprocess.TimeoutExpired:
             pass
+
         # Step 3: SIGTERM 兜底
         try:
             process.terminate()
@@ -518,6 +551,7 @@ class BiliRecorder(QObject):
             return
         except Exception:
             pass
+
         # Step 4: SIGKILL 兜底（不应该到这里）
         try:
             process.kill()
@@ -542,17 +576,28 @@ class BiliRecorder(QObject):
             self._danmaku_recorder = None
 
         self.current_ffmpeg = None
-        self.current_save_path = None
-        self.stream_url = None
-
+        # 关键：记下"停止瞬间"的时间戳和 part 大小（如果还在写 part），让防抖到期
+        # 发 FileClosed 时能算出"停止那一刻"的 duration/size，而不是防抖期内虚涨的值。
+        if was_recording and self.current_save_path:
+            self._last_part_stop_time = time.time()
+            try:
+                self._last_part_size_at_stop = os.path.getsize(self.current_save_path)
+            except OSError:
+                self._last_part_size_at_stop = 0
+        # 关键：不立即清 current_save_path / current_session_id —— 防抖到期还需要
+        # 拿这两个值发 FileClosed + RecordingFinishedEvent；只有 reset_time=True
+        # 时（即"真正下播 / 用户主动关停监控"）才彻底清空。
         if reset_time:
-            # 只有真正停止（主播下播）时才重置时间
+            self.current_save_path = None
+            self.stream_url = None
             self.record_start_time = 0
             self.current_part_start_time = 0
             self.last_total_size = 0
             self.accumulated_size = 0
             # 会话结束，清空 SessionId 让下次重新生成
             self.current_session_id = ""
+            self._last_part_stop_time = 0.0
+            self._last_part_size_at_stop = 0
 
         if was_recording:
             logging.info(f"⏹️ 已停止录制: {self.room_id}")
@@ -829,13 +874,17 @@ class BiliRecorder(QObject):
             now_time = time.time()
 
             if not self.is_monitoring:
-                if self.is_recording:
+                if self.is_recording or (self.current_save_path and self.current_session_id):
                     # 用户关停监控时，把当前录制当成一次完整会话上报。
                     # 必须在 stop_recording 之前发，否则 record_start_time 被清零、duration 算不出。
                     # 同时补发最后一分P 的 FileClosed，否则最后一个 part 不会上传。
+                    # 注意：也要覆盖"防抖期内"的情况（is_recording=False 但 current_save_path 还在）——
+                    # 用户关停监控 = 主动结束录制，立刻发结束事件 + stop_recording(True) 清空。
                     _emit_last_part_file_closed_webhook(self)
                     _emit_recording_stopped_webhook(self)
-                    self.stop_recording(reset_time=True)  # 关闭监控时重置录制时间
+                    _send_notify("recording_stopped", self.room_id, self.uname, self.current_title, {"cover": self.current_cover, "face": self.current_face})
+                    # 无论在录 / 防抖期内，都 reset_time=True 清空所有状态
+                    self.stop_recording(reset_time=True)
                 # 注意：未录制时不再发 live_ended —— 主循环每 2 秒轮询一次会产生风暴，
                 # 而 biliupforjava 自己有 RoomStatusSyncJob 兜底同步房间状态，不需要我们推。
                 self.status_updated.emit("⚙️ 已暂停", "🌙 未开播", "⏳ 闲置中",
@@ -902,6 +951,22 @@ class BiliRecorder(QObject):
                             self.current_parent_area = new_parent
                             self.current_area = new_area
 
+                            # 关键：检测到主播下播（live_status != 1）→ 主动 stop_recording(False)
+                            # 杀 ffmpeg、停弹幕，**不**清 part 信息。continue 跳出 874 块
+                            # 让主循环下次轮询进 else 分支走防抖流程。
+                            # 否则主循环会一直在 is_recording 块跑（只检查标题/分区/编码），
+                            # 永远走不到"下播"路径。
+                            if info.get("live_status") != 1:
+                                logging.info(f"🔍 {self.room_id} API 返回下播（live_status={info.get('live_status')}），主动停录进入防抖")
+                                if self.is_recording:
+                                    self.stop_recording(reset_time=False)
+                                self.last_api_check_time = now_time
+                                self.status_updated.emit("⚠️ 监控中", "🌙 未开播", "⏳ 等待防抖",
+                                                        self.current_title, "", "", "",
+                                                        self.current_parent_area, self.current_area)
+                                time.sleep(2)
+                                continue
+
                         # 检测编码改变（需要置 stream_info）
                         if get_global_setting("split_on_codec_change"):
                             new_info = get_stream_info(self.room_id)
@@ -914,13 +979,23 @@ class BiliRecorder(QObject):
 
                         self.last_api_check_time = now_time
 
-                # 检测流不连续：ffmpeg 意外退出但主播仍在直播
-                if get_global_setting("split_on_stream_discontinuity"):
-                    if self.current_ffmpeg and self.current_ffmpeg.poll() is not None:
-                        logging.info(f"⚡ {self.room_id} ffmpeg 意外退出，检测到流不连续，触发重新录制")
-                        self._ffmpeg_exit_count += 1
-                        self.current_ffmpeg = None
-                        # 不 stop_recording，直接让外层循环重新拉流并重启录制
+                # 检测流不连续：ffmpeg 意外退出。
+                # 调 stop_recording(reset_time=False)：保留 current_save_path / current_session_id
+                # 给后续防抖路径（或 API 翻回 1 重启路径）使用。
+                if self.current_ffmpeg and self.current_ffmpeg.poll() is not None:
+                    logging.warning(f"⚠️ {self.room_id} ffmpeg 进程已退出（可能 B 站流断开）")
+                    # 关键：用 reset_time=False 保留 part 信息
+                    self.stop_recording(reset_time=False)
+                    if get_global_setting("split_on_stream_discontinuity"):
+                        self.status_updated.emit("⚠️ 监控中", "📡 直播中", "⏸️ 录制中断（流不连续）",
+                                                self.current_title, "", "", "",
+                                                self.current_parent_area, self.current_area)
+                    else:
+                        self.status_updated.emit("⚠️ 监控中", "📡 直播中", "⏸️ 录制中断",
+                                                self.current_title, "", "", "",
+                                                self.current_parent_area, self.current_area)
+                    time.sleep(2)
+                    continue
 
                 self.status_updated.emit("🟢 监控中", "📡 直播中", "🔴 录制中",
                                         self.current_title, duration_str, speed_str, size_str,
@@ -967,6 +1042,26 @@ class BiliRecorder(QObject):
                     time.sleep(2)
                     continue
 
+                # 关键：防抖期内 API 翻回 1（短暂断流后重新开播）→ 主循环进到这里。
+                # 1. 先补发旧 part 的 FileClosed（让 biliupforjava 把旧 part 入队）
+                # 2. 清 current_ffmpeg / 弹幕引用
+                # 3. 然后正常启 ffmpeg 写新 part，session_id 延续
+                # 关键：判定条件 _last_part_stop_time != 0 而不是 _live_first_seen == 0，
+                # 避免与 trigger_cut 路径冲突（trigger_cut 走 _do_cut 内部发 FileClosed）。
+                if self.current_save_path and self.current_session_id and self._last_part_stop_time:
+                    logging.info(f"🔄 {self.room_id} 防抖期内 API 翻回 1，补发旧 part FileClosed 后重启录制")
+                    _emit_last_part_file_closed_webhook(self)
+                    # 不调 stop_recording —— _last_part_stop_time 已经是首检下播时记下的，
+                    # _emit_last_part_file_closed_webhook 会用它算旧 part 的 duration/size。
+                    # 只需要清 current_ffmpeg / 弹幕引用，让下面启新 ffmpeg 走通。
+                    if self._danmaku_recorder:
+                        self._danmaku_recorder.stop()
+                        self._danmaku_recorder = None
+                    self.current_ffmpeg = None
+                    # 清掉 _last_part_* 让下一次防抖首检能正确触发
+                    self._last_part_stop_time = 0.0
+                    self._last_part_size_at_stop = 0
+
                 stream_info = get_stream_info(self.room_id)
                 if stream_info:
                     self.stream_url = stream_info["url"]
@@ -984,11 +1079,15 @@ class BiliRecorder(QObject):
                         self.record_start_time = time.time()
                         self.last_total_size = 0
                         self.accumulated_size = 0
-                        # 当前 part 开始时间：跟 record_start_time 同步
                         self.current_part_start_time = time.time()
                         # 为本次录制会话生成一个固定 SessionId
                         # —— 后续 split / stopped 都用同一个，保证 biliupforjava 端 session 一致
                         self.current_session_id = str(uuid.uuid4())
+                    else:
+                        # 关键：本次是"防抖期内 API 翻回 1 重启 ffmpeg"或"split 切 part"路径。
+                        # 重置 current_part_start_time 让新 part 的 duration 从 0 开始算；
+                        # session_id 延续（biliupforjava 端同一会话续命）。
+                        self.current_part_start_time = time.time()
 
                     # 启动弹幕录制
                     if get_global_setting("chat_record_enabled"):
@@ -1033,15 +1132,22 @@ class BiliRecorder(QObject):
                 self.status_updated.emit("🟢 监控中", "🌙 未开播", "⏳ 闲置中",
                                         self.current_title, "", "", "",
                                         self.current_parent_area, self.current_area)
-                if self.is_recording:
-                    # 防抖：B 站 API 的 live_status 偶尔会短暂返回 0（网络抖动/主播短暂断流），
-                    # 不应该立刻判定下播。必须**持续 N 分钟**检测到下播才真正停录 + 发结束事件。
-                    # 这里的 N 取全局 monitor_debounce 配置（默认 5 分钟）。
+                # 主播下播流程：先 stop_recording（杀 ffmpeg / 停弹幕 / 转码），
+                # 然后进入防抖期，5 分钟内 API 翻回 1 算"短暂断流"，重置防抖重启 ffmpeg；
+                # 5 分钟到才发 FileClosed + RecordingFinishedEvent + 通知。
+                if self.current_save_path and self.current_session_id:
                     _debounce_sec = _parse_monitor_seconds("monitor_debounce", 300)
                     now_ts = time.time()
                     if not self._live_first_seen:
+                        # 首检：先关停录播，再开始防抖
                         self._live_first_seen = now_ts
-                        logging.info(f"⏳ {self.room_id} 检测到主播下播，等待 {int(_debounce_sec)}s 确认...")
+                        logging.info(f"⏳ {self.room_id} 检测到主播下播，停止录制后等待 {int(_debounce_sec)}s 确认...")
+                        if self.is_recording:
+                            # reset_time=False：保留 current_save_path / current_session_id
+                            # 给防抖到期发 FileClosed 用
+                            self.stop_recording(reset_time=False)
+                        time.sleep(_parse_monitor_seconds("monitor_interval", 20))
+                        continue
                     elif now_ts - self._live_first_seen >= _debounce_sec:
                         # 防抖窗口过了 → 真正下播
                         self._live_first_seen = 0.0
@@ -1051,16 +1157,21 @@ class BiliRecorder(QObject):
                         _emit_last_part_file_closed_webhook(self)
                         _emit_recording_stopped_webhook(self)
                         _send_notify("recording_stopped", self.room_id, self.uname, self.current_title, {"cover": self.current_cover, "face": self.current_face})
+                        # reset_time=True：彻底清空状态（current_save_path / session_id 等）
+                        self.stop_recording(reset_time=True)
+                        time.sleep(_parse_monitor_seconds("monitor_interval", 20))
+                        continue
                     else:
-                        # 还在防抖窗口内，不动
+                        # 还在防抖窗口内，等下一轮轮询
                         self.status_updated.emit("🟢 监控中", "🌙 未开播", f"⏳ 确认中({int((_debounce_sec - (now_ts - self._live_first_seen)))}s)",
                                                 self.current_title, "", "", "",
                                                 self.current_parent_area, self.current_area)
                         time.sleep(_parse_monitor_seconds("monitor_interval", 20))
                         continue
-                # 注意：未录制时不再发 live_ended —— 主循环每 20 秒轮询一次会产生风暴，
-                # 而 biliupforjava 自己有 RoomStatusSyncJob 兜底同步房间状态，不需要我们推。
-                self.stop_recording(reset_time=True)
+                # 兜底：current_save_path 为空 + API 下播（用户主动关停监控后会到这里，
+                # 或主播下播前还没开始录）。直接清理状态，不发任何事件。
+                if self.is_recording:
+                    self.stop_recording(reset_time=True)
                 self._live_first_seen = 0.0   # 下播，重置 debounce
                 time.sleep(_parse_monitor_seconds("monitor_interval", 20))
 

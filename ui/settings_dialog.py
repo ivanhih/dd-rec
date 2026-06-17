@@ -2223,3 +2223,69 @@ def open_room_settings_overlay(room_id, uname, main_window):
 
     close_btn.clicked.connect(_close)
     overlay.mousePressEvent = lambda e: _close()
+
+
+# ------------------------------------------------------------------
+# Overlay entry point called from MainWindow.add_channel
+# ------------------------------------------------------------------
+def open_add_channel_overlay(main_window):
+    """添加直播间 — overlay 风格(全屏半透明遮罩 + 居中输入框)。
+
+    复用 AddChannelDialog 已有的输入 + 错误提示 + 异步加载直播间信息逻辑,
+    但不用 QDialog 模态弹窗,而是作为普通 widget 嵌到全屏遮罩中央。
+    加载完成后调 main_window.add_card 添加卡片,再关掉 overlay。
+    """
+    # 1) 全屏半透明遮罩
+    overlay = QWidget(main_window)
+    overlay.setStyleSheet("background: rgba(0,0,0,0.72);")
+    overlay.resize(main_window.size())
+    overlay.move(0, 0)
+    overlay.show(); overlay.raise_()
+
+    # 2) 嵌入 AddChannelDialog,去掉 QDialog 模态边框
+    dialog = AddChannelDialog(main_window)
+    dialog.setWindowFlags(Qt.Widget)
+    dialog.setModal(False)
+    dialog.setFixedSize(420, 260)
+
+    # 顶部加一个小标题
+    title = QLabel("添加直播间")
+    title.setFont(QFont("Microsoft YaHei UI", 14, QFont.Bold))
+    title.setStyleSheet("color: #F8FAFC; border: none; background: transparent;")
+    dialog.layout().insertWidget(0, title)
+
+    # 居中
+    dialog.move(
+        (main_window.width() - dialog.width()) // 2,
+        (main_window.height() - dialog.height()) // 2,
+    )
+    dialog.show(); dialog.raise_()
+
+    # 3) 关闭 hook
+    def _close():
+        overlay.hide(); overlay.deleteLater()
+        dialog.hide(); dialog.deleteLater()
+
+    # 4) accepted/rejected 信号: dialog.confirm() 完成后会调 self.accept()
+    #    (因为我们 setWindowFlags(Qt.Widget) 不再真正关闭,只触发信号)
+    def _on_accepted():
+        info = dialog.result
+        if info:
+            main_window.add_card(info)
+            main_window.show_notification(
+                f"已添加 {info['uname']}", "添加成功", "success",
+                merge_key=f"add:{info['room_id']}",
+            )
+        _close()
+
+    def _on_rejected():
+        _close()
+
+    dialog.accepted.connect(_on_accepted)
+    dialog.rejected.connect(_on_rejected)
+
+    # 5) 点击 overlay 空白处也关
+    def _on_overlay_click(event):
+        if not dialog.geometry().contains(event.pos()):
+            _close()
+    overlay.mousePressEvent = _on_overlay_click
