@@ -177,6 +177,12 @@ def reload_config() -> bool:
         return False
 
 
+def ensure_default_config():
+    """如果 config.json 不存在，生成默认配置。"""
+    if not os.path.exists(CONFIG_FILE):
+        save_config()
+
+
 def save_config():
     with open(CONFIG_FILE, "w", encoding="utf-8") as f:
         json.dump(CONFIG, f, ensure_ascii=False, indent=4)

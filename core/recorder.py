@@ -1,4 +1,5 @@
 # core/recorder.py
+import sys
 import time
 import datetime
 import threading
@@ -21,10 +22,62 @@ from core.bili_api import get_bili_info, get_stream_info
 from core.utils import format_size, render_path_template
 from core.danmaku_recorder import DanmakuRecorder
 
+
+def _get_ffmpeg_path():
+    """获取 ffmpeg 路径，支持打包后的场景"""
+    if getattr(sys, 'frozen', False):
+        # 打包后：从 exe 同目录查找
+        base_dir = os.path.dirname(sys.executable)
+        if platform.system() == "Windows":
+            return os.path.join(base_dir, "ffmpeg.exe")
+        else:
+            return os.path.join(base_dir, "ffmpeg")
+    else:
+        # 开发时：从项目根目录查找
+        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        if platform.system() == "Windows":
+            return os.path.join(project_root, "ffmpeg.exe")
+        else:
+            return os.path.join(project_root, "ffmpeg")
+
+
+def _extract_ffmpeg():
+    """从打包资源中提取 ffmpeg（如果尚未提取）"""
+    if not getattr(sys, 'frozen', False):
+        return  # 开发环境不需要
+
+    base_dir = os.path.dirname(sys.executable)
+    ffmpeg_path = os.path.join(base_dir, "ffmpeg.exe")
+    ffprobe_path = os.path.join(base_dir, "ffprobe.exe")
+
+    # 如果 ffmpeg 已存在，直接返回
+    if os.path.exists(ffmpeg_path):
+        return
+
+    # 确定 ffmpeg 源目录（datas 打包到 ffmpeg/ 子目录）
+    if hasattr(sys, '_MEIPASS'):
+        src_dir = os.path.join(sys._MEIPASS, 'ffmpeg')
+    else:
+        src_dir = base_dir
+
+    src_ffmpeg = os.path.join(src_dir, "ffmpeg.exe")
+    src_ffprobe = os.path.join(src_dir, "ffprobe.exe")
+
+    # 复制到 exe 同目录
+    import shutil
+    if os.path.exists(src_ffmpeg):
+        shutil.copy2(src_ffmpeg, ffmpeg_path)
+    if os.path.exists(src_ffprobe):
+        shutil.copy2(src_ffprobe, ffprobe_path)
+
+
+# 启动时尝试提取 ffmpeg
+_extract_ffmpeg()
+
 if platform.system() == "Windows":
-    LOCAL_FFMPEG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "ffmpeg.exe")
+    LOCAL_FFMPEG = _get_ffmpeg_path()
 else:
-    LOCAL_FFMPEG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "ffmpeg")
+    LOCAL_FFMPEG = _get_ffmpeg_path()
 
 FFMPEG_CMD = LOCAL_FFMPEG if os.path.exists(LOCAL_FFMPEG) else "ffmpeg"
 
@@ -715,7 +768,7 @@ class BiliRecorder(QObject):
             save_path
         ]  # noqa
         proxy_env = self._get_proxy_env()
-        # Windows 下要 CREATE_NEW_PROCESS_GROUP 才能收到 CTRL_BREAK_EVENT / SIGINT
+        # Windows 下隐藏 ffmpeg 命令行窗口，同时保持进程组功能用于优雅关闭
         _popen_kwargs = dict(
             stdin=subprocess.PIPE,
             stdout=subprocess.DEVNULL,
@@ -723,7 +776,8 @@ class BiliRecorder(QObject):
             env=proxy_env,
         )
         if platform.system() == "Windows":
-            _popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+            # CREATE_NO_WINDOW = 隐藏窗口, CREATE_NEW_PROCESS_GROUP = 可接收 Ctrl+C
+            _popen_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
         return subprocess.Popen(cmd, **_popen_kwargs)
 
     def trigger_cut(self):
@@ -1146,6 +1200,10 @@ class BiliRecorder(QObject):
                             # reset_time=False：保留 current_save_path / current_session_id
                             # 给防抖到期发 FileClosed 用
                             self.stop_recording(reset_time=False)
+                        # 立即发信号让卡片 fade_out 统计信息
+                        self.status_updated.emit("🟢 监控中", "🌙 未开播", "⏳ 确认中",
+                                                self.current_title, "", "", "",
+                                                self.current_parent_area, self.current_area)
                         time.sleep(_parse_monitor_seconds("monitor_interval", 20))
                         continue
                     elif now_ts - self._live_first_seen >= _debounce_sec:
@@ -1172,6 +1230,10 @@ class BiliRecorder(QObject):
                 # 或主播下播前还没开始录）。直接清理状态，不发任何事件。
                 if self.is_recording:
                     self.stop_recording(reset_time=True)
+                    # 发信号让卡片 fade_out 统计信息
+                    self.status_updated.emit("🟢 监控中", "🌙 未开播", "⏳ 闲置中",
+                                            self.current_title, "", "", "",
+                                            self.current_parent_area, self.current_area)
                 self._live_first_seen = 0.0   # 下播，重置 debounce
                 time.sleep(_parse_monitor_seconds("monitor_interval", 20))
 

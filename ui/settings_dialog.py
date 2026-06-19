@@ -677,7 +677,7 @@ class GlobalSettingsOldStyleReplicaPage(QWidget):
         line.setObjectName("settingDivider")
         return line
 
-    def _setting_item(self, title_text, desc_text, control):
+    def _setting_item(self, title_text, desc_text, control, reset_widget=None):
         wrapper = QWidget()
         layout = QHBoxLayout(wrapper)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -698,7 +698,87 @@ class GlobalSettingsOldStyleReplicaPage(QWidget):
 
         layout.addLayout(text_col, 1)
         layout.addWidget(control, 0, Qt.AlignRight | Qt.AlignVCenter)
+        if reset_widget:
+            layout.addWidget(reset_widget, 0, Qt.AlignRight | Qt.AlignVCenter)
         return wrapper
+
+    def _reset_button(self, key, default_value):
+        """生成两阶段确认重置按钮（点重置 -> 显示确认重置 -> 点确认才执行）"""
+        btn = QPushButton("重置")
+        btn.setFixedSize(60, 28)
+        btn.setStyleSheet("""
+            QPushButton {
+                background: transparent;
+                border: 1px solid #3D3E4A;
+                border-radius: 6px;
+                color: #94A3B8;
+                font-size: 11px;
+                padding: 0 8px;
+            }
+            QPushButton:hover {
+                background: #2D2E3A;
+                color: #F87171;
+                border-color: #F87171;
+            }
+        """)
+        confirm = QPushButton("确认重置")
+        confirm.setFixedSize(60, 28)
+        confirm.setStyleSheet("""
+            QPushButton {
+                background: #EF4444;
+                border: none;
+                border-radius: 6px;
+                color: white;
+                font-size: 11px;
+                padding: 0 8px;
+            }
+            QPushButton:hover {
+                background: #DC2626;
+            }
+        """)
+        confirm.hide()
+
+        def _on_reset():
+            btn.hide()
+            confirm.show()
+
+        def _do_reset():
+            self._save_setting(key, default_value)
+            self._refresh_widget(key, default_value)
+            confirm.hide()
+            btn.show()
+
+        btn.clicked.connect(_on_reset)
+        confirm.clicked.connect(_do_reset)
+
+        wrapper = QWidget()
+        w_layout = QHBoxLayout(wrapper)
+        w_layout.setContentsMargins(0, 0, 0, 0)
+        w_layout.setSpacing(4)
+        w_layout.addWidget(btn)
+        w_layout.addWidget(confirm)
+        return wrapper
+
+    def _refresh_widget(self, key, default_value):
+        """重置后刷新控件 UI 到默认值"""
+        widget = self._controls.get(key)
+        if widget is None:
+            return
+        if isinstance(widget, ToggleSwitch):
+            widget.setChecked(bool(default_value))
+        elif isinstance(widget, tuple):       # split_by_duration 三元组
+            h, m, s = widget
+            parts = str(default_value).split(":")
+            h.setText(parts[0] if len(parts) > 0 else "1")
+            m.setText(parts[1] if len(parts) > 1 else "00")
+            s.setText(parts[2] if len(parts) > 2 else "00")
+        elif isinstance(widget, QLineEdit):
+            widget.setText(str(default_value) if default_value else "")
+        elif isinstance(widget, QTextEdit):
+            widget.setPlainText(str(default_value) if default_value else "")
+        elif isinstance(widget, QComboBox):
+            idx = widget.findText(str(default_value))
+            widget.setCurrentIndex(idx if idx >= 0 else 0)
 
     def _bind_line_edit(self, widget, key):
         widget.editingFinished.connect(lambda k=key, w=widget: self._save_setting(k, w.text()))
@@ -768,8 +848,12 @@ class GlobalSettingsOldStyleReplicaPage(QWidget):
 
     def _build_appearance_card(self):
         return self._setting_card("外观", "#7B61FF", [
-            self._setting_item("语言", "界面显示语言", self._combo("language", ["简体中文"], 120)),
-            self._setting_item("主题", "应用主题模式", self._combo("theme", ["深色"], 120)),
+            self._setting_item("语言", "界面显示语言",
+                self._combo("language", ["简体中文"], 120),
+                self._reset_button("language", DEFAULT_GLOBAL_SETTINGS["language"])),
+            self._setting_item("主题", "应用主题模式",
+                self._combo("theme", ["深色"], 120),
+                self._reset_button("theme", DEFAULT_GLOBAL_SETTINGS["theme"])),
         ])
 
     @staticmethod
@@ -784,49 +868,6 @@ class GlobalSettingsOldStyleReplicaPage(QWidget):
         if val < 1024 ** 3:
             return f"{val / 1024 ** 2:.2f} MB"
         return f"{val / 1024 ** 3:.2f} GB"
-
-    def _build_size_input(self):
-        """文件大小：一个摘要按钮行，点击后弹出内嵌面板编辑"""
-        wrapper = QWidget()
-        wrapper.setFixedHeight(36)
-        row = QHBoxLayout(wrapper)
-        row.setContentsMargins(0, 0, 0, 0)
-        row.setSpacing(8)
-
-        # 摘要标签（显示当前值）
-        summary = QLabel("禁用")
-        summary.setStyleSheet("color: #64748B; font-size: 13px;")
-
-        # 初始化摘要
-        raw = get_global_setting("split_by_size")
-        try:
-            init_val = int(raw) if raw and str(raw).isdigit() else 0
-        except (ValueError, TypeError):
-            init_val = 0
-        summary.setText(self._format_bytes(init_val))
-
-        edit_btn = QPushButton("编辑")
-        edit_btn.setFixedWidth(52)
-        edit_btn.setFixedHeight(30)
-        edit_btn.setStyleSheet("""
-            QPushButton {
-                background: #2D2E3A; border: none;
-                border-radius: 8px; color: #94A3B8; font-size: 12px;
-            }
-            QPushButton:hover { background: #3B82F6; color: white; }
-        """)
-
-        # 保存摘要引用供 overlay 保存后更新
-        self._size_summary_label = summary
-
-        edit_btn.clicked.connect(lambda: self._open_size_overlay())
-
-        row.addWidget(summary)
-        row.addStretch()
-        row.addWidget(edit_btn)
-
-        # 不注册进 _controls，直接在 overlay 里读写
-        return wrapper
 
     def _open_size_overlay(self):
         """在设置页内部弹出内嵌面板（非系统窗口）"""
@@ -1066,9 +1107,11 @@ class GlobalSettingsOldStyleReplicaPage(QWidget):
         """)
 
         def _reset():
-            h_box.setText("1")
-            m_box.setText("00")
-            s_box.setText("00")
+            default = DEFAULT_GLOBAL_SETTINGS["split_by_duration"]
+            parts = default.split(":")
+            h_box.setText(parts[0] if len(parts) > 0 else "1")
+            m_box.setText(parts[1] if len(parts) > 1 else "00")
+            s_box.setText(parts[2] if len(parts) > 2 else "00")
 
         reset_btn.clicked.connect(_reset)
 
@@ -1084,13 +1127,85 @@ class GlobalSettingsOldStyleReplicaPage(QWidget):
         return wrapper
 
     def _build_file_split_card(self):
+        # split_by_size 是自定义控件，不在 _controls 里，需要单独处理重置
+        size_wrapper = QWidget()
+        size_row = QHBoxLayout(size_wrapper)
+        size_row.setContentsMargins(0, 0, 0, 0)
+        size_row.setSpacing(8)
+
+        # 摘要标签
+        summary = QLabel("禁用")
+        summary.setStyleSheet("color: #64748B; font-size: 13px;")
+        raw = get_global_setting("split_by_size")
+        try:
+            init_val = int(raw) if raw and str(raw).isdigit() else 0
+        except (ValueError, TypeError):
+            init_val = 0
+        summary.setText(self._format_bytes(init_val))
+        self._size_summary_label = summary
+
+        edit_btn = QPushButton("编辑")
+        edit_btn.setFixedWidth(52)
+        edit_btn.setFixedHeight(30)
+        edit_btn.setStyleSheet("""
+            QPushButton { background: #2D2E3A; border: none; border-radius: 8px; color: #94A3B8; font-size: 12px; }
+            QPushButton:hover { background: #3B82F6; color: white; }
+        """)
+        edit_btn.clicked.connect(lambda: self._open_size_overlay())
+
+        reset_btn = QPushButton("重置")
+        reset_btn.setFixedWidth(52)
+        reset_btn.setFixedHeight(30)
+        reset_btn.setStyleSheet("""
+            QPushButton { background: transparent; border: 1px solid #3D3E4A; border-radius: 6px; color: #94A3B8; font-size: 11px; padding: 0 8px; }
+            QPushButton:hover { background: #2D2E3A; color: #F87171; border-color: #F87171; }
+        """)
+        confirm_btn = QPushButton("确认重置")
+        confirm_btn.setFixedWidth(60)
+        confirm_btn.setFixedHeight(30)
+        confirm_btn.setStyleSheet("""
+            QPushButton { background: #EF4444; border: none; border-radius: 6px; color: white; font-size: 11px; padding: 0 8px; }
+            QPushButton:hover { background: #DC2626; }
+        """)
+        confirm_btn.hide()
+        confirm_btn.setFixedHeight(30)
+
+        def _on_size_reset():
+            reset_btn.hide()
+            confirm_btn.show()
+
+        def _do_size_reset():
+            self._save_setting("split_by_size", "")
+            summary.setText("禁用")
+            confirm_btn.hide()
+            reset_btn.show()
+
+        reset_btn.clicked.connect(_on_size_reset)
+        confirm_btn.clicked.connect(_do_size_reset)
+
+        size_row.addWidget(summary)
+        size_row.addStretch()
+        size_row.addWidget(edit_btn)
+        size_row.addWidget(reset_btn)
+        size_row.addWidget(confirm_btn)
+
         return self._setting_card("✂️ 文件分割", "#EB5757", [
-            self._setting_item("文件大小", "输入字节数，留空或 0 表示不使用", self._build_size_input()),
-            self._setting_item("视频时长", "留空或 00:00:00 表示不使用，默认 1 小时", self._build_duration_input()),
-            self._setting_item("编码改变", "在编码改变处自动切割文件", self._check("split_on_codec_change")),
-            self._setting_item("流不连续", "在流不连续处自动切割文件", self._check("split_on_stream_discontinuity")),
-            self._setting_item("标题改变", "直播标题改变时自动切割", self._check("split_on_title_change")),
-            self._setting_item("类别改变", "直播类别改变时自动切割", self._check("split_on_category_change")),
+            self._setting_item("文件大小", "输入字节数，留空或 0 表示不使用", size_wrapper),
+            self._setting_item("视频时长", "留空或 00:00:00 表示不使用，默认 1 小时",
+                self._build_duration_input(),
+                self._reset_button("split_by_duration", DEFAULT_GLOBAL_SETTINGS["split_by_duration"])),
+            self._setting_item("编码改变", "在编码改变处自动切割文件",
+                self._check("split_on_codec_change"),
+                self._reset_button("split_on_codec_change", DEFAULT_GLOBAL_SETTINGS["split_on_codec_change"])),
+            self._setting_item("流不连续", "在流不连续处自动切割文件",
+                self._check("split_on_stream_discontinuity"),
+                self._reset_button("split_on_stream_discontinuity", DEFAULT_GLOBAL_SETTINGS["split_on_stream_discontinuity"])),
+            self._setting_item("标题改变", "直播标题改变时自动切割",
+                self._check("split_on_title_change"),
+                self._reset_button("split_on_title_change", DEFAULT_GLOBAL_SETTINGS["split_on_title_change"])),
+            self._setting_item("类别改变", "直播类别改变时自动切割",
+                self._check("split_on_category_change"),
+                self._reset_button("split_on_category_change", DEFAULT_GLOBAL_SETTINGS["split_on_category_change"])),
         ])
 
     def _build_network_card(self):
@@ -1107,36 +1222,49 @@ class GlobalSettingsOldStyleReplicaPage(QWidget):
             enabled = (mode_text == "自定义")
             proxy_input.setEnabled(enabled)
             bypass_input.setEnabled(enabled)
-            dim = "color: #4B5563;" if not enabled else ""
-            proxy_input.setStyleSheet(proxy_input.styleSheet() + (
-                " QLineEdit { color: #4B5563; background: #131419; }" if not enabled else ""
-            ))
 
-        # 初始状态
         init_mode = get_global_setting("proxy_mode") or "禁用"
         _update_proxy_state(init_mode)
-
-        # 模式切换时联动
         mode_combo.currentTextChanged.connect(_update_proxy_state)
 
         row.addWidget(mode_combo)
         row.addWidget(proxy_input)
         return self._setting_card("🌐 网络", "#27AE60", [
-            self._setting_item("全局代理", "HTTP/SOCKS5 代理地址与模式", proxy_box),
-            self._setting_item("绕过列表", "代理绕过规则，多个用逗号分隔", bypass_input),
+            self._setting_item("全局代理", "HTTP/SOCKS5 代理地址与模式", proxy_box,
+                self._reset_button("proxy_mode", DEFAULT_GLOBAL_SETTINGS["proxy_mode"])),
+            self._setting_item("绕过列表", "代理绕过规则，多个用逗号分隔", bypass_input,
+                self._reset_button("proxy_bypass", DEFAULT_GLOBAL_SETTINGS["proxy_bypass"])),
         ])
 
     def _build_stream_record_card(self):
         return self._setting_card("📡 直播流录制", "#2D9CDB", [
-            self._setting_item("启用录制", "全局开关，关闭后所有房间停止录制", self._check("stream_record_enabled")),
-            self._setting_item("允许仅音频", "允许录制仅音频的直播流", self._check("allow_audio_only")),
-            self._setting_item("自动切换", "有新画质或格式时自动切换流", self._check("auto_switch_stream")),
-            self._setting_item("流优先参数", "优先级排序依据", self._combo("stream_priority_param", ["分辨率", "帧率", "码率", "编码", "格式", "网址"], 120)),
-            self._setting_item("分辨率优先", "优先选择的分辨率", self._combo("stream_resolution", ["原画", "超清", "高清", "流畅"], 110)),
-            self._setting_item("帧率优先", "优先选择的帧率", self._combo("stream_fps", ["30 fps", "60 fps", "120 fps", "25 fps", "20 fps", "15 fps"], 110)),
-            self._setting_item("码率优先", "优先选择的码率", self._line_edit("stream_bitrate", "30.0 Mb/s", 120)),
-            self._setting_item("编码优先", "优先选择的编码", self._combo("stream_codec", ["av1", "hevc", "h264"], 100)),
-            self._setting_item("格式优先", "优先选择的封装格式", self._combo("stream_format", ["fmp4", "flv", "ts"], 100)),
+            self._setting_item("启用录制", "全局开关，关闭后所有房间停止录制",
+                self._check("stream_record_enabled"),
+                self._reset_button("stream_record_enabled", DEFAULT_GLOBAL_SETTINGS["stream_record_enabled"])),
+            self._setting_item("允许仅音频", "允许录制仅音频的直播流",
+                self._check("allow_audio_only"),
+                self._reset_button("allow_audio_only", DEFAULT_GLOBAL_SETTINGS["allow_audio_only"])),
+            self._setting_item("自动切换", "有新画质或格式时自动切换流",
+                self._check("auto_switch_stream"),
+                self._reset_button("auto_switch_stream", DEFAULT_GLOBAL_SETTINGS["auto_switch_stream"])),
+            self._setting_item("流优先参数", "优先级排序依据",
+                self._combo("stream_priority_param", ["分辨率", "帧率", "码率", "编码", "格式", "网址"], 120),
+                self._reset_button("stream_priority_param", DEFAULT_GLOBAL_SETTINGS["stream_priority_param"])),
+            self._setting_item("分辨率优先", "优先选择的分辨率",
+                self._combo("stream_resolution", ["原画", "超清", "高清", "流畅"], 110),
+                self._reset_button("stream_resolution", DEFAULT_GLOBAL_SETTINGS["stream_resolution"])),
+            self._setting_item("帧率优先", "优先选择的帧率",
+                self._combo("stream_fps", ["30 fps", "60 fps", "120 fps", "25 fps", "20 fps", "15 fps"], 110),
+                self._reset_button("stream_fps", DEFAULT_GLOBAL_SETTINGS["stream_fps"])),
+            self._setting_item("码率优先", "优先选择的码率",
+                self._line_edit("stream_bitrate", "30.0 Mb/s", 120),
+                self._reset_button("stream_bitrate", DEFAULT_GLOBAL_SETTINGS["stream_bitrate"])),
+            self._setting_item("编码优先", "优先选择的编码",
+                self._combo("stream_codec", ["av1", "hevc", "h264"], 100),
+                self._reset_button("stream_codec", DEFAULT_GLOBAL_SETTINGS["stream_codec"])),
+            self._setting_item("格式优先", "优先选择的封装格式",
+                self._combo("stream_format", ["fmp4", "flv", "ts"], 100),
+                self._reset_button("stream_format", DEFAULT_GLOBAL_SETTINGS["stream_format"])),
         ])
 
     def _build_chat_record_card(self):
@@ -1167,10 +1295,22 @@ class GlobalSettingsOldStyleReplicaPage(QWidget):
         cred_row.addStretch()
         cred_row.addWidget(edit_btn)
 
+        # 凭据重置按钮（清除 cookie）
+        def _do_cred_reset():
+            self._save_setting("chat_credential", "")
+            self._cred_summary_label.setText("未设置")
+        cred_reset = self._reset_button("chat_credential", "")
+
         return self._setting_card("💬 聊天消息录制", "#BB6BD9", [
-            self._setting_item("启用", "录制直播间弹幕和聊天消息", self._check("chat_record_enabled")),
-            self._setting_item("凭据", "下载聊天消息使用的 SESSDATA（B站 cookie）", cred_widget),
-            self._setting_item("输出格式", "聊天记录保存格式", self._combo("chat_format", ["jsonl 数据", "xml", "ass 弹幕"], 120)),
+            self._setting_item("启用", "录制直播间弹幕和聊天消息",
+                self._check("chat_record_enabled"),
+                self._reset_button("chat_record_enabled", DEFAULT_GLOBAL_SETTINGS["chat_record_enabled"])),
+            self._setting_item("凭据", "下载聊天消息使用的 SESSDATA（B站 cookie）",
+                cred_widget,
+                cred_reset),
+            self._setting_item("输出格式", "聊天记录保存格式",
+                self._combo("chat_format", ["jsonl 数据", "xml", "ass 弹幕"], 120),
+                self._reset_button("chat_format", DEFAULT_GLOBAL_SETTINGS["chat_format"])),
         ])
 
     def _open_cookie_overlay(self):
@@ -1360,48 +1500,85 @@ class GlobalSettingsOldStyleReplicaPage(QWidget):
 
     def _build_schedule_card(self):
         return self._setting_card("📅 录制计划", "#F2994A", [
-            self._setting_item("时区", "录制计划使用的时区", self._combo("schedule_timezone", ["UTC", "Asia/Shanghai", "Asia/Tokyo", "America/New_York", "Europe/London"], 160)),
-            self._setting_item("开始录制", "仅在此时间后开始（HH:MM，留空不限）", self._line_edit("schedule_start", "如: 08:00", 110)),
-            self._setting_item("停止录制", "到达此时间后停止（HH:MM，留空不限）", self._line_edit("schedule_stop", "如: 23:00", 110)),
+            self._setting_item("时区", "录制计划使用的时区",
+                self._combo("schedule_timezone", ["UTC", "Asia/Shanghai", "Asia/Tokyo", "America/New_York", "Europe/London"], 160),
+                self._reset_button("schedule_timezone", DEFAULT_GLOBAL_SETTINGS["schedule_timezone"])),
+            self._setting_item("开始录制", "仅在此时间后开始（HH:MM，留空不限）",
+                self._line_edit("schedule_start", "如: 08:00", 110),
+                self._reset_button("schedule_start", DEFAULT_GLOBAL_SETTINGS["schedule_start"])),
+            self._setting_item("停止录制", "到达此时间后停止（HH:MM，留空不限）",
+                self._line_edit("schedule_stop", "如: 23:00", 110),
+                self._reset_button("schedule_stop", DEFAULT_GLOBAL_SETTINGS["schedule_stop"])),
         ])
 
     def _build_automation_card(self):
         return self._setting_card("⚡ 自动化", "#56CCF2", [
-            self._setting_item("Webhooks", "录制事件通知的 Webhook 地址（每行一个）", self._line_edit("webhooks", "https://...", 220)),
+            self._setting_item("Webhooks", "录制事件通知的 Webhook 地址（每行一个）",
+                self._line_edit("webhooks", "https://...", 220),
+                self._reset_button("webhooks", DEFAULT_GLOBAL_SETTINGS["webhooks"])),
         ])
 
     def _build_file_location_card(self):
+        # path_template 摘要需要刷新
         return self._setting_card("📁 文件位置", "#F2C94C", [
-            self._setting_item("保存目录", "所有录制文件的根目录", self._directory_field("save_dir", VIDEO_SAVE_DIR, 220)),
-            self._setting_item("路径模板", "点击按钮弹出编辑器修改 liquid 模板", self._template_editor_button("path_template")),
+            self._setting_item("保存目录", "所有录制文件的根目录",
+                self._directory_field("save_dir", VIDEO_SAVE_DIR, 220),
+                self._reset_button("save_dir", VIDEO_SAVE_DIR)),
+            self._setting_item("路径模板", "点击按钮弹出编辑器修改 liquid 模板",
+                self._template_editor_button("path_template"),
+                self._reset_button("path_template", DEFAULT_GLOBAL_SETTINGS["path_template"])),
         ])
 
     def _build_convert_card(self):
         return self._setting_card("🔄 转换格式", "#EB5757", [
-            self._setting_item("启用转换", "录制完成后自动转换视频格式", self._check("convert_enabled")),
-            self._setting_item("删除原文件", "转换成功后删除原始录制文件", self._check("convert_delete_source")),
-            self._setting_item("目标格式", "转换的目标视频格式", self._combo("convert_format", ["mp4", "mkv", "ts", "flv"], 100)),
+            self._setting_item("启用转换", "录制完成后自动转换视频格式",
+                self._check("convert_enabled"),
+                self._reset_button("convert_enabled", DEFAULT_GLOBAL_SETTINGS["convert_enabled"])),
+            self._setting_item("删除原文件", "转换成功后删除原始录制文件",
+                self._check("convert_delete_source"),
+                self._reset_button("convert_delete_source", DEFAULT_GLOBAL_SETTINGS["convert_delete_source"])),
+            self._setting_item("目标格式", "转换的目标视频格式",
+                self._combo("convert_format", ["mp4", "mkv", "ts", "flv"], 100),
+                self._reset_button("convert_format", DEFAULT_GLOBAL_SETTINGS["convert_format"])),
         ])
 
     def _build_monitor_card(self):
         return self._setting_card("👁️ 直播监控", "#2D9CDB", [
-            self._setting_item("轮询延时", "每次轮询之间的等待时间", self._combo("monitor_delay", ["自动", "5 秒", "10 秒", "30 秒", "1 分钟"], 110)),
-            self._setting_item("轮询间隔", "检查直播状态的时间间隔", self._combo("monitor_interval", ["自动", "10 秒", "30 秒", "1 分钟", "5 分钟"], 110)),
-            self._setting_item("并发数", "同时轮询的房间数量上限", self._combo("monitor_concurrency", ["自动", "5", "10", "20", "50"], 110)),
-            self._setting_item("防抖延迟", "下播状态确认延迟，防止误触发", self._combo("monitor_debounce", ["禁用", "30 秒", "1 分钟", "3 分钟", "5 分钟"], 110)),
-            self._setting_item("监控代理", "专用于监控请求的代理地址", self._line_edit("monitor_proxy", "留空使用全局代理", 180)),
+            self._setting_item("轮询延时", "每次轮询之间的等待时间",
+                self._combo("monitor_delay", ["自动", "5 秒", "10 秒", "30 秒", "1 分钟"], 110),
+                self._reset_button("monitor_delay", DEFAULT_GLOBAL_SETTINGS["monitor_delay"])),
+            self._setting_item("轮询间隔", "检查直播状态的时间间隔",
+                self._combo("monitor_interval", ["自动", "10 秒", "30 秒", "1 分钟", "5 分钟"], 110),
+                self._reset_button("monitor_interval", DEFAULT_GLOBAL_SETTINGS["monitor_interval"])),
+            self._setting_item("并发数", "同时轮询的房间数量上限",
+                self._combo("monitor_concurrency", ["自动", "5", "10", "20", "50"], 110),
+                self._reset_button("monitor_concurrency", DEFAULT_GLOBAL_SETTINGS["monitor_concurrency"])),
+            self._setting_item("防抖延迟", "下播状态确认延迟，防止误触发",
+                self._combo("monitor_debounce", ["禁用", "30 秒", "1 分钟", "3 分钟", "5 分钟"], 110),
+                self._reset_button("monitor_debounce", DEFAULT_GLOBAL_SETTINGS["monitor_debounce"])),
+            self._setting_item("监控代理", "专用于监控请求的代理地址",
+                self._line_edit("monitor_proxy", "留空使用全局代理", 180),
+                self._reset_button("monitor_proxy", DEFAULT_GLOBAL_SETTINGS["monitor_proxy"])),
         ])
 
     def _build_cover_card(self):
         return self._setting_card("🖼️ 封面下载", "#BB6BD9", [
-            self._setting_item("启用", "开播时自动下载直播封面图片", self._check("download_cover")),
+            self._setting_item("启用", "开播时自动下载直播封面图片",
+                self._check("download_cover"),
+                self._reset_button("download_cover", DEFAULT_GLOBAL_SETTINGS["download_cover"])),
         ])
 
     def _build_conditions_card(self):
         return self._setting_card("🎯 录制条件", "#F2994A", [
-            self._setting_item("直播标题", "仅录制标题包含以下关键词的直播（多个用英文逗号分隔）", self._line_edit("condition_title", "留空不过滤", 200)),
-            self._setting_item("直播类别", "仅录制分区包含以下关键词的直播（多个用英文逗号分隔）", self._line_edit("condition_category", "留空不过滤", 200)),
-            self._setting_item("直播时段", "仅在指定时段录制（格式: 08:00-23:00，留空不限）", self._line_edit("condition_time_range", "如: 08:00-23:00", 140)),
+            self._setting_item("直播标题", "仅录制标题包含以下关键词的直播（多个用英文逗号分隔）",
+                self._line_edit("condition_title", "留空不过滤", 200),
+                self._reset_button("condition_title", DEFAULT_GLOBAL_SETTINGS["condition_title"])),
+            self._setting_item("直播类别", "仅录制分区包含以下关键词的直播（多个用英文逗号分隔）",
+                self._line_edit("condition_category", "留空不过滤", 200),
+                self._reset_button("condition_category", DEFAULT_GLOBAL_SETTINGS["condition_category"])),
+            self._setting_item("直播时段", "仅在指定时段录制（格式: 08:00-23:00，留空不限）",
+                self._line_edit("condition_time_range", "如: 08:00-23:00", 140),
+                self._reset_button("condition_time_range", DEFAULT_GLOBAL_SETTINGS["condition_time_range"])),
         ])
 
     def _update_template_summary(self, key):
@@ -1541,23 +1718,166 @@ class GlobalSettingsOldStyleReplicaPage(QWidget):
 
     def _build_notify_card(self):
         return self._setting_card("🔔 通知", "#56CCF2", [
-            self._setting_item("启用通知", "开播/下播/错误时发送通知", self._check("notify_enabled")),
-            self._setting_item("通知地址", "通知服务的 Webhook 地址", self._line_edit("notify_url", "https://...", 220)),
-                        self._setting_item("标题模板", "通知标题的模板（{uname}, {room_id}, {title}, {time}）", self._build_notify_template_item("notify_title_template")),
-                        self._setting_item("正文模板", "通知正文的模板（{uname}, {room_id}, {title}, {time}）", self._build_notify_template_item("notify_body_template")),
-            self._setting_item("直播结束通知", "直播结束时发送通知", self._check("notify_on_live_end")),
-            self._setting_item("错误通知", "发生录制错误时发送通知", self._check("notify_on_error")),
+            self._setting_item("启用通知", "开播/下播/错误时发送通知",
+                self._check("notify_enabled"),
+                self._reset_button("notify_enabled", DEFAULT_GLOBAL_SETTINGS["notify_enabled"])),
+            self._setting_item("通知地址", "通知服务的 Webhook 地址",
+                self._line_edit("notify_url", "https://...", 220),
+                self._reset_button("notify_url", DEFAULT_GLOBAL_SETTINGS["notify_url"])),
+            self._setting_item("标题模板", "通知标题的模板（{uname}, {room_id}, {title}, {time}）",
+                self._build_notify_template_item("notify_title_template")),
+            self._setting_item("正文模板", "通知正文的模板（{uname}, {room_id}, {title}, {time}）",
+                self._build_notify_template_item("notify_body_template")),
+            self._setting_item("直播结束通知", "直播结束时发送通知",
+                self._check("notify_on_live_end"),
+                self._reset_button("notify_on_live_end", DEFAULT_GLOBAL_SETTINGS["notify_on_live_end"])),
+            self._setting_item("错误通知", "发生录制错误时发送通知",
+                self._check("notify_on_error"),
+                self._reset_button("notify_on_error", DEFAULT_GLOBAL_SETTINGS["notify_on_error"])),
         ])
 
     def _build_system_card(self):
+        # 添加更新按钮
+        self.update_btn = QPushButton("检查更新")
+        self.update_btn.setObjectName("primaryBtn")
+        self.update_btn.setFixedWidth(120)
+        self.update_btn.clicked.connect(self._check_update)
+        self.update_btn.setStyleSheet("""
+            QPushButton#primaryBtn {
+                background-color: #3B82F6;
+                color: white;
+                border: none;
+                border-radius: 10px;
+                padding: 9px 14px;
+                font-size: 13px;
+                font-weight: 600;
+            }
+            QPushButton#primaryBtn:hover {
+                background-color: #2563EB;
+            }
+            QPushButton#primaryBtn:disabled {
+                background-color: #3B82F680;
+                color: #94A3B8;
+            }
+        """)
+        self.update_status_label = QLabel("")
+        self.update_status_label.setStyleSheet("color: #94A3B8; font-size: 12px;")
+
+        update_btn_wrapper = QWidget()
+        update_btn_layout = QHBoxLayout(update_btn_wrapper)
+        update_btn_layout.setContentsMargins(0, 0, 0, 0)
+        update_btn_layout.setSpacing(12)
+        update_btn_layout.addWidget(self.update_btn)
+        update_btn_layout.addWidget(self.update_status_label)
+        update_btn_layout.addStretch()
+
         return self._setting_card("⚙️ 系统", "#6FCF70", [
-            self._setting_item("开机自启", "系统启动时自动运行本程序", self._check("auto_start")),
-            self._setting_item("阻止休眠", "录制期间阻止系统进入休眠状态", self._check("prevent_sleep")),
+            self._setting_item("开机自启", "系统启动时自动运行本程序",
+                self._check("auto_start"),
+                self._reset_button("auto_start", DEFAULT_GLOBAL_SETTINGS["auto_start"])),
+            self._setting_item("阻止休眠", "录制期间阻止系统进入休眠状态",
+                self._check("prevent_sleep"),
+                self._reset_button("prevent_sleep", DEFAULT_GLOBAL_SETTINGS["prevent_sleep"])),
+            self._setting_item("检查更新", "检查是否有新版本可用",
+                update_btn_wrapper,
+                None),
         ])
 
     def _save_setting(self, key, value):
         set_global_setting(key, value)
         self.saved.emit(key)
+
+    def _check_update(self):
+        """检查更新"""
+        from core.updater import check_update
+
+        self.update_btn.setEnabled(False)
+        self.update_status_label.setText("检查中...")
+        self.update_status_label.setStyleSheet("color: #94A3B8; font-size: 12px;")
+
+        def do_check():
+            has_update, latest_version, download_url, release_notes = check_update()
+            # 直接更新 UI（Qt 会自动处理跨线程）
+            if has_update:
+                self.update_status_label.setText(f"发现新版本: {latest_version}")
+                self.update_status_label.setStyleSheet("color: #4ADE80; font-size: 12px;")
+                self.update_btn.setEnabled(True)
+                # 显示更新对话框
+                from PySide6.QtCore import QTimer
+                QTimer.singleShot(100, lambda: self._show_update_dialog(latest_version, download_url, release_notes))
+            elif latest_version:
+                self.update_status_label.setText("已是最新版本")
+                self.update_status_label.setStyleSheet("color: #4ADE80; font-size: 12px;")
+                self.update_btn.setEnabled(True)
+            else:
+                self.update_status_label.setText("检查失败")
+                self.update_status_label.setStyleSheet("color: #EF4444; font-size: 12px;")
+                self.update_btn.setEnabled(True)
+
+        thread = threading.Thread(target=do_check, daemon=True)
+        thread.start()
+
+    def _show_update_dialog(self, version, download_url, release_notes):
+        """显示更新对话框"""
+        from PySide6.QtWidgets import QMessageBox
+
+        msg = QMessageBox(self)
+        msg.setWindowTitle("发现新版本")
+        msg.setText(f"发现新版本 v{version}")
+        msg.setInformativeText(f"更新说明:\n{release_notes[:500]}..." if release_notes else "是否立即下载更新？")
+        msg.setIcon(QMessageBox.Information)
+
+        msg.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+        msg.button(QMessageBox.Yes).setText("立即下载")
+        msg.button(QMessageBox.No).setText("稍后")
+
+        if msg.exec() == QMessageBox.Yes:
+            self._start_download(version, download_url)
+
+    def _start_download(self, version, download_url):
+        """开始下载更新"""
+        import tempfile
+        import os
+        from core.updater import download_file
+        from PySide6.QtCore import QTimer
+
+        self.update_btn.setEnabled(False)
+        self.update_status_label.setText(f"正在下载 v{version}...")
+        self.update_status_label.setStyleSheet("color: #F59E0B; font-size: 12px;")
+
+        # 下载单个 exe 文件
+        temp_exe = os.path.join(tempfile.gettempdir(), f"DD录播机_v{version}.exe")
+
+        def do_download():
+            success = download_file(download_url, temp_exe)
+            QTimer.singleShot(0, lambda: self._on_download_complete(success, temp_exe))
+
+        thread = threading.Thread(target=do_download, daemon=True)
+        thread.start()
+
+    def _on_download_complete(self, success, exe_path):
+        """下载完成处理"""
+        if success:
+            self.update_status_label.setText("下载完成，正在安装...")
+            self.update_status_label.setStyleSheet("color: #4ADE80; font-size: 12px;")
+
+            # 提示用户关闭程序
+            from PySide6.QtWidgets import QMessageBox
+            msg = QMessageBox(self)
+            msg.setWindowTitle("更新就绪")
+            msg.setText("新版本已下载完成！")
+            msg.setInformativeText("点击「确定」将关闭程序并安装更新...")
+            msg.setIcon(QMessageBox.Information)
+            msg.setStandardButtons(QMessageBox.Ok)
+            msg.button(QMessageBox.Ok).setText("确定")
+
+            if msg.exec() == QMessageBox.Ok:
+                from core.updater import quit_and_update
+                quit_and_update(exe_path)
+        else:
+            self.update_btn.setEnabled(True)
+            self.update_status_label.setText("下载失败")
+            self.update_status_label.setStyleSheet("color: #EF4444; font-size: 12px;")
 
     def _choose_directory(self, key, line_edit):
         current_dir = line_edit.text().strip() or str(VIDEO_SAVE_DIR)

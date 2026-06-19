@@ -18,7 +18,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import QTimer, Qt, QThread, QPropertyAnimation, QEasingCurve, QPoint, QEvent, Signal
 from PySide6.QtGui import QIcon, QFont, QColor, QActionGroup, QPixmap, QPainter, QPen, QPainterPath, QAction
 
-from core.config import load_app_data, save_app_data, VIDEO_SAVE_DIR, get_room_config, get_global_setting, get_room_setting, get_effective_format
+from core.config import load_app_data, save_app_data, VIDEO_SAVE_DIR, get_room_config, get_global_setting, get_room_setting, get_effective_format, ensure_default_config
 from core.bili_api import get_bili_info
 from core.recorder import BiliRecorder
 from core.utils import render_path_template
@@ -335,9 +335,28 @@ class MainWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("B站高级录播机")
+        self.setWindowTitle("DD录播机")
         self.resize(1360, 780)
         self.setStyleSheet("background-color: #0F0F13;")
+
+        # 生成并设置窗口图标（任务栏、窗口左上角统一用 DD 图标）
+        window_icon = QIcon()
+        pix = QPixmap(64, 64)
+        pix.fill(Qt.transparent)
+        p = QPainter(pix)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.setRenderHint(QPainter.LosslessImageRendering)
+        p.setBrush(QColor("#3B82F6"))
+        p.setPen(Qt.NoPen)
+        p.drawEllipse(4, 4, 56, 56)
+        p.setPen(QColor("white"))
+        font = QFont("Microsoft YaHei UI", 26, QFont.Bold)
+        font.setStyleHint(QFont.SansSerif)
+        p.setFont(font)
+        p.drawText(pix.rect(), Qt.AlignCenter, "DD")
+        p.end()
+        window_icon.addPixmap(pix)
+        self.setWindowIcon(window_icon)
 
         self.cards = {}           # room_id -> RoomCard
         self.threads = {}         # room_id -> QThread
@@ -356,9 +375,21 @@ class MainWindow(QMainWindow):
         self._is_shutting_down = False
 
         self.setup_ui()
+        self._center_window()  # 窗口居中
         self._setup_tray()
+        ensure_default_config()  # config.json 不存在时生成默认配置
         self.load_saved_data()
         self.start_refresh_timer()
+
+    def _center_window(self):
+        """将窗口居中显示"""
+        screen = self.screen()
+        if screen:
+            screen_geometry = screen.geometry()
+            window_geometry = self.geometry()
+            x = (screen_geometry.width() - window_geometry.width()) // 2 + screen_geometry.x()
+            y = (screen_geometry.height() - window_geometry.height()) // 2 + screen_geometry.y()
+            self.move(x, y)
 
     def _create_toolbar_icon(self, kind, color="#94A3B8"):
         pixmap = QPixmap(20, 20)
@@ -676,30 +707,34 @@ class MainWindow(QMainWindow):
         self._tray_menu.addAction(self._tray_quit_action)
 
         self._tray_icon = QSystemTrayIcon(self)
-        self._tray_icon.setToolTip("B站高级录播机")
+        self._tray_icon.setToolTip("DD录播机")
         self._tray_icon.setContextMenu(self._tray_menu)
         self._tray_icon.activated.connect(self._on_tray_activated)
 
-        # 用程序图标（没有时用文字 emoji 生成）
+        # 生成 DD 托盘图标：蓝底白字圆形
         icon = QIcon()
-        pix = QPixmap(32, 32)
+        pix = QPixmap(64, 64)
         pix.fill(Qt.transparent)
         p = QPainter(pix)
         p.setRenderHint(QPainter.Antialiasing)
+        p.setRenderHint(QPainter.LosslessImageRendering)
         p.setBrush(QColor("#3B82F6"))
         p.setPen(Qt.NoPen)
-        p.drawEllipse(4, 4, 24, 24)
+        p.drawEllipse(4, 4, 56, 56)
         p.setPen(QColor("white"))
-        p.setFont(QFont("Segoe UI Emoji", 14))
-        p.drawText(pix.rect(), Qt.AlignCenter, "B")
+        font = QFont("Microsoft YaHei UI", 26, QFont.Bold)
+        font.setStyleHint(QFont.SansSerif)
+        p.setFont(font)
+        p.drawText(pix.rect(), Qt.AlignCenter, "DD")
         p.end()
         icon.addPixmap(pix)
         self._tray_icon.setIcon(icon)
         self._tray_icon.show()
 
     def _on_tray_activated(self, reason):
-        if reason == QSystemTrayIcon.DoubleClick:
-            self._tray_show()
+        # 左键点击和双击都切换显示/隐藏
+        if reason in (QSystemTrayIcon.Trigger, QSystemTrayIcon.DoubleClick):
+            self._tray_show_hide()
 
     def _tray_show(self):
         """托盘 -> 显示窗口"""
@@ -707,30 +742,27 @@ class MainWindow(QMainWindow):
         self.activateWindow()
         self.raise_()
 
+    def _tray_show_hide(self):
+        """左键点击托盘图标：显示则隐藏，隐藏则显示"""
+        if self.isVisible():
+            self.hide()
+        else:
+            self.showNormal()
+            self.activateWindow()
+            self.raise_()
+
     def _tray_quit(self):
-        """托盘 -> 退出程序（异步停 recorder 后退出）"""
+        """托盘 -> 退出程序（直接退出，操作系统会清理所有线程和子进程）。"""
         self._is_shutting_down = True
-        # 停所有 recorder
+        # 停所有 recorder（发退出信号让线程自然停）
         for room_id in list(self.recorders.keys()):
             self._stop_recorder(room_id)
         # 隐藏窗口 + 托盘
         self.hide()
         if self._tray_icon:
             self._tray_icon.hide()
-        # 后台轮询线程，全退出后 app.quit()
-        self._shutdown_elapsed = 0
-        self._shutdown_timer = QTimer(self)
-        self._shutdown_timer.timeout.connect(self._async_shutdown)
-        self._shutdown_timer.start(500)
-
-    def _async_shutdown(self):
-        self._shutdown_elapsed += 0.5
-        dying = getattr(self, "_dying_threads", [])
-        all_done = all(t.isFinished() for t, _ in dying)
-
-        if all_done or self._shutdown_elapsed >= 30:  # 30s 硬超时
-            self._shutdown_timer.stop()
-            QApplication.instance().quit()
+        # 直接 quit()，不等线程退出。操作系统会在进程退出时强制杀掉所有线程和 ffmpeg 子进程。
+        QApplication.instance().quit()
 
     def show_notification(self, message, title="提示", level="info", merge_key=None, duration_ms=3200):
         """显示通知"""
@@ -903,6 +935,14 @@ class MainWindow(QMainWindow):
         # 只有 enabled=True 才启 QThread(节省资源 + 避免卡顿)
         if room_info.get("enabled", True):
             self._start_recorder(room_id, room_info)
+        else:
+            # enabled=False 时 recorder 不启动，不会发 status_updated，手动设一次初始状态
+            card.update_status(
+                "⚙️ 已暂停", "🌙 未开播", "⏳ 闲置中",
+                room_info.get("title", ""), "", "", "",
+                room_info.get("parent_area_name", ""),
+                room_info.get("area_name", "")
+            )
 
         if rearrange:
             self.request_rearrange_cards(0)
