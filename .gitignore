@@ -27,14 +27,58 @@ dlog.txt
 Thumbs.db
 .DS_Store
 
-# ffmpeg binaries
+# ffmpeg binaries (源码目录内的，单文件会被 onedir 重新打包)
 ffmpeg.exe
 ffmpeg
 ffprobe.exe
 ffprobe
 
-# Recorded files
+# Recorded files (用户录的视频，不进版本库)
 录播文件/
 
-# User runtime state (per-machine live room cache + commit-时含真实信息)
+# User runtime state (跨机器，含真实房间号/路径)
 data.json
+config.json
+.codegraph/
+
+# ==================== 打包构建产物 ====================
+# NSIS 编译产物
+installer/
+installer/*.exe
+installer/Setup.exe
+
+# NSIS 安装器构建产物（PyInstaller onedir 已经在 dist/ 里）
+DD录播机.exe
+DDRecUpdater.exe
+
+# 旧版 zip 包
+DD录播机_*.zip
+DD录播机_v*.zip
+
+# PyInstaller bootloader 残留
+*.spec.bak
+
+# ==================== 调研/调试残留 ====================
+# Velopack 调研时留下的临时文件（本次不再需要）
+_extract_vp.py
+_extract_vp.ps1
+_vpdocs.txt
+_probe_vpy.py
+_probe_out.txt
+
+# 废弃的旧插件示例
+example_plugin_in_zip/
+
+# ==================== 旧构建脚本 ====================
+# Inno Setup 已被 NSIS 取代
+installer.iss
+# 早期旧 main
+oldmain.py
+# 旧 build 脚本
+build.bat
+# 早期 Nuitka 试验（已放弃）
+build_nuitka.py
+
+# ==================== Windows 临时 ====================
+Thumbs.db
+desktop.ini

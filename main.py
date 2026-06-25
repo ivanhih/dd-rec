@@ -19,11 +19,16 @@ from PySide6.QtCore import QTimer, Qt, QThread, QPropertyAnimation, QEasingCurve
 from PySide6.QtGui import QIcon, QFont, QColor, QActionGroup, QPixmap, QPainter, QPen, QPainterPath, QAction
 
 from core.config import load_app_data, save_app_data, VIDEO_SAVE_DIR, get_room_config, get_global_setting, get_room_setting, get_effective_format, ensure_default_config
+from core.updater import check_for_updates, get_current_version
 from core.bili_api import get_bili_info
 from core.recorder import BiliRecorder
 from core.utils import render_path_template
 from ui.room_card import RoomCard, HoverLabel, _HoverToolButton, _HoverPushButton
 from ui.settings_dialog import RoomSettingsDialog, GlobalSettingsOldStyleReplicaPage, AddChannelDialog, open_room_settings_overlay, open_room_settings_overlay
+
+# 插件系统
+from plugins import PluginManager
+from plugins.page import PluginsPage
 
 
 # ==================== Path preview (mirrors recorder._build_save_path) ====================
@@ -476,6 +481,7 @@ class MainWindow(QMainWindow):
             }
         """
         self.nav_channels_btn.setStyleSheet(active_style if self.current_page == "channels" else inactive_style)
+        self.nav_plugins_btn.setStyleSheet(active_style if self.current_page == "plugins" else inactive_style)
         self.nav_settings_btn.setStyleSheet(active_style if self.current_page == "settings" else inactive_style)
 
     def setup_ui(self):
@@ -510,12 +516,16 @@ class MainWindow(QMainWindow):
         self.nav_channels_btn = self._create_sidebar_nav_button("📋", "频道")
         self._wire_hover(self.nav_channels_btn, "频道")
         self.nav_channels_btn.clicked.connect(self.show_channels_page)
+        self.nav_plugins_btn = self._create_sidebar_nav_button("🧩", "插件")
+        self._wire_hover(self.nav_plugins_btn, "插件")
+        self.nav_plugins_btn.clicked.connect(self.show_plugins_page)
         self.nav_settings_btn = self._create_sidebar_nav_button("⚙️", "全局设置")
         self._wire_hover(self.nav_settings_btn, "全局设置")
         self.nav_settings_btn.clicked.connect(self.show_global_settings_page)
 
         sidebar_layout.addWidget(logo_btn)
         sidebar_layout.addWidget(self.nav_channels_btn)
+        sidebar_layout.addWidget(self.nav_plugins_btn)
         sidebar_layout.addWidget(self.nav_settings_btn)
         sidebar_layout.addStretch()
         self._update_sidebar_nav_styles()
@@ -666,6 +676,10 @@ class MainWindow(QMainWindow):
         self.page_stack.addWidget(self.channels_page)
         self.page_stack.addWidget(self.settings_page)
 
+        # 插件页面（懒加载）
+        self.plugins_page = None
+        self._plugins_page_index = -1
+
         main_layout.addWidget(sidebar)
         main_layout.addWidget(self.page_stack, 1)
         
@@ -686,11 +700,17 @@ class MainWindow(QMainWindow):
         self.scroll.viewport().installEventFilter(self)
         self._setup_filter_menu()
         self._setup_sort_menu()
+
+        # 布局更新定时器
         self._layout_update_timer = QTimer(self)
         self._layout_update_timer.setSingleShot(True)
         self._layout_update_timer.timeout.connect(self._rearrange_cards)
         self._layout_ready = True
-        
+
+        # 插件管理器
+        self.plugin_manager = PluginManager()
+        self.plugin_manager.initialize(self)
+
         # 初始定位
         self._position_notification_container()
 
@@ -917,6 +937,20 @@ class MainWindow(QMainWindow):
             self.add_card(ch, save=False, rearrange=False)
         self._layout_ready = True
         self.request_rearrange_cards(0)
+
+    def _init_plugins(self):
+        """初始化插件系统（懒加载插件页面）"""
+        if self.plugins_page is None:
+            self.plugins_page = PluginsPage(self.plugin_manager)
+            self._plugins_page_index = self.page_stack.addWidget(self.plugins_page)
+
+    def show_plugins_page(self):
+        """显示插件页面"""
+        self._init_plugins()  # 确保插件页面已初始化
+        self.current_page = "plugins"
+        self.page_stack.setCurrentIndex(self._plugins_page_index)
+        self._update_sidebar_nav_styles()
+        self.plugins_page.refresh()
 
     def add_card(self, room_info: dict, save=True, rearrange=True):
         room_id = str(room_info["room_id"])
@@ -1320,8 +1354,15 @@ class MainWindow(QMainWindow):
 
 
 if __name__ == "__main__":
+    import logging
+    logging.info(f"DD录播机 v{get_current_version()} 启动中...")
+
     app = QApplication(sys.argv)
-    app.setQuitOnLastWindowClosed(False)  # X 隐藏到托盘时不退出
+    app.setQuitOnLastWindowClosed(False)
+
+    # 检查更新
+    check_for_updates(app.activeWindow())
+
     window = MainWindow()
     window.show()
     sys.exit(app.exec())

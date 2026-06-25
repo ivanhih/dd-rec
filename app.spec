@@ -1,34 +1,26 @@
+# app.spec
 # -*- mode: python ; coding: utf-8 -*-
 """
-DD录播机 PyInstaller 打包配置
-用法: pyinstaller bilirec.spec
+dd-rec 主程序 PyInstaller 打包配置（Portable 方案）
 
-支持两种模式:
-1. Portable 模式: 直接运行 exe，配置文件在同目录
-2. 安装模式: 通过 Inno Setup 创建安装包
+产物：dist\dd_rec-{VERSION}\dd_rec_main.exe + *.dll
+输出到 dd_rec-{VERSION}/ 目录，配合 launcher 使用
+
+注意：ffmpeg 不打包进 app/，因为根目录已有 ffmpeg/
 """
 
 import os
-import sys
-import shutil
 
 block_cipher = None
 
-# ffmpeg 源路径
-FFMPEG_SOURCE = r"C:\ffmpeg\bin"
-
-# 插件目录
-PLUGINS_SOURCE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "plugins")
+_binaries = []
+_datas = []  # 不再包含 ffmpeg（根目录已有）
 
 a = Analysis(
     ['main.py'],
     pathex=[],
-    binaries=[],
-    datas=[
-        # 把 ffmpeg 作为数据文件打包
-        (os.path.join(FFMPEG_SOURCE, 'ffmpeg.exe'), 'ffmpeg'),
-        (os.path.join(FFMPEG_SOURCE, 'ffprobe.exe'), 'ffmpeg'),
-    ],
+    binaries=_binaries,
+    datas=_datas,
     hiddenimports=[
         'PySide6',
         'PySide6.QtCore',
@@ -44,7 +36,10 @@ a = Analysis(
         'plugins.manager',
         'plugins.store',
         'plugins.page',
-        'core.updater',
+        'core.portable_updater',
+        'core.config',
+        'core.recorder',
+        'version',
     ],
     hookspath=[],
     hooksconfig={},
@@ -65,14 +60,13 @@ a = Analysis(
 
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 
+# onedir 模式
 exe = EXE(
     pyz,
     a.scripts,
-    a.binaries,
-    a.zipfiles,
-    a.datas,
     [],
-    name='DD录播机',
+    exclude_binaries=True,
+    name='dd_rec_main',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -85,4 +79,15 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+)
+
+coll = COLLECT(
+    exe,
+    a.binaries,
+    a.zipfiles,
+    a.datas,
+    strip=False,
+    upx=False,
+    upx_exclude=[],
+    name='dd_rec_app',  # 临时目录名，build.py 会重命名
 )

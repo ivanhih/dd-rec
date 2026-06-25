@@ -1,218 +1,390 @@
-# core/updater.py
 """
-自动更新模块 - GitHub 下载
-直接下载单个 exe 文件更新
+更新模块（Portable + NSIS 兼容方案）
+
+Portable 流程（推荐）：
+  1. check_update()            → 调 GitHub API 拉最新 release，比版本号
+  2. download_update(info, cb) → 下载 bilirec-{ver}.zip 到 temp/
+  3. prepare_update(info, path) → 写入 pending_update.json，等待重启
+  4. 重启后 launcher.py 自动应用更新
+
+NSIS 流程（遗留，保留兼容）：
+  - 主程序: core/updater.py 通过 winreg 找安装目录
+  - 启动 updater.exe（NSIS 编译的轻量安装器）:
+      taskkill /F /T DD录播机.exe
+      → 静默安装新 Setup.exe 到原目录
+      → 启动新版本
 """
+
 import os
 import sys
 import json
 import logging
 import tempfile
-import subprocess
-import platform
 import urllib.request
 import urllib.error
-import re
+import zipfile
+import subprocess
+from dataclasses import dataclass
+from typing import Optional, Callable
 
-# 当前版本号（发布新版本时修改这里）
-CURRENT_VERSION = "0.1.1"
+logger = logging.getLogger(__name__)
 
-# 更新源配置（GitHub）
-UPDATE_SOURCES = [
-    {
-        "name": "GitHub",
-        "api_url": "https://api.github.com/repos/ivanhih/dd-rec/releases/latest",
-        "timeout": 15,
-    },
-]
+# 检测是否为 Portable 模式
+def _detect_portable_mode() -> bool:
+    """检测是否为 Portable 模式"""
+    if not getattr(sys, "frozen", False):
+        return False
+    exe_dir = os.path.dirname(sys.executable)
+    parent_dir = os.path.dirname(exe_dir)
+    return os.path.exists(os.path.join(parent_dir, "version.ini"))
 
+IS_PORTABLE = _detect_portable_mode()
 
-def get_current_version():
-    """获取当前版本号"""
-    return CURRENT_VERSION
-
-
-def parse_version(version_str):
-    """解析版本号字符串为元组，用于比较"""
-    version_str = version_str.lstrip('v')
-    match = re.match(r'(\d+)\.(\d+)\.(\d+)', version_str)
-    if match:
-        return tuple(int(x) for x in match.groups())
-    return (0, 0, 0)
-
-
-def is_newer_version(new_version, current_version):
-    """判断新版本是否比当前版本更新"""
-    return parse_version(new_version) > parse_version(current_version)
+# Portable 模式的导入
+if IS_PORTABLE:
+    from core.portable_updater import (
+        check_update as _portable_check_update,
+        download_update as _portable_download_update,
+        prepare_update as _portable_prepare_update,
+        UpdateInfo as PortableUpdateInfo,
+        get_current_version as _portable_get_version,
+        has_pending_update as _portable_has_pending,
+        get_pending_update_info as _portable_get_pending,
+    )
 
 
-def fetch_json(url, timeout=15):
-    """下载 JSON 数据，带超时"""
+@dataclass
+class UpdateInfo:
+    version: str
+    download_url: str
+    size: int
+    body: str
+    asset_name: str = ""
+
+
+# ==================== 版本号 ====================
+def get_local_version() -> str:
+    """本地版本号"""
+    if IS_PORTABLE:
+        return _portable_get_version()
+
     try:
-        req = urllib.request.Request(url, headers={
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-        })
-        with urllib.request.urlopen(req, timeout=timeout) as response:
-            return json.loads(response.read().decode('utf-8'))
-    except urllib.error.URLError as e:
-        logging.warning(f"网络错误: {e}")
-        return None
-    except Exception as e:
-        logging.warning(f"获取 {url} 失败: {e}")
-        return None
+        from version import __version__
+        return __version__
+    except Exception:
+        pass
+    # fallback: 从注册表读
+    try:
+        import winreg
+        with winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            r"Software\DD\DD录播机",
+        ) as key:
+            return winreg.QueryValueEx(key, "Version")[0]
+    except Exception:
+        return "0.0.0"
 
 
-def check_update():
-    """
-    检查更新
+def get_current_version() -> str:
+    """兼容别名"""
+    return get_local_version()
 
-    返回:
-        (has_update, latest_version, download_url, release_notes)
-    """
-    for source in UPDATE_SOURCES:
-        source_name = source["name"]
-        api_url = source["api_url"]
-        timeout = source.get("timeout", 15)
 
-        logging.info(f"从 {source_name} 检查更新...")
+# ==================== Portable 模式 ====================
+if IS_PORTABLE:
+    def check_update(max_retries: int = 3) -> Optional[UpdateInfo]:
+        """Portable 模式：检查更新"""
+        return _portable_check_update(max_retries)
 
-        data = fetch_json(api_url, timeout=timeout)
+    def download_update(info: UpdateInfo, progress_callback: Callable = None) -> str:
+        """Portable 模式：下载 zip"""
+        return _portable_download_update(info, progress_callback)
 
-        if not data:
-            logging.warning(f"{source_name}: 检查更新失败")
-            continue
+    def prepare_update(info: UpdateInfo, zip_path: str) -> bool:
+        """Portable 模式：准备更新（写入 pending_update.json）"""
+        return _portable_prepare_update(info, zip_path)
 
+    def has_pending_update() -> bool:
+        """检查是否有待更新"""
+        return _portable_has_pending()
+
+    def get_pending_update_info() -> Optional[dict]:
+        """获取待更新信息"""
+        return _portable_get_pending()
+
+    def apply_update(setup_path: str) -> None:
+        """Portable 模式：触发重启更新"""
+        # 用户点击更新后，提示重启
+        pending = get_pending_update_info()
+        if pending:
+            logger.info("更新已准备好，重启应用以完成更新")
+        # 不在这里退出，让用户手动重启或提示重启
+
+
+# ==================== NSIS 模式（遗留兼容） ====================
+else:
+    # GitHub 仓库配置
+    GITHUB_REPO = "ivanhih/dd-rec"
+    GITHUB_API = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
+    GITHUB_RELEASES = f"https://github.com/{GITHUB_REPO}/releases"
+    UPDATER_EXE_NAME = "DDRecUpdater.exe"
+    SETUP_TEMP_NAME = "DDRec_Setup_new.exe"
+
+    def _read_install_dir() -> Optional[str]:
+        """从注册表读 NSIS 安装时写入的安装目录。"""
         try:
-            # 解析版本号
-            latest_version = data.get("tag_name", data.get("name", ""))
-            if not latest_version:
-                logging.warning(f"{source_name}: 未获取到版本号")
-                continue
+            import winreg
+            with winreg.OpenKey(
+                winreg.HKEY_CURRENT_USER,
+                r"Software\DD\DD录播机",
+            ) as key:
+                return winreg.QueryValueEx(key, "InstallDir")[0]
+        except Exception:
+            pass
+        if getattr(sys, "frozen", False):
+            return os.path.dirname(sys.executable)
+        return os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"), "DD录播机")
 
-            # 获取下载链接和更新说明
-            download_url = None
-            release_notes = data.get("body", "") or data.get("name", "")
+    def _find_updater_exe() -> Optional[str]:
+        """找内嵌的 updater.exe"""
+        candidates = []
+        if getattr(sys, "frozen", False):
+            candidates.append(os.path.join(os.path.dirname(sys.executable), UPDATER_EXE_NAME))
+        try:
+            from core.config import RESOURCE_DIR
+            candidates.append(os.path.join(RESOURCE_DIR, UPDATER_EXE_NAME))
+        except Exception:
+            pass
+        candidates.append(os.path.join(os.getcwd(), UPDATER_EXE_NAME))
+        for p in candidates:
+            if os.path.exists(p):
+                return p
+        return None
 
-            # 从 assets 中查找 exe 文件
-            assets = data.get("assets", [])
-            for asset in assets:
-                name = asset.get("name", "")
-                # 匹配 .exe 文件
-                if name.lower().endswith('.exe'):
-                    download_url = asset.get("browser_download_url")
-                    break
+    def _parse_semver(v: str) -> tuple:
+        """'1.0.2' → (1, 0, 2)"""
+        s = str(v).strip().lstrip("v")
+        try:
+            parts = []
+            for x in s.split("."):
+                x = x.strip()
+                if x.isdigit():
+                    parts.append(int(x))
+                else:
+                    head = ""
+                    for ch in x:
+                        if ch.isdigit():
+                            head += ch
+                        else:
+                            break
+                    parts.append(int(head) if head else 0)
+            return tuple(parts[:3])
+        except Exception:
+            return (0, 0, 0)
 
-            if not download_url:
-                logging.warning(f"{source_name}: 未找到 DD录播机.exe 附件")
-                continue
+    def check_update(max_retries: int = 3) -> Optional[UpdateInfo]:
+        """NSIS 模式：检查更新"""
+        local = get_local_version()
+        logger.info(f"本地版本: {local}")
 
-            # 比较版本
-            current = get_current_version()
-            if is_newer_version(latest_version, current):
-                logging.info(f"发现新版本: {latest_version} (当前: {current})")
-                return (True, latest_version, download_url, release_notes)
-            else:
-                logging.info(f"当前已是最新版本: {current}")
-                return (False, current, None, None)
+        for attempt in range(max_retries):
+            try:
+                req = urllib.request.Request(
+                    GITHUB_API,
+                    headers={"User-Agent": "ddrec-updater/1.0"},
+                )
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    data = json.loads(resp.read().decode("utf-8"))
 
-        except Exception as e:
-            logging.error(f"解析 {source_name} 数据失败: {e}")
-            continue
+                remote_tag = (data.get("tag_name") or "").lstrip("v")
+                if not remote_tag:
+                    return None
 
-    # 所有源都失败
-    error_msg = "无法连接到更新服务器，请检查网络"
-    logging.error(error_msg)
-    return (False, None, None, None)
+                download_url = None
+                size = 0
+                asset_name = ""
+                for asset in data.get("assets", []):
+                    name = asset.get("name", "")
+                    if name.endswith(".exe") and "Setup" in name:
+                        download_url = asset.get("browser_download_url")
+                        size = asset.get("size", 0)
+                        asset_name = name
+                        break
 
+                if not download_url:
+                    return None
 
-def download_file(url, dest_path):
-    """
-    下载文件
+                logger.info(f"最新版本: {remote_tag}")
 
-    返回:
-        True 成功，False 失败
-    """
-    try:
-        req = urllib.request.Request(url, headers={
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-        })
+                if _parse_semver(remote_tag) <= _parse_semver(local):
+                    return None
 
-        with urllib.request.urlopen(req, timeout=120) as response:
-            with open(dest_path, 'wb') as f:
-                f.write(response.read())
+                return UpdateInfo(
+                    version=remote_tag,
+                    download_url=download_url,
+                    size=size,
+                    body=data.get("body", "") or "",
+                    asset_name=asset_name,
+                )
+            except Exception as e:
+                logger.warning(f"检查更新失败: {e}")
 
-        logging.info("下载完成")
-        return True
+        return None
 
-    except urllib.error.URLError as e:
-        logging.error(f"下载失败（网络错误）: {e}")
-        return False
-    except Exception as e:
-        logging.error(f"下载失败: {e}")
-        return False
+    def download_update(info: UpdateInfo, progress_callback: Callable = None) -> str:
+        """NSIS 模式：下载 Setup.exe"""
+        setup_path = os.path.join(tempfile.gettempdir(), SETUP_TEMP_NAME)
+        if os.path.exists(setup_path):
+            try:
+                os.remove(setup_path)
+            except OSError:
+                pass
 
+        req = urllib.request.Request(
+            info.download_url,
+            headers={"User-Agent": "ddrec-updater/1.0"},
+        )
 
-def quit_and_update(new_exe_path):
-    """
-    退出程序并用新版本替换
+        with urllib.request.urlopen(req, timeout=600) as resp:
+            total = int(resp.headers.get("Content-Length", 0) or 0)
+            downloaded = 0
+            with open(setup_path, "wb") as f:
+                while True:
+                    chunk = resp.read(64 * 1024)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    downloaded += len(chunk)
+                    if progress_callback and total > 0:
+                        try:
+                            progress_callback(int(downloaded * 100 / total))
+                        except Exception:
+                            pass
 
-    参数:
-        new_exe_path: 下载的新版本 exe 路径
-    """
-    try:
-        # 获取当前 exe 路径
-        if getattr(sys, 'frozen', False):
-            current_exe = sys.executable
-        else:
-            current_exe = sys.executable
+        return setup_path
 
-        app_dir = os.path.dirname(current_exe)
-        new_exe_name = "DD录播机.exe"
-        target_path = os.path.join(app_dir, new_exe_name)
+    def apply_update(setup_path: str) -> None:
+        """NSIS 模式：触发更新"""
+        updater = _find_updater_exe()
+        if not updater:
+            raise RuntimeError(f"找不到 {UPDATER_EXE_NAME}，无法更新。")
 
-        # 创建批处理文件来替换 exe 并重启
-        batch_content = f'''@echo off
-chcp 65001 >nul
-echo 正在更新...
-timeout /t 2 /nobreak >nul
-del /f /q "{current_exe}" 2>nul
-move /y "{new_exe_path}" "{target_path}"
-start "" "{target_path}"
-del "%~f0"
-'''
-        batch_path = os.path.join(tempfile.gettempdir(), "bilirec_update.bat")
-        with open(batch_path, 'w', encoding='utf-8') as f:
-            f.write(batch_content)
+        install_dir = _read_install_dir()
+        if not install_dir:
+            raise RuntimeError("找不到安装路径")
 
-        # 使用隐藏窗口启动批处理
-        if platform.system() == "Windows":
-            CREATE_NO_WINDOW = 0x08000000
-            subprocess.Popen(
-                ['cmd', '/c', batch_path],
-                creationflags=CREATE_NO_WINDOW,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL
-            )
+        if not os.path.exists(setup_path):
+            raise RuntimeError(f"下载文件已丢失: {setup_path}")
 
-        # 退出当前程序
+        args = [
+            updater,
+            f"/UPDATER_PATH={setup_path}",
+            f"/INSTDIR={install_dir}",
+            "/LAUNCH=1",
+        ]
+        CREATE_NO_WINDOW = 0x08000000
+        subprocess.Popen(
+            args,
+            creationflags=CREATE_NO_WINDOW,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            close_fds=True,
+        )
+
+        import time
+        time.sleep(0.2)
         os._exit(0)
 
+    def has_pending_update() -> bool:
+        return False
+
+    def get_pending_update_info() -> Optional[dict]:
+        return None
+
+
+# ==================== 兼容层 ====================
+# 提前定义 semver 函数（两边都会用）
+def _compat_parse_semver(v: str) -> tuple:
+    """'1.0.2' → (1, 0, 2)"""
+    s = str(v).strip().lstrip("v")
+    try:
+        parts = []
+        for x in s.split("."):
+            x = x.strip()
+            if x.isdigit():
+                parts.append(int(x))
+            else:
+                head = ""
+                for ch in x:
+                    if ch.isdigit():
+                        head += ch
+                    else:
+                        break
+                parts.append(int(head) if head else 0)
+        return tuple(parts[:3])
+    except Exception:
+        return (0, 0, 0)
+
+
+def _compat_is_newer(remote: str, local: str) -> bool:
+    return _compat_parse_semver(remote) > _compat_parse_semver(local)
+
+
+def _get_compat_semver():
+    """获取兼容的 semver 函数"""
+    if IS_PORTABLE:
+        from core.portable_updater import _parse_semver
+        return _parse_semver
+    return _compat_parse_semver
+
+
+def _get_compat_is_newer():
+    """获取兼容的 is_newer 函数"""
+    if IS_PORTABLE:
+        from core.portable_updater import _is_newer
+        return _is_newer
+    return _compat_is_newer
+
+
+def check_and_update(progress_callback=None) -> Optional[UpdateInfo]:
+    """兼容旧名"""
+    return check_update()
+
+
+def parse_version(version_str: str) -> tuple:
+    """兼容旧名"""
+    return _get_compat_semver()(version_str)
+
+
+def is_newer_version(new_version: str, current_version: str) -> bool:
+    """兼容旧名"""
+    return _get_compat_is_newer()(new_version, current_version)
+
+
+def download_file(url: str, dest_path: str) -> bool:
+    """兼容旧名"""
+    try:
+        req = urllib.request.Request(
+            url,
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
+        )
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            with open(dest_path, "wb") as f:
+                f.write(resp.read())
+        return True
     except Exception as e:
-        logging.error(f"准备更新失败: {e}")
-        raise
+        logger.error(f"download_file 失败: {e}")
+        return False
 
 
-# ==================== 测试代码 ====================
-if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
+def quit_and_update(new_exe_path: str) -> None:
+    """兼容旧名"""
+    logger.warning("quit_and_update 已弃用")
 
-    print(f"当前版本: {get_current_version()}")
-    print("检查更新中...")
 
-    has_update, latest, url, notes = check_update()
-    if has_update:
-        print(f"发现新版本: {latest}")
-        print(f"下载链接: {url}")
-        print(f"更新说明: {notes[:200]}..." if notes else "")
-    else:
-        print("已是最新版本或检查失败")
+def check_for_updates(parent=None):
+    """兼容旧名"""
+    from core.simple_updater import show_update_dialog
+    info = check_update()
+    if info:
+        show_update_dialog(info, parent)

@@ -1,0 +1,10 @@
+{
+    "id": "example-plugin",
+    "name": "示例插件",
+    "version": "1.0.0",
+    "description": "这是一个示例插件，用于展示插件系统的使用方法",
+    "author": "bilirec",
+    "homepage": "https://github.com/ivanhih/ddrec-plugins",
+    "min_app_version": "1.0.0",
+    "download_url": "https://github.com/ivanhih/ddrec-plugins/releases/download/v1.0.0/example_plugin.zip"
+}
