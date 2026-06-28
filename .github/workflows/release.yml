@@ -1,0 +1,113 @@
+name: Build and Publish Release
+
+# 触发条件: 推送 v* 格式的 tag(如 v1.0.5)
+# 同时也允许 workflow_dispatch 手动触发(用于测试)
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '要发布的版本号(如 1.0.5-test),留空则用 tag 名'
+        required: false
+        default: ''
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller awscli
+
+      - name: Determine version
+        id: version
+        shell: pwsh
+        run: |
+          if ("${{ github.event_name }}" -eq "workflow_dispatch" -and "${{ inputs.version }}" -ne "") {
+            $VERSION = "${{ inputs.version }}"
+          } else {
+            $VERSION = "${{ github.ref_name }}" -replace '^v', ''
+          }
+          Write-Host "Building version: $VERSION"
+          "version=$VERSION" >> $env:GITHUB_OUTPUT
+
+      - name: Update version.py
+        shell: pwsh
+        run: |
+          $VERSION = "${{ steps.version.outputs.version }}"
+          (Get-Content version.py) -replace '__version__ = ".*"', "__version__ = `"$VERSION`"" | Set-Content version.py
+          Write-Host "version.py updated:"
+          Get-Content version.py
+
+      - name: Build
+        shell: pwsh
+        run: |
+          python build.py 2>&1 | Tee-Object -FilePath build.log
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "build.py failed"
+            exit 1
+          }
+
+      - name: List build artifacts
+        shell: pwsh
+        run: |
+          Get-ChildItem dist -Recurse -File |
+            Where-Object { $_.Length -gt 1MB } |
+            Select-Object FullName, @{N='SizeMB';E={[math]::Round($_.Length/1MB,1)}} |
+            Format-Table -AutoSize
+
+      - name: Upload to Cloudflare R2
+        shell: pwsh
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+        run: |
+          $VERSION = "${{ steps.version.outputs.version }}"
+          $TAG = "v$VERSION"
+          $INSTALL_EXE = "dist/DD录播机.Install.${VERSION}.exe"
+
+          if (-not (Test-Path $INSTALL_EXE)) {
+            Write-Error "找不到 install exe: $INSTALL_EXE"
+            exit 1
+          }
+
+          $ENDPOINT = "https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com"
+          $BUCKET = "dd-rec-releases"
+
+          Write-Host "上传到 R2: s3://${BUCKET}/dd_rec.Install.${VERSION}.exe"
+          aws s3 cp "$INSTALL_EXE" "s3://${BUCKET}/dd_rec.Install.${VERSION}.exe" `
+            --endpoint-url $ENDPOINT `
+            --acl public-read
+
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "R2 上传失败"
+            exit 1
+          }
+
+          Write-Host "✓ R2 上传成功"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: 'DD录播机 v${{ steps.version.outputs.version }}'
+          draft: true
+          generate_release_notes: true
+          files: |
+            dist/dd_rec-*portable.7z
+            dist/DD录播机.Install.*.exe
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

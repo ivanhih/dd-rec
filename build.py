@@ -15,20 +15,24 @@ dd-rec 打包脚本（Portable 方案）
 产物：
   dist/dd_rec-{VERSION}.zip  ← 发布到 GitHub Release
 
-目录结构：
+目录结构:
   dd-rec/
   ├── dd_rec.exe              # 启动器
+  ├── dd_rec_main.exe         # 主程序(平坦化,跟 launcher 同目录)
+  ├── dd_rec.update.exe       # kachina 自更新器
   ├── version.ini              # 当前版本
-  ├── config.json              # 用户配置（保留）
-  ├── data.json                # 用户数据（保留）
-  ├── dd_rec.db              # SQLite 数据（保留）
-  ├── ffmpeg/                 # ffmpeg 二进制（保留）
+  ├── _internal/              # PyInstaller 运行时
+  ├── ffmpeg/                 # ffmpeg 二进制(保留)
   │   ├── ffmpeg.exe
   │   └── ffprobe.exe
-  ├── dd_rec-1.0.2/         # 版本化应用包
-  │   ├── dd_rec_main.exe    # 主程序
-  │   └── _internal/          # Python 运行时 + dll
-  └── temp/                   # 下载临时目录
+  ├── userdata/               # 用户数据(kachina update.exe 自动保护)
+  │   ├── config.json
+  │   ├── data.json
+  │   ├── dd_rec.db
+  │   ├── log/
+  │   └── cache/
+  └── 录播文件/              # 用户视频(kachina ignoreFolderPath 保护)
+      └── <room_id>-<uname>/<date>/<file>.mp4
 
 使用：
   python build.py
@@ -40,6 +44,7 @@ import shutil
 import subprocess
 import zipfile
 import time
+from typing import Optional
 
 from version import __version__ as VERSION
 
@@ -51,6 +56,100 @@ LAUNCHER_SPEC = os.path.join(PROJECT_ROOT, "launcher.spec")
 APP_SPEC = os.path.join(PROJECT_ROOT, "app.spec")
 FFMPEG_BIN = r"C:\ffmpeg\bin"
 FFMPEG_EXES = ("ffmpeg.exe", "ffprobe.exe")
+
+# ==================== kachina-installer 配置 ====================
+# kachina-builder 路径(自动探测以下位置,优先级从高到低)
+_KACHINA_CANDIDATES = [
+    r"C:\tools\kachina-builder\kachina-builder.exe",
+    r"C:\Users\user\Downloads\ABDM\Programs\kachina-builder.exe",
+    os.path.join(os.environ.get("LOCALAPPDATA", ""), "kachina-builder", "kachina-builder.exe"),
+    os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"), "kachina-builder", "kachina-builder.exe"),
+]
+KACHINA_CONFIG = os.path.join(PROJECT_ROOT, "kachina.config.json")
+APP_ICON = os.path.join(PROJECT_ROOT, "assets", "icon.ico")
+KACHINA_RID = "dd_rec"  # AppId,跟 kachina.config.json regName 一致
+
+
+def find_kachina_builder() -> str | None:
+    """找 kachina-builder.exe,多个候选位置 + PATH
+
+    注意:shutil.which("kachina-builder") 默认会优先搜当前工作目录,
+    如果项目根里有 kachina-builder.exe 会优先被找到 — 这是个坑。
+    所以这里只信绝对路径候选列表,不用 PATH(避免项目根污染)。
+    """
+    for c in _KACHINA_CANDIDATES:
+        if os.path.exists(c):
+            return c
+    # 兜底:真的 PATH 里有时才用它(但要排除项目根)
+    import shutil
+    p = shutil.which("kachina-builder")
+    if p and os.path.normpath(os.path.dirname(p)) != os.path.normpath(PROJECT_ROOT):
+        return p
+    return None
+
+
+def find_7z() -> str | None:
+    """找 7z.exe(打包 7z 格式用)"""
+    import shutil
+    p = shutil.which("7z")
+    if p:
+        return p
+    candidates = [
+        r"C:\Program Files\7-Zip\7z.exe",
+        r"C:\Program Files (x86)\7-Zip\7z.exe",
+    ]
+    for c in candidates:
+        if os.path.exists(c):
+            return c
+    return None
+
+
+def _run_kachina(cmd: list, wait_for: str = None, timeout: int = 120) -> None:
+    """调 kachina-builder。
+
+    已知背景:
+      - Python subprocess 直接 spawn kachina-builder 报 WinError 740
+      - cmd /c 中间层可以绕过,但要小心引号处理
+      - 这次用最直接的:shell=True,让 Windows 自己处理引号
+
+    Args:
+        cmd: 完整命令行(元素 0 是 exe 路径,后面是参数)
+        wait_for: 等待此文件路径出现(kachina 跑完的标志)
+        timeout: 等待超时(秒)
+    """
+    import subprocess
+    # 用空格连接的字符串作为 shell 命令
+    cmdline = subprocess.list2cmdline(cmd)
+    print(f"  $ {cmdline}")
+
+    CREATE_NO_WINDOW = 0x08000000
+    # shell=True 让 Windows cmd.exe 自己解析 + 执行(处理引号等)
+    r = subprocess.run(
+        cmdline,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=timeout,
+        shell=True,
+        creationflags=CREATE_NO_WINDOW,
+    )
+    stdout = (r.stdout or "").strip()
+    stderr = (r.stderr or "").strip()
+    if stdout:
+        print(f"  stdout: {stdout[:500]}")
+    if stderr:
+        print(f"  stderr: {stderr[:500]}")
+    if r.returncode != 0:
+        raise RuntimeError(
+            f"kachina-builder 退出码 {r.returncode}\n"
+            f"stdout: {stdout[:500]}\n"
+            f"stderr: {stderr[:500]}"
+        )
+    if wait_for and not os.path.exists(wait_for):
+        raise RuntimeError(
+            f"kachina-builder 报告成功但产物未出现: {wait_for}"
+        )
 
 
 def find_pyinstaller() -> str | None:
@@ -116,6 +215,20 @@ def check_dependencies() -> bool:
         p = os.path.join(FFMPEG_BIN, exe)
         if not os.path.exists(p):
             errors.append(f"ffmpeg 缺失: {p}")
+
+    kachina = find_kachina_builder()
+    if not kachina:
+        errors.append(
+            "kachina-builder 未找到（Phase 0 步骤 0.1-0.2 没完成）。\n"
+            "   下载地址: https://github.com/YuehaiTeam/kachina-installer/releases\n"
+            "   解压到 C:\\tools\\kachina-builder\\ 后重试。"
+        )
+    else:
+        print(f"   找到 kachina-builder: {kachina}")
+
+    if not find_7z():
+        # 不是致命错误 — 没有 7z 时 fallback zip,build.py 后续会处理
+        print("   警告: 没找到 7z.exe，会回退到 zip 格式（产物稍大）")
 
     if errors:
         print("依赖检查失败:")
@@ -221,17 +334,29 @@ def assemble_portable_dir() -> None:
     else:
         print(f"   警告: 找不到启动器 {launcher_src}")
 
-    # 2. 复制主程序目录（PyInstaller 输出 dist/dd_rec_app/）
-    # 注意：重命名为 dd_rec-{VERSION}/
-    app_src = os.path.join(DIST_DIR, "dd_rec_app")  # PyInstaller 输出的目录
-    app_dst = os.path.join(portable_root, f"dd_rec-{VERSION}")  # 目标目录名
-
+    # 2. 平铺主程序到 portable 根(不再有 dd_rec-{VERSION}/ 子目录)
+    #    原因: kachina update.exe 启动时检查 current_exe().parent() / exe_name,
+    #    找不到就走"装到 Program Files"模式。所以主程序必须跟 update.exe 平铺,
+    #    这样 update.exe 看到 dd_rec_main.exe 就走"就地升级"模式(参考 BetterGI)。
+    app_src = os.path.join(DIST_DIR, "dd_rec_app")  # PyInstaller onedir 输出
     if os.path.exists(app_src):
-        if os.path.exists(app_dst):
-            shutil.rmtree(app_dst)
-        # 直接重命名，而不是复制
-        shutil.move(app_src, app_dst)
-        print(f"   重命名主程序: dd_rec_app/ → dd_rec-{VERSION}/")
+        # 把 onedir 里所有条目(文件 + 子目录,主要是 _internal/)复制/合并到 portable 根
+        for entry in os.listdir(app_src):
+            src_path = os.path.join(app_src, entry)
+            dst_path = os.path.join(portable_root, entry)
+            try:
+                if os.path.isdir(src_path):
+                    if os.path.exists(dst_path):
+                        shutil.rmtree(dst_path)
+                    shutil.copytree(src_path, dst_path)
+                else:
+                    if os.path.exists(dst_path):
+                        os.remove(dst_path)
+                    shutil.copy2(src_path, dst_path)
+            except Exception as e:
+                print(f"   警告: 平铺 {entry} 失败: {e}")
+        shutil.rmtree(app_src)
+        print(f"   平铺主程序到 portable 根({len(os.listdir(portable_root))} 项)")
     else:
         print(f"   警告: 找不到主程序 {app_src}")
 
@@ -253,32 +378,143 @@ def assemble_portable_dir() -> None:
         f.write(f"version={VERSION}\n")
     print(f"   创建 version.ini: {VERSION}")
 
+    # 4.5 拷贝 kachina update.exe（assemble 阶段之前先 build 了 update.exe）
+    update_src = os.path.join(DIST_DIR, "dd_rec.update.exe")
+    if os.path.exists(update_src):
+        update_dst = os.path.join(portable_root, "dd_rec.update.exe")
+        if os.path.exists(update_dst):
+            os.remove(update_dst)
+        shutil.copy2(update_src, update_dst)
+        print(f"   复制 kachina update.exe")
+    else:
+        print(f"   警告: 找不到 update.exe {update_src}，kachina 自更新不可用")
+
     # 5. 创建 temp 目录
     temp_dir = os.path.join(portable_root, "temp")
     os.makedirs(temp_dir, exist_ok=True)
     print("   创建 temp/ 目录")
 
 
-def create_zip() -> str:
-    """打包成 zip"""
-    print(f"\n[5/7] 打包成 zip...")
+def create_7z() -> str:
+    """打包成 7z（优先）或 zip（fallback）
+
+    文件名: dd_rec-{VERSION}-portable.7z
+    内部结构跟原 zip 一致：
+      dd_rec.exe / version.ini / dd_rec.update.exe / dd_rec-{VERSION}/ / ffmpeg/ / temp/
+    """
+    print(f"\n[5/9] 打包成 7z/zip...")
     portable_root = os.path.join(DIST_DIR, "dd-rec")
-    zip_name = f"dd_rec-{VERSION}.zip"
-    zip_path = os.path.join(DIST_DIR, zip_name)
+    archive_name = f"dd_rec-{VERSION}-portable"
+    archive_path = os.path.join(DIST_DIR, archive_name)
 
-    if os.path.exists(zip_path):
-        os.remove(zip_path)
+    seven_z = find_7z()
+    if seven_z:
+        # 7z 模式：体积小 ~25%
+        archive_path_7z = archive_path + ".7z"
+        if os.path.exists(archive_path_7z):
+            os.remove(archive_path_7z)
+        subprocess.check_call([
+            seven_z, "a",
+            "-t7z", "-mx=9", "-mfb=64", "-md=32m",
+            archive_path_7z,
+            os.path.join(portable_root, "*"),
+        ], cwd=portable_root)
+        size_mb = os.path.getsize(archive_path_7z) / 1024 / 1024
+        print(f"   创建: {os.path.basename(archive_path_7z)} ({size_mb:.1f} MB, 7z)")
+        return archive_path_7z
+    else:
+        # zip fallback
+        archive_path_zip = archive_path + ".zip"
+        if os.path.exists(archive_path_zip):
+            os.remove(archive_path_zip)
+        with zipfile.ZipFile(archive_path_zip, "w", zipfile.ZIP_DEFLATED) as zf:
+            for root, dirs, files in os.walk(portable_root):
+                for file in files:
+                    file_path = os.path.join(root, file)
+                    arcname = os.path.relpath(file_path, portable_root)
+                    zf.write(file_path, arcname)
+        size_mb = os.path.getsize(archive_path_zip) / 1024 / 1024
+        print(f"   创建: {os.path.basename(archive_path_zip)} ({size_mb:.1f} MB, zip fallback)")
+        return archive_path_zip
 
-    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-        for root, dirs, files in os.walk(portable_root):
-            for file in files:
-                file_path = os.path.join(root, file)
-                arcname = os.path.relpath(file_path, portable_root)
-                zf.write(file_path, arcname)
 
-    size_mb = os.path.getsize(zip_path) / 1024 / 1024
-    print(f"   创建: {zip_name} ({size_mb:.1f} MB)")
-    return zip_path
+def build_kachina_update() -> str:
+    """生成 dd_rec.update.exe — kachina 的便携更新器
+
+    必须在 assemble_portable_dir 之前调用，因为后者要把 update.exe 拷到 portable 根。
+    """
+    kachina = find_kachina_builder()
+    if not kachina:
+        raise RuntimeError("kachina-builder 不可用，请先完成 Phase 0")
+
+    print(f"\n[2.5/9] 生成 kachina update.exe...")
+    update_exe = os.path.join(DIST_DIR, "dd_rec.update.exe")
+    if os.path.exists(update_exe):
+        os.remove(update_exe)
+    cmd = [kachina, "pack", "-c", KACHINA_CONFIG, "-o", update_exe]
+    if os.path.exists(APP_ICON):
+        cmd += ["--icon", APP_ICON]
+    print(f"  $ " + " ".join(cmd))
+    _run_kachina(cmd, wait_for=update_exe)
+    print(f"   创建: dd_rec.update.exe")
+    return update_exe
+
+
+def build_kachina_metadata(portable_root: str) -> tuple:
+    """生成 metadata.json + hashed/ 目录
+
+    kachina 增量更新 (HDiffPatch) 需要的元数据。
+    - portable_root: assemble 完之后的 portable 根目录(dist/dd-rec/),
+      必须包含 launcher (dd_rec.exe) + version.ini + 主程序 + _internal + ffmpeg,
+      这样 patch 时这些文件都会被替换(否则 launcher 和 version.ini 永远不更新)
+    """
+    kachina = find_kachina_builder()
+    print(f"\n[6/9] 生成 kachina metadata + hashed...")
+    metadata = os.path.join(DIST_DIR, "metadata.json")
+    hashed = os.path.join(DIST_DIR, "hashed")
+    if os.path.exists(hashed):
+        shutil.rmtree(hashed)
+    # -u:updater 文件路径(绝对路径,避免 kachina 找不到)
+    update_exe_abs = os.path.join(DIST_DIR, "dd_rec.update.exe")
+    cmd = [
+        kachina, "gen",
+        "-j", "8",
+        "-i", portable_root,
+        "-m", metadata,
+        "-o", hashed,
+        "-r", KACHINA_RID,
+        "-t", VERSION,
+        "-u", update_exe_abs,
+    ]
+    print("  $ " + " ".join(cmd))
+    # gen 跑全量 hash + 压缩,几百到几千个文件
+    # PyInstaller onedir 通常 1500-3000 个文件,180MB 左右 → 15 分钟保守
+    _run_kachina(cmd, wait_for=metadata, timeout=900)
+    return metadata, hashed
+
+
+def build_kachina_installer(metadata: str, hashed: str) -> str:
+    """生成完整的 Install.exe — 给想要安装器的用户"""
+    kachina = find_kachina_builder()
+    print(f"\n[7/9] 生成 kachina Install.exe...")
+    install_exe = os.path.join(DIST_DIR, f"DD录播机.Install.{VERSION}.exe")
+    if os.path.exists(install_exe):
+        os.remove(install_exe)
+    cmd = [
+        kachina, "pack",
+        "-c", KACHINA_CONFIG,
+        "-m", metadata,
+        "-d", hashed,
+        "-o", install_exe,
+    ]
+    if os.path.exists(APP_ICON):
+        cmd += ["--icon", APP_ICON]
+    print("  $ " + " ".join(cmd))
+    # pack Install.exe 也是写大文件,5 分钟够
+    _run_kachina(cmd, wait_for=install_exe, timeout=300)
+    size_mb = os.path.getsize(install_exe) / 1024 / 1024
+    print(f"   创建: {os.path.basename(install_exe)} ({size_mb:.1f} MB)")
+    return install_exe
 
 
 def copy_to_installer() -> None:
@@ -293,33 +529,65 @@ def copy_to_installer() -> None:
         print(f"   复制: {dst}")
 
 
-def print_summary(zip_path: str) -> None:
+def print_summary(archive_path: str, install_exe: str = "", patch_path: str = "") -> None:
     """打印最终产物"""
     print("\n" + "=" * 60)
     print("打包完成!")
     print("=" * 60)
-    if os.path.exists(zip_path):
-        size_mb = os.path.getsize(zip_path) / 1024 / 1024
-        print(f"\n发布产物:")
-        print(f"   - {zip_path}  ({size_mb:.1f} MB)")
-    print(f"\n目录结构预览:")
-    print(f"   dd-rec/")
-    print(f"   ├── dd_rec.exe          # 启动器")
-    print(f"   ├── version.ini         # 当前版本")
-    print(f"   ├── config.json         # 用户配置")
-    print(f"   ├── data.json           # 用户数据")
-    print(f"   ├── ffmpeg/")
-    print(f"   │   ├── ffmpeg.exe")
-    print(f"   │   └── ffprobe.exe")
-    print(f"   ├── dd_rec-{VERSION}/")
-    print(f"   │   ├── dd_rec_main.exe # 主程序")
-    print(f"   │   └── _internal/      # Python 运行时")
-    print(f"   └── temp/")
+
+    def _print_art(p: str, label: str):
+        if p and os.path.exists(p):
+            size_mb = os.path.getsize(p) / 1024 / 1024
+            print(f"   - {os.path.basename(p):50s} {size_mb:7.1f} MB  ({label})")
+
+    print("\n发布产物:")
+    _print_art(archive_path, "绿色版(kachina 自更新)")
+    _print_art(install_exe, "完整安装器(可选)")
+    _print_art(patch_path, "增量补丁(可选)")
+    _print_art(os.path.join(DIST_DIR, "dd_rec.update.exe"), "kachina 更新器(已嵌入 7z)")
+
     print(f"\n下一步:")
     print(f"   1. 在 GitHub 创建 Release v{VERSION}")
-    print(f"   2. 上传 dd_rec-{VERSION}.zip 到 Release")
-    print(f"   3. 用户解压后双击 dd_rec.exe 即可运行")
+    print(f"   2. 上传以下文件(全部):")
+    if archive_path:
+        print(f"      - {os.path.basename(archive_path)}")
+    if install_exe:
+        print(f"      - {os.path.basename(install_exe)}")
+    if patch_path:
+        print(f"      - {os.path.basename(patch_path)}")
+    print(f"   3. 7z/Install.exe 用户:走 kachina update.exe 自动增量更新")
     print("=" * 60)
+
+
+def _is_admin() -> bool:
+    """检查当前进程是否以管理员身份运行"""
+    try:
+        import ctypes
+        return ctypes.windll.shell32.IsUserAnAdmin() != 0
+    except Exception:
+        return False
+
+
+def _request_admin_relaunch() -> None:
+    """请求 UAC 提权,失败则退出
+
+    用 runas 启动新进程:
+      - 整个 python 进程提权,后续 subprocess.check_call kachina-builder
+        不会再报 WinError 740
+      - 一次性提权,build.py 后续所有 kachina 调用都跑得通
+    """
+    import subprocess
+    import sys
+    script = os.path.abspath(__file__)
+    args = " ".join(f'"{a}"' for a in sys.argv[1:])
+    cmd = f'"{sys.executable}" "{script}" {args}'
+    print("=" * 60)
+    print("build.py 需要管理员权限(因为 kachina-builder 要求 UAC)")
+    print("即将弹 UAC 框,点'是'后 build.py 会以管理员身份重新启动")
+    print("=" * 60)
+    # runas 启动新进程;父进程直接退出,等提权后的子进程接管
+    subprocess.call(["runas", "/user:Administrator", cmd])
+    sys.exit(0)
 
 
 def main() -> int:
@@ -329,11 +597,108 @@ def main() -> int:
     clean()
     build_launcher()
     build_app()
+    # update.exe 必须在 metadata 之前生成(metadata 的 -u 参数要它)
+    update_exe = build_kachina_update()
+    # assemble 必须先于 metadata:metadata 现在用 assemble 完之后的 portable 根作为输入,
+    # 这样 launcher (dd_rec.exe) 和 version.ini 也进 hashed 列表,patch 时会被替换
+    # —— 否则 kachina update.exe 跑完后 version.ini 还是旧版号,下次启动又弹更新
     assemble_portable_dir()
-    zip_path = create_zip()
-    copy_to_installer()
-    print_summary(zip_path)
+    # metadata 输入改成 portable 根(assemble 后),包含 launcher / version.ini / 主程序 / _internal / ffmpeg / update.exe
+    portable_root = os.path.join(DIST_DIR, "dd-rec")
+    metadata, hashed = build_kachina_metadata(portable_root)
+    install_exe = build_kachina_installer(metadata, hashed)
+    archive_path = create_7z()
+    patch_path = build_hdiff_patch_auto(metadata)  # 可能 None
+    archive_current_patches(metadata, hashed)
+    print_summary(archive_path, install_exe, patch_path)
     return 0
+
+
+def archive_current_patches(metadata: str, hashed: str) -> None:
+    """把当前版本的 metadata + hashed/ 归档到 patches/{version}/
+
+    下一次发版时,build_hdiff_patch_auto 会从这里读 prev_version 的 hashed,
+    生成 patch。
+
+    归档策略:
+      - 只存哈希索引(几千 KB,极小),不存 hashed/ 里的文件实体
+      - metadata.json 完整保留(几 KB)
+
+    提示:发布到 GitHub Release 之前,记得把 patches/{version}/ 提交到 git。
+    """
+    target_dir = os.path.join(PROJECT_ROOT, "patches", VERSION)
+    print(f"\n[9/9] 归档 patches/{VERSION}/ (给下个版本做 patch 源)...")
+    try:
+        # 清理旧归档(可能有遗漏的临时文件)
+        if os.path.exists(target_dir):
+            shutil.rmtree(target_dir)
+        os.makedirs(target_dir, exist_ok=True)
+
+        # 拷贝 metadata.json
+        if os.path.exists(metadata):
+            shutil.copy2(metadata, os.path.join(target_dir, "metadata.json"))
+            print(f"   写入 metadata.json")
+
+        # 拷贝 hashed/(只是哈希索引,小)
+        target_hashed = os.path.join(target_dir, "hashed")
+        if os.path.isdir(hashed):
+            shutil.copytree(hashed, target_hashed)
+            count = sum(len(files) for _, _, files in os.walk(target_hashed))
+            print(f"   写入 hashed/ ({count} 个索引文件)")
+
+        # 写一个 .gitkeep + 提示
+        readme = os.path.join(target_dir, "README.txt")
+        with open(readme, "w", encoding="utf-8") as f:
+            f.write(
+                f"DD录播机 v{VERSION} 的 kachina 更新元数据\n"
+                f"由 build.py 自动生成\n"
+                f"提交到 git,下个版本 build 时会用来生成增量 patch\n"
+            )
+        print(f"   归档完成: {target_dir}")
+        print(f"   提示: 记得 git add patches/{VERSION}/ && git commit")
+    except Exception as e:
+        print(f"   警告: 归档失败 {e}（不影响本次 build 产物）")
+
+
+def build_hdiff_patch_auto(new_metadata: str) -> Optional[str]:
+    """自动检测前一版 git tag,生成 HDiffPatch(可选)
+
+    需要 patches/{prev_version}/metadata.json + hashed/ 在 git 里
+    """
+    kachina = find_kachina_builder()
+    try:
+        prev_tag = subprocess.check_output(
+            ["git", "describe", "--tags", "--abbrev=0", "HEAD"],
+            cwd=PROJECT_ROOT, text=True, stderr=subprocess.DEVNULL,
+        ).strip()
+    except Exception:
+        print("   跳过 HDiffPatch: 没有可用的 git tag")
+        return None
+
+    prev_version = prev_tag.lstrip("v")
+    prev_hashed = os.path.join(PROJECT_ROOT, "patches", prev_version, "hashed")
+    prev_meta = os.path.join(PROJECT_ROOT, "patches", prev_version, "metadata.json")
+    if not (os.path.isdir(prev_hashed) and os.path.exists(prev_meta)):
+        print(f"   跳过 HDiffPatch: 找不到 patches/{prev_version}/")
+        return None
+
+    print(f"\n[8/9] 生成 HDiffPatch ({prev_version} → {VERSION})...")
+    patch = os.path.join(DIST_DIR, f"DD录播机-{VERSION}-patch-from-{prev_version}.zip")
+    cmd = [
+        kachina, "diff",
+        "-c", KACHINA_CONFIG,
+        "-i", prev_hashed,
+        "-o", patch,
+        "--old-meta", prev_meta,
+        "--new-meta", new_metadata,
+    ]
+    print("  $ " + " ".join(cmd))
+    try:
+        _run_kachina(cmd, wait_for=patch)
+    except Exception as e:
+        print(f"   警告: HDiffPatch 生成失败 {e}，跳过 patch 产物")
+        return None
+    return patch
 
 
 if __name__ == "__main__":

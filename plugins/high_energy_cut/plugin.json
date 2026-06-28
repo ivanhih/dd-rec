@@ -1,0 +1,11 @@
+{
+    "id": "high_energy_cut",
+    "name": "高能剪切",
+    "version": "1.0.0",
+    "description": "对已录制的直播录播做二次分析:基于弹幕密度自动识别高能片段,支持预览与批量剪切到「录播目录/高能剪切/」。",
+    "author": "DDRec",
+    "homepage": "https://github.com/ivanhih/ddrec-plugins",
+    "min_app_version": "1.0.0",
+    "icon": "🎬",
+    "download_url": "https://github.com/ivanhih/ddrec-plugins/releases/download/v1.0.0/high_energy_cut.zip"
+}

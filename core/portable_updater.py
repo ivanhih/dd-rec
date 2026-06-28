@@ -1,27 +1,25 @@
 """
-Portable 更新模块（Portable 方案）
+Portable 更新模块
 
-功能：
+流程（kachina-installer 模式）：
   1. check_update()           → 调 GitHub API 检查最新 release
-  2. download_update(info, cb) → 下载 dd_rec-{version}.zip 到 temp/
-  3. prepare_update(info, path) → 写入 pending_update.json，等待重启
-  4. apply_pending_update()    → 由 launcher.py 在启动时调用，解压并更新
+  2. download_update(info, cb) → 下载 7z 到 temp/
+  3. 用户确认 → launch_kachina_update() spawn DDRec.update.exe → 主程序退出
+  4. kachina update.exe: 关闭主程序 → HDiffPatch → 替换 launcher / dd_rec-{ver}/ → 启动新版
 
-流程：
-  主程序检测更新 → 用户确认 → 下载 zip → 写 pending → 提示重启
-  用户重启 → launcher 检测 pending → 解压 → 更新 version.ini → 启动新版本
+不再走 pending_update.json 流程：
+  - launcher 已被简化为只启动主程序（不再负责解包）
+  - kachina update.exe 自身会处理 launcher 替换（因为 launcher 已退出，可写）
 """
 
 import os
 import sys
 import json
 import logging
-import tempfile
 import urllib.request
 import urllib.error
-import zipfile
 from dataclasses import dataclass
-from typing import Optional, Callable
+from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -32,7 +30,7 @@ GITHUB_RELEASES = f"https://github.com/{GITHUB_REPO}/releases"
 
 # 文件名约定
 VERSION_INI = "version.ini"
-PENDING_UPDATE_FILE = "pending_update.json"
+KACHINA_UPDATE_EXE = "dd_rec.update.exe"
 
 
 @dataclass
@@ -42,17 +40,29 @@ class UpdateInfo:
     size: int
     body: str
     asset_name: str = ""
+    published_at: str = ""   # GitHub release 发布时间 (ISO 8601 UTC),mirror 酱路径可能为空
 
 
 def get_app_dir() -> str:
-    """获取应用根目录（主程序所在目录）"""
+    """获取应用根目录（主程序所在目录）
+
+    平坦化后:dd_rec_main.exe 直接在 portable 根目录,所以 sys.executable 的父目录
+    就是 app_dir。Launcher 也是 onefile 模式,逻辑一致。
+
+    兼容老版本结构(用 dd_rec-{ver}/ 子目录):如果父目录有 version.ini 就在父目录。
+    """
     if getattr(sys, "frozen", False):
-        # 主程序在 dd_rec-{version}/dd_rec_main.exe
-        # 父目录是 dd_rec-{version}/
-        # 再父目录是 dd-rec/ 根目录
         exe_dir = os.path.dirname(sys.executable)
-        return os.path.dirname(exe_dir)
-    # 开发态：项目根目录
+        # 平坦化主路径:version.ini 在主程序同目录
+        if os.path.exists(os.path.join(exe_dir, VERSION_INI)):
+            return exe_dir
+        # 兼容老结构(主程序在 dd_rec-{ver}/ 子目录)
+        parent_dir = os.path.dirname(exe_dir)
+        if os.path.exists(os.path.join(parent_dir, VERSION_INI)):
+            return parent_dir
+        # 兜底:返回自己,让上层报错更明确
+        return exe_dir
+    # 开发态:项目根目录
     return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
@@ -107,10 +117,82 @@ def _is_newer(remote: str, local: str) -> bool:
 
 # ==================== 检查更新 ====================
 def check_update(max_retries: int = 3) -> Optional[UpdateInfo]:
-    """调 GitHub API 检查更新。返回 None 表示无更新或检查失败。"""
+    """检查更新(GitHub 优先,失败/无版本回落 mirror 酱)
+
+    优先级:
+      1) GitHub API(主通道,默认行为,用户最信任)
+      2) Mirror 酱 API(fallback,仅在 GitHub 完全失败时顶上)
+
+    返回:
+      UpdateInfo — 有可用更新
+      None       — 已是最新 / 两个源都失败 / 没匹配资产
+    """
     local = get_current_version()
     logger.info(f"当前版本: {local}")
 
+    # 1) GitHub(主通道)
+    github_info = _check_update_github_only(local, max_retries)
+    if github_info is not None:
+        return github_info
+
+    # 2) Mirror 酱(fallback,GitHub 失败时)
+    mirror_info = _try_mirror_chyan(local)
+    if mirror_info is None:
+        return None
+    if mirror_info.raw_code != 0:
+        logger.info(f"mirror 酱 code={mirror_info.raw_code},跳过")
+        return None
+
+    remote_tag = mirror_info.version
+    if not remote_tag or not _is_newer(remote_tag, local):
+        logger.info("mirror 酱:当前已是最新版本")
+        return None
+
+    # 下载 URL 仍拼 GitHub 直链(mirror 酱 url 带时效,kachina 接不了 — 留给未来重构)
+    github_url = _build_github_release_url(remote_tag)
+    if not github_url:
+        logger.warning("mirror 酱:有更新但拼不出 GitHub 直链,跳过")
+        return None
+
+    logger.info(f"mirror 酱 fallback:最新 v{remote_tag} (GitHub 直链下载)")
+    return UpdateInfo(
+        version=remote_tag,
+        download_url=github_url,
+        size=0,  # mirror 酱不返回 size,这里无法预知
+        body=mirror_info.release_note,
+        asset_name="(mirror-chyan-via-github)",
+        published_at="",  # mirror 酱 API 当前未返回此字段
+    )
+
+
+def _try_mirror_chyan(local: str):
+    """调 mirror 酱。None=不可用/未启用/异常,本次跳过。"""
+    try:
+        from core.config import get_global_setting
+        if not get_global_setting("mirror_chyan_enabled"):
+            return None
+        from core.mirror_chyan import check_mirror_chyan
+        cdk = (get_global_setting("mirror_chyan_cdk") or "").strip()
+        return check_mirror_chyan(local, cdk)
+    except Exception as e:
+        logger.warning(f"mirror 酱入口异常: {e}")
+        return None
+
+
+def _build_github_release_url(version: str) -> Optional[str]:
+    """拼 GitHub release 直链(portable.7z,主程序优先找的资产)
+
+    实际资产名可能是 -portable.7z / -portable.zip,这里只兜底给一个
+    最常见的 -portable.7z 模板。如果 release 用别的命名,这里会 404,
+    kachina 安装器会自己处理(它用的是 kachina.config.json 的 source.uri)。
+    """
+    if not version:
+        return None
+    return f"https://github.com/{GITHUB_REPO}/releases/download/v{version}/dd_rec-{version}-portable.7z"
+
+
+def _check_update_github_only(local: str, max_retries: int) -> Optional[UpdateInfo]:
+    """原 check_update() 逻辑(改名,逻辑零修改)。GitHub API 不可达 = 返回 None。"""
     for attempt in range(max_retries):
         try:
             req = urllib.request.Request(
@@ -125,24 +207,36 @@ def check_update(max_retries: int = 3) -> Optional[UpdateInfo]:
                 logger.info("Release 没有 tag_name，跳过")
                 return None
 
-            # 查找 portable zip 包（命名约定：dd_rec-{version}.zip）
+            # 查找 portable 包（kachina 模式）
+            # 优先级（按文件类型）:
+            #   1) -portable.7z  (新标准，主推)
+            #   2) -portable.zip (过渡期兼容老用户)
+            #
+            # 显式不接受:
+            #   - dd_rec-{ver}.zip / bilirec-{ver}.zip (旧 launcher 流，已被新方案替代)
+            #   - -patch-from-X.Y.Z.zip (增量补丁,kachina update.exe 启动后自己会
+            #     检测并下载,不需要在这里选)
             download_url = None
             size = 0
             asset_name = ""
             for asset in data.get("assets", []):
-                name = asset.get("name", "")
-                # 匹配 dd_rec-1.0.2.zip 或 dd_rec-1.0.2-portable.zip
-                # 兼容历史命名：bilirec-1.0.2.zip（旧 build.py 用的名字）
-                if name.endswith(".zip") and (
-                    "dd_rec" in name.lower() or "bilirec" in name.lower()
-                ):
+                name = asset.get("name", "").lower()
+                if name.endswith("-portable.7z"):
                     download_url = asset.get("browser_download_url")
                     size = asset.get("size", 0)
-                    asset_name = name
-                    break
+                    asset_name = asset.get("name", "")
+                    break  # 7z 优先级最高
+            if not download_url:
+                for asset in data.get("assets", []):
+                    name = asset.get("name", "").lower()
+                    if name.endswith("-portable.zip"):
+                        download_url = asset.get("browser_download_url")
+                        size = asset.get("size", 0)
+                        asset_name = asset.get("name", "")
+                        break
 
             if not download_url:
-                logger.warning("未找到 dd_rec-*.zip 资源")
+                logger.warning("未找到 portable.7z / -portable.zip 资源")
                 return None
 
             logger.info(f"最新版本: {remote_tag}（资产: {asset_name}）")
@@ -157,6 +251,7 @@ def check_update(max_retries: int = 3) -> Optional[UpdateInfo]:
                 size=size,
                 body=data.get("body", "") or "",
                 asset_name=asset_name,
+                published_at=str(data.get("published_at", "") or ""),
             )
 
         except urllib.error.HTTPError as e:
@@ -174,132 +269,148 @@ def check_update(max_retries: int = 3) -> Optional[UpdateInfo]:
     return None
 
 
-# ==================== 下载 ====================
-ProgressCallback = Optional[Callable[[int], None]]
-
-
-def download_update(info: UpdateInfo, progress_callback: ProgressCallback = None) -> str:
-    """下载新版本 zip 到 temp/ 目录。
+# ==================== 启动 kachina update.exe ====================
+def apply_kachina_source_for_channel(channel: str, version: str) -> bool:
+    """根据用户选的通道,改 portable 根目录的 kachina.config.json 的 source[0].uri
 
     Args:
-        info: check_update() 返回的 UpdateInfo
-        progress_callback: 进度回调函数，参数为 0~100 的整数
+        channel: "github" | "mirror_chyan" | "cloudflare_r2"
+        version: 远端版本号(用于 R2 URI 模板里的 ${version} 占位检查)
 
     Returns:
-        下载到本地的 zip 路径
-
-    Raises:
-        Exception: 下载失败时抛出
+        True  = 改了 kachina.config.json(用户选了非 GitHub 通道且配置可用)
+        False = 不需要改(GitHub 直接用 / 通道未启用 / 异常)
     """
-    app_dir = get_app_dir()
-    temp_dir = os.path.join(app_dir, "temp")
-    os.makedirs(temp_dir, exist_ok=True)
+    if channel == "github":
+        # GitHub 直接用 kachina.config 里写的 URI,不改
+        return False
 
-    zip_path = os.path.join(temp_dir, info.asset_name)
-
-    # 删旧下载
-    if os.path.exists(zip_path):
+    if channel == "cloudflare_r2":
         try:
-            os.remove(zip_path)
-        except OSError:
-            pass
+            from core.cloudflare_r2 import build_source_uri, is_enabled
+        except Exception as e:
+            logger.warning(f"加载 R2 模块失败: {e}")
+            return False
+        if not is_enabled():
+            logger.warning("R2 未配置(R2_PUBLIC_BASE 为空),跳过")
+            return False
+        new_uri = build_source_uri(version)
+        if not new_uri:
+            return False
+    elif channel == "mirror_chyan":
+        # Mirror 酱 url 带时效,kachina 接不了,保持 GitHub 直链
+        # 跟 GitHub 一样不修改
+        return False
+    else:
+        logger.warning(f"未知通道: {channel}")
+        return False
 
-    logger.info(f"下载更新: {info.download_url}")
-    req = urllib.request.Request(
-        info.download_url,
-        headers={"User-Agent": "bilirec-updater/1.0"},
-    )
-
-    with urllib.request.urlopen(req, timeout=600) as resp:
-        total = int(resp.headers.get("Content-Length", 0) or 0)
-        downloaded = 0
-        chunk_size = 64 * 1024
-        with open(zip_path, "wb") as f:
-            while True:
-                chunk = resp.read(chunk_size)
-                if not chunk:
-                    break
-                f.write(chunk)
-                downloaded += len(chunk)
-                if progress_callback and total > 0:
-                    try:
-                        progress_callback(int(downloaded * 100 / total))
-                    except Exception:
-                        pass
-
-    size_mb = os.path.getsize(zip_path) / 1024 / 1024
-    logger.info(f"下载完成: {zip_path} ({size_mb:.1f} MB)")
-    return zip_path
-
-
-# ==================== 准备更新（等待重启） ====================
-def prepare_update(info: UpdateInfo, zip_path: str) -> bool:
-    """写入 pending_update.json，等待用户重启后由 launcher 应用更新。
-
-    Args:
-        info: UpdateInfo 对象
-        zip_path: 下载的 zip 文件路径
-
-    Returns:
-        True 成功，False 失败
-    """
+    # 改 portable 根目录的 kachina.config.json
     app_dir = get_app_dir()
-    pending_path = os.path.join(app_dir, PENDING_UPDATE_FILE)
+    kachina_cfg_path = os.path.join(app_dir, "kachina.config.json")
+    if not os.path.exists(kachina_cfg_path):
+        logger.warning(f"找不到 kachina.config.json: {kachina_cfg_path}")
+        return False
 
     try:
-        pending_data = {
-            "version": info.version,
-            "zip_path": zip_path,
-            "asset_name": info.asset_name,
-            "size": info.size,
-        }
-        with open(pending_path, "w", encoding="utf-8") as f:
-            json.dump(pending_data, f, ensure_ascii=False, indent=2)
+        with open(kachina_cfg_path, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
 
-        logger.info(f"已写入待更新标记: {pending_path}")
+        if not cfg.get("source") or not isinstance(cfg["source"], list) or len(cfg["source"]) == 0:
+            logger.warning("kachina.config.json source 不是非空数组,跳过")
+            return False
+
+        old_uri = cfg["source"][0].get("uri", "")
+        cfg["source"][0]["uri"] = new_uri
+
+        with open(kachina_cfg_path, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
+
+        logger.info(
+            f"kachina.config source[0].uri 已更新为 {channel}: "
+            f"{old_uri[:60]}... → {new_uri[:60]}..."
+        )
         return True
-
     except Exception as e:
-        logger.error(f"写入 pending_update.json 失败: {e}")
+        logger.error(f"改 kachina.config.json 失败: {e}")
         return False
 
 
-def has_pending_update() -> bool:
-    """检查是否有待更新的标记"""
-    app_dir = get_app_dir()
-    pending_path = os.path.join(app_dir, PENDING_UPDATE_FILE)
-    return os.path.exists(pending_path)
+def launch_kachina_update(app_dir: str) -> None:
+    """主程序退出,让 kachina update.exe 接管剩余更新流程。
 
+    kachina update.exe (DDRec.update.exe) 是带 UI 的独立 exe,会:
+      1. 弹"DD录播机 安装程序"窗口(类似 BetterGI 安装器)
+      2. 读 kachina.config.json 的 source(指向 GitHub release Install.exe)
+      3. 用户点"更新"按钮 → 下载远端 Install.exe
+      4. 关闭 dd_rec_main.exe(占用检测) + dd_rec.exe(launcher)
+      5. HDiffPatch 增量替换 dd_rec-{version}/ + 替换 launcher.exe
+      6. 启动新版本
 
-def get_pending_update_info() -> Optional[dict]:
-    """获取待更新信息"""
-    app_dir = get_app_dir()
-    pending_path = os.path.join(app_dir, PENDING_UPDATE_FILE)
-    try:
-        if os.path.exists(pending_path):
-            with open(pending_path, "r", encoding="utf-8") as f:
-                return json.load(f)
-    except Exception as e:
-        logger.error(f"读取 pending_update.json 失败: {e}")
-    return None
+    调用本函数后必须 os._exit(0) 立即退出主程序,避免双进程冲突。
 
+    Args:
+        app_dir: portable 根目录(即 dd-rec/ 那个目录)
 
-# ==================== 验证 zip 完整性 ====================
-def verify_zip(zip_path: str) -> bool:
-    """验证 zip 文件完整性"""
-    try:
-        with zipfile.ZipFile(zip_path, "r") as zf:
-            # 检查是否有文件
-            if zf.namelist():
-                # 尝试验证 CRC（可选，快速检查）
-                bad_file = zf.testzip()
-                if bad_file:
-                    logger.error(f"ZIP 损坏: {bad_file}")
-                    return False
-                return True
-    except Exception as e:
-        logger.error(f"验证 ZIP 失败: {e}")
-    return False
+    Raises:
+        FileNotFoundError: 找不到 update.exe
+    """
+    update_exe = os.path.join(app_dir, KACHINA_UPDATE_EXE)
+    if not os.path.exists(update_exe):
+        raise FileNotFoundError(
+            f"找不到 kachina update.exe: {update_exe}\n"
+            "请重新下载完整 7z 包并解压覆盖。\n"
+            "(绿色版的自更新依赖此文件,kachina update.exe 与主程序必须配套)"
+        )
+
+    logger.info(f"启动 kachina update.exe: {update_exe}")
+    # 用 ShellExecuteExW + runas verb 启动 update.exe —— 让它自己请求 UAC 提权
+    # (Windows 行为:非 elevated 进程 spawn 普通 EXE 会被 Windows 自动拦截弹 UAC,
+    #  用 runas 让 spawn 那一刻就显式提权,只弹一次 UAC 且用户体验更明确)
+    import ctypes
+    from ctypes import wintypes
+
+    SEE_MASK_NOASYNC = 0x00000100
+    SW_SHOWNORMAL = 1
+
+    class SHELLEXECUTEINFOW(ctypes.Structure):
+        _fields_ = [
+            ("cbSize", wintypes.DWORD),
+            ("fMask", ctypes.c_ulong),
+            ("hwnd", wintypes.HWND),
+            ("lpVerb", wintypes.LPCWSTR),
+            ("lpFile", wintypes.LPCWSTR),
+            ("lpParameters", wintypes.LPCWSTR),
+            ("lpDirectory", wintypes.LPCWSTR),
+            ("nShow", ctypes.c_int),
+            ("hInstApp", ctypes.c_void_p),
+            ("lpIDList", ctypes.c_void_p),
+            ("lpClass", wintypes.LPCWSTR),
+            ("hkeyClass", ctypes.c_void_p),
+            ("dwHotKey", ctypes.c_ulong),
+            ("hIcon", ctypes.c_void_p),
+            ("hProcess", ctypes.c_void_p),
+        ]
+    sei = SHELLEXECUTEINFOW()
+    sei.cbSize = ctypes.sizeof(SHELLEXECUTEINFOW)
+    sei.fMask = SEE_MASK_NOASYNC
+    sei.hwnd = None
+    sei.lpVerb = "runas"          # ← 关键:runas 让 Windows 立刻弹 UAC 提权
+    sei.lpFile = update_exe
+    sei.lpParameters = None
+    sei.lpDirectory = app_dir     # ← 跟 cwd=app_dir 效果一样,让 update.exe 找到 portable 根
+    sei.nShow = SW_SHOWNORMAL
+
+    logger.info("通过 ShellExecuteExW (runas) 启动 update.exe...")
+    if not ctypes.windll.shell32.ShellExecuteExW(ctypes.byref(sei)):
+        # 提权失败(用户取消 UAC 或其他原因)
+        err = ctypes.GetLastError()
+        raise OSError(f"ShellExecuteExW 失败,Windows error code: {err}")
+
+    # 给 update.exe 一点启动时间,再退出主程序
+    import time
+    time.sleep(0.5)
+    os._exit(0)
 
 
 # ==================== 兼容层 ====================
@@ -320,7 +431,7 @@ def is_newer_version(new_version: str, current_version: str) -> bool:
 
 def quit_and_update(new_exe_path: str) -> None:
     """兼容旧名 - 已弃用"""
-    logger.warning("quit_and_update 已弃用，请使用 prepare_update + 重启")
+    logger.warning("quit_and_update 已弃用，请使用 launch_kachina_update")
 
 
 if __name__ == "__main__":

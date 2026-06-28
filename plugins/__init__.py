@@ -36,6 +36,7 @@ class PluginInfo:
     homepage: str = ""
     min_app_version: str = ""
     download_url: str = ""
+    icon: str = ""  # 侧边栏图标(emoji 或文字),空则用默认 🎬
 
     @classmethod
     def from_json(cls, data: dict) -> "PluginInfo":
@@ -48,6 +49,7 @@ class PluginInfo:
             homepage=data.get("homepage", ""),
             min_app_version=data.get("min_app_version", ""),
             download_url=data.get("download_url", ""),
+            icon=data.get("icon", ""),
         )
 
 
@@ -129,6 +131,34 @@ class PluginContext:
         if config_file.exists():
             with open(config_file, "r", encoding="utf-8") as f:
                 self.config = json.load(f)
+
+    # ==================== 宿主能力委托(供插件使用) ====================
+    # 这些方法让插件拿到必要的宿主上下文(录播目录、ffmpeg 路径、已添加直播间),
+    # 而不需要插件自己去 import `core.*` —— 避免插件对宿主内部模块的硬依赖。
+
+    def get_save_dir(self) -> Optional[str]:
+        """返回全局默认录播目录(VIDEO_SAVE_DIR)。"""
+        if hasattr(self.main_window, "get_save_dir"):
+            return self.main_window.get_save_dir()
+        return None
+
+    def get_effective_save_dir_for_room(self, room_id: str, uname: str) -> Optional[str]:
+        """按主程序一致的规则解析某直播间的录播目录。"""
+        if hasattr(self.main_window, "get_effective_save_dir_for_room"):
+            return self.main_window.get_effective_save_dir_for_room(room_id, uname)
+        return None
+
+    def get_ffmpeg_cmd(self) -> Optional[str]:
+        """返回当前可用的 ffmpeg 可执行路径(优先本地 ffmpeg/ffmpeg.exe)。"""
+        if hasattr(self.main_window, "get_ffmpeg_cmd"):
+            return self.main_window.get_ffmpeg_cmd()
+        return None
+
+    def list_known_rooms(self) -> List[Dict[str, Any]]:
+        """返回已添加的直播间列表 [{room_id, uname, ...}]。"""
+        if hasattr(self.main_window, "list_known_rooms"):
+            return self.main_window.list_known_rooms()
+        return []
 
 
 class PluginManager:
@@ -225,7 +255,9 @@ class PluginManager:
         if plugin_id not in self._plugins:
             return False
         plugin = self._plugins[plugin_id]
-        if plugin.state == PluginState.ENABLED:
+        # 状态持久化在 config.json,instance 是内存对象;冷启动时
+        # state==ENABLED 但 instance==None 是正常情况 —— 走完整创建流程
+        if plugin.state == PluginState.ENABLED and plugin.instance is not None:
             return True
         try:
             plugin.instance = self._create_instance(plugin)

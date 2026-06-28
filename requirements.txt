@@ -2,6 +2,7 @@
 PySide6
 curl-cffi<0.15            # 0.15.0 在 PyInstaller 6.21 onedir 下有 _ssl.get_default_verify_paths 崩溃
 python-liquid
+markdown            # 用于 GitHub release note 渲染
 
 # 构建依赖（运行时不需要，仅 build.py 使用）
 # pyinstaller        # pip install pyinstaller

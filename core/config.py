@@ -5,13 +5,117 @@ import sys
 import json
 import logging
 
-if getattr(sys, "frozen", False):
-    APP_DIR = os.path.dirname(sys.executable)
-else:
-    APP_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+PACK_ID = "dd_rec"
+USERDATA_DIR_NAME = "userdata"   # 独立目录名,不跟录播文件混
+VIDEOS_DIR_NAME = "录播文件"      # 用户视频目录(独立于 userdata)
 
-VIDEO_SAVE_DIR = os.path.join(APP_DIR, "录播文件")
-os.makedirs(VIDEO_SAVE_DIR, exist_ok=True)
+
+def _portable_root() -> str:
+    """获取 portable 根目录(launcher 所在目录或版本化子目录的父目录)
+
+    平坦化后:portable 根 = exe_dir(dd_rec_main.exe 跟 launcher 同目录)
+    兼容老结构(主程序在 dd_rec-{ver}/ 子目录):父目录有 version.ini
+    开发态:返回项目根
+    """
+    if getattr(sys, "frozen", False):
+        exe_dir = os.path.dirname(sys.executable)
+        # 平坦化主路径:version.ini 在主程序同目录
+        if os.path.exists(os.path.join(exe_dir, "version.ini")):
+            return exe_dir
+        # 兼容老结构(主程序在 dd_rec-{ver}/ 子目录)
+        parent = os.path.dirname(exe_dir)
+        if os.path.exists(os.path.join(parent, "version.ini")):
+            return parent
+        return exe_dir
+    # 开发态:项目根
+    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def _user_data_dir() -> str:
+    """用户数据目录 — portable 根/userdata/
+
+    不再用 %AppData%:
+      - 录播文件保持独立(在 portable 根/录播文件/)
+      - userdata 单独管理(config/data/日志/缓存/db)
+      - kachina update.exe 通过 userDataPath + ignoreFolderPath 保护
+    """
+    d = os.path.join(_portable_root(), USERDATA_DIR_NAME)
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def _video_save_dir() -> str:
+    """录播文件目录 — portable 根/录播文件/
+
+    跟 userdata 平级:录播文件是用户视频,不应该跟配置文件混在一起。
+    kachina ignoreFolderPath 保护。
+    """
+    d = os.path.join(_portable_root(), VIDEOS_DIR_NAME)
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def _is_portable_mode() -> bool:
+    """检测是否为 Portable 模式"""
+    if not getattr(sys, "frozen", False):
+        return False
+    exe_dir = os.path.dirname(sys.executable)
+    parent_dir = os.path.dirname(exe_dir)
+    return os.path.exists(os.path.join(parent_dir, "version.ini"))
+
+
+def _read_version_ini() -> str:
+    """读取 version.ini 获取版本号"""
+    if not getattr(sys, "frozen", False):
+        return ""
+    exe_dir = os.path.dirname(sys.executable)
+    parent_dir = os.path.dirname(exe_dir)
+    version_ini = os.path.join(parent_dir, "version.ini")
+    try:
+        if os.path.exists(version_ini):
+            with open(version_ini, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line.startswith("version="):
+                        return line.split("=", 1)[1].strip()
+    except Exception:
+        pass
+    return ""
+
+
+def _resource_dir() -> str:
+    """代码自带的资源目录（只读）
+
+    Portable 模式（frozen + version.ini 存在）：
+      - 返回 app-{version}/ 目录（版本化目录，包含主程序和资源）
+    非 Portable 模式（frozen）：
+      - 返回 exe 同级目录
+    开发态：
+      - 返回项目根目录"""
+    if getattr(sys, "frozen", False):
+        exe_dir = os.path.dirname(sys.executable)
+        parent_dir = os.path.dirname(exe_dir)  # bilirec/ 根目录
+
+        # 检查是否是 Portable 模式
+        if _is_portable_mode():
+            version = _read_version_ini()
+            if version:
+                return os.path.join(parent_dir, f"dd_rec-{version}")
+            # version.ini 不存在或版本为空，使用默认
+            logger.warning("Portable 模式但 version.ini 缺失或为空，使用默认路径")
+
+        # 非 Portable 或无法确定版本，使用 exe 同级目录
+        return exe_dir
+    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+# 用户数据目录(可读写,跨更新保留) — portable 根/userdata/
+APP_DIR = _user_data_dir()
+# 录播文件目录(可读写,跨更新保留) — portable 根/录播文件/,跟 userdata 平级
+VIDEO_SAVE_DIR = _video_save_dir()
+
+# 只读资源目录（exe 同级）
+RESOURCE_DIR = _resource_dir()
 
 CONFIG_FILE = os.path.join(APP_DIR, "config.json")
 DATA_FILE = os.path.join(APP_DIR, "data.json")
@@ -121,6 +225,11 @@ DEFAULT_GLOBAL_SETTINGS = {
     # 系统
     "auto_start": True,
     "prevent_sleep": True,
+
+    # 更新通道
+    "mirror_chyan_enabled": False,   # 启用 Mirror 酱作为 GitHub 失败时的 fallback 检查源
+    "mirror_chyan_cdk": "",          # 用户 CDK,明文存于 config.json,UI 有警告
+    "update_channel": "github",      # 用户上次选择的下载通道(github / mirror_chyan)
 }
 
 # ==================== 配置管理 ====================
@@ -338,3 +447,7 @@ def has_room_override(room_id, key):
     if room_id not in CONFIG["rooms"]:
         return False
     return key in CONFIG["rooms"][room_id].get("overrides", {})
+
+
+# 注:不再需要 migrate_legacy_data —— 老 NSIS 流程已废弃,用户数据走 portable 根/userdata/。
+# kachina update.exe 通过 userDataPath + ignoreFolderPath 自动保护 userdata/ 和 录播文件/。

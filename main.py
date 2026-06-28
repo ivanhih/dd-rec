@@ -1,4 +1,4 @@
-﻿# main.py
+# main.py
 import sys
 import os
 import re
@@ -13,13 +13,17 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QScrollArea, QLineEdit, QPushButton, QLabel, QGridLayout,
     QFrame, QToolButton, QGraphicsDropShadowEffect, QSizePolicy,
-    QGraphicsOpacityEffect, QMenu, QStackedWidget, QSystemTrayIcon
+    QGraphicsOpacityEffect, QMenu, QStackedWidget, QSystemTrayIcon,
+    QDialog, QMessageBox, QCheckBox
 )
-from PySide6.QtCore import QTimer, Qt, QThread, QPropertyAnimation, QEasingCurve, QPoint, QEvent, Signal
-from PySide6.QtGui import QIcon, QFont, QColor, QActionGroup, QPixmap, QPainter, QPen, QPainterPath, QAction
+from PySide6.QtCore import QTimer, Qt, QThread, QObject, QPropertyAnimation, QEasingCurve, QPoint, QEvent, Signal, QUrl
+from PySide6.QtGui import QIcon, QFont, QColor, QActionGroup, QPixmap, QPainter, QPen, QPainterPath, QAction, QDesktopServices
 
-from core.config import load_app_data, save_app_data, VIDEO_SAVE_DIR, get_room_config, get_global_setting, get_room_setting, get_effective_format, ensure_default_config
-from core.updater import check_for_updates, get_current_version
+from core.config import load_app_data, save_app_data, VIDEO_SAVE_DIR, get_room_config, get_global_setting, get_room_setting, get_effective_format, ensure_default_config, APP_DIR
+from core.updater import get_local_version, check_update as _check_update, IS_PORTABLE
+from core.simple_updater import show_update_dialog
+from core.power import PowerKeepAlive, set_auto_start
+from version import __version__
 from core.bili_api import get_bili_info
 from core.recorder import BiliRecorder
 from core.utils import render_path_template
@@ -29,6 +33,7 @@ from ui.settings_dialog import RoomSettingsDialog, GlobalSettingsOldStyleReplica
 # 插件系统
 from plugins import PluginManager
 from plugins.page import PluginsPage
+from plugins.host import PluginHostBar, PluginStackController
 
 
 # ==================== Path preview (mirrors recorder._build_save_path) ====================
@@ -74,8 +79,8 @@ def _preview_save_path(room_id: str, uname: str, title: str, now_dt) -> str:
 
 
 # 日志配置 —— 写到文件 + stdout 双输出，方便关窗后回溯崩溃
-PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
-LOG_DIR = os.path.join(PROJECT_ROOT, "录播文件", "log")
+# 放到 userdata/log/ —— 跟 portable 根/录播文件/ 独立,只放主程序日志
+LOG_DIR = os.path.join(APP_DIR, "log")
 os.makedirs(LOG_DIR, exist_ok=True)
 LOG_FILE = os.path.join(LOG_DIR, "bilirec.log")
 
@@ -386,6 +391,15 @@ class MainWindow(QMainWindow):
         self.load_saved_data()
         self.start_refresh_timer()
 
+        # ==================== 电源管理 ====================
+        # 防止电脑休眠：按 prevent_sleep 配置启动守护线程
+        self._power_keepalive = PowerKeepAlive()
+        if get_global_setting("prevent_sleep"):
+            self._power_keepalive.start()
+        # 开机自启：按 auto_start 配置同步注册表
+        if get_global_setting("auto_start"):
+            set_auto_start(True)
+
     def _center_window(self):
         """将窗口居中显示"""
         screen = self.screen()
@@ -483,6 +497,7 @@ class MainWindow(QMainWindow):
         self.nav_channels_btn.setStyleSheet(active_style if self.current_page == "channels" else inactive_style)
         self.nav_plugins_btn.setStyleSheet(active_style if self.current_page == "plugins" else inactive_style)
         self.nav_settings_btn.setStyleSheet(active_style if self.current_page == "settings" else inactive_style)
+        self.nav_about_btn.setStyleSheet(active_style if self.current_page == "about" else inactive_style)
 
     def setup_ui(self):
         central = QWidget()
@@ -522,12 +537,22 @@ class MainWindow(QMainWindow):
         self.nav_settings_btn = self._create_sidebar_nav_button("⚙️", "全局设置")
         self._wire_hover(self.nav_settings_btn, "全局设置")
         self.nav_settings_btn.clicked.connect(self.show_global_settings_page)
+        self.nav_about_btn = self._create_sidebar_nav_button("ℹ️", "关于")
+        self._wire_hover(self.nav_about_btn, "关于")
+        self.nav_about_btn.clicked.connect(self.show_about_page)
 
         sidebar_layout.addWidget(logo_btn)
         sidebar_layout.addWidget(self.nav_channels_btn)
         sidebar_layout.addWidget(self.nav_plugins_btn)
+
+        # 插件宿主 sidebar 区 —— 已启用插件的图标会动态追加到这里
+        # 注:plugin_manager 还在后面才创建,先放占位 widget,稍后回填
+        self.plugin_host_bar = PluginHostBar(None)
+        sidebar_layout.addWidget(self.plugin_host_bar)
+
         sidebar_layout.addWidget(self.nav_settings_btn)
         sidebar_layout.addStretch()
+        sidebar_layout.addWidget(self.nav_about_btn)
         self._update_sidebar_nav_styles()
 
         # ==================== 内容区 ====================
@@ -676,13 +701,17 @@ class MainWindow(QMainWindow):
         self.page_stack.addWidget(self.channels_page)
         self.page_stack.addWidget(self.settings_page)
 
+        # 关于页面（不是 dialog，是和频道/插件/全局设置一样的主内容页面）
+        self.about_page = self._build_about_page()
+        self._about_page_index = self.page_stack.addWidget(self.about_page)
+
         # 插件页面（懒加载）
         self.plugins_page = None
         self._plugins_page_index = -1
 
         main_layout.addWidget(sidebar)
         main_layout.addWidget(self.page_stack, 1)
-        
+
         # 通知区域
         self.notification_container = QWidget(central)
         self.notification_container.setAttribute(Qt.WA_TransparentForMouseEvents, False)
@@ -710,6 +739,14 @@ class MainWindow(QMainWindow):
         # 插件管理器
         self.plugin_manager = PluginManager()
         self.plugin_manager.initialize(self)
+        # 把 manager 回填到 host bar(它构造时还没有 manager)
+        self.plugin_host_bar.set_plugin_manager(self.plugin_manager)
+
+        # 插件宿主:把已启用插件挂到 sidebar + page_stack
+        self._plugin_stack_controller = PluginStackController(
+            self.plugin_manager, self.page_stack, self.plugin_host_bar, parent=self
+        )
+        self._plugin_stack_controller.refresh_from_manager()
 
         # 初始定位
         self._position_notification_container()
@@ -943,6 +980,32 @@ class MainWindow(QMainWindow):
         if self.plugins_page is None:
             self.plugins_page = PluginsPage(self.plugin_manager)
             self._plugins_page_index = self.page_stack.addWidget(self.plugins_page)
+        # 启动时让已启用的插件在 sidebar 自动出现
+        if getattr(self, "_plugin_stack_controller", None) is not None:
+            self._plugin_stack_controller.refresh_from_manager()
+
+    # ==================== 插件宿主 API（PluginContext 委托调用） ====================
+    def get_save_dir(self) -> str:
+        """全局默认录播目录。"""
+        return VIDEO_SAVE_DIR
+
+    def get_effective_save_dir_for_room(self, room_id: str, uname: str) -> str:
+        """按主程序一致的规则解析某直播间的录播目录。"""
+        from core.config import get_effective_save_dir as _gesd
+        return _gesd(room_id, uname)
+
+    def get_ffmpeg_cmd(self) -> str:
+        """返回当前可用的 ffmpeg 可执行路径。"""
+        from core.recorder import FFMPEG_CMD
+        return FFMPEG_CMD
+
+    def list_known_rooms(self) -> list:
+        """返回已添加的直播间列表 [{room_id, uname, ...}]。"""
+        try:
+            data = load_app_data() or {}
+        except Exception:
+            return []
+        return list(data.get("channels", []) or [])
 
     def show_plugins_page(self):
         """显示插件页面"""
@@ -1175,18 +1238,18 @@ class MainWindow(QMainWindow):
         if hasattr(self, 'notification_container') and self.notification_container.parent():
             parent = self.notification_container.parent()
             parent_size = parent.size()
-            
+
             # 更新容器大小以适应内容
             self.notification_container.adjustSize()
-            
+
             # 定位到右下角，留出边距
             container_size = self.notification_container.size()
             x = parent_size.width() - container_size.width() - 20
             y = parent_size.height() - container_size.height() - 20
-            
+
             self.notification_container.move(x, y)
             self.notification_container.raise_()  # 确保在最上层
-    
+
     def eventFilter(self, obj, event):
         """事件过滤器，用于响应窗口大小变化"""
         if obj == self.notification_container.parent() and event.type() == QEvent.Resize:
@@ -1332,6 +1395,341 @@ class MainWindow(QMainWindow):
     def show_global_settings(self):
         self.show_global_settings_page()
 
+    def show_about_page(self):
+        """切换到关于页面（用 page_stack，和其他页面一致，不弹 dialog）"""
+        self.current_page = "about"
+        self.page_stack.setCurrentWidget(self.about_page)
+        self._update_sidebar_nav_styles()
+
+    def _build_about_page(self):
+        """构建关于页面（信息卡片 + 操作按钮）"""
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(32, 24, 32, 24)
+        layout.setSpacing(20)
+
+        # ==================== 顶部 toolbar ====================
+        top_bar = QHBoxLayout()
+        title_label = QLabel("关于")
+        title_label.setFont(QFont("Microsoft YaHei UI", 24, QFont.Bold))
+        title_label.setStyleSheet("color: #F8FAFC;")
+        top_bar.addWidget(title_label)
+        top_bar.addStretch()
+        layout.addLayout(top_bar)
+
+        # ==================== 信息卡片 ====================
+        info_card = QFrame()
+        info_card.setObjectName("aboutInfoCard")
+        info_card.setStyleSheet("""
+            QFrame#aboutInfoCard {
+                background-color: #181920;
+                border: 1px solid #2D2E3A;
+                border-radius: 12px;
+            }
+        """)
+        card_layout = QVBoxLayout(info_card)
+        card_layout.setContentsMargins(28, 24, 28, 24)
+        card_layout.setSpacing(14)
+
+        app_name = QLabel("DD录播机")
+        app_name.setFont(QFont("Microsoft YaHei UI", 20, QFont.Bold))
+        app_name.setStyleSheet("color: #F8FAFC; background: transparent; border: none;")
+
+        sep = QFrame()
+        sep.setFrameShape(QFrame.HLine)
+        sep.setStyleSheet(
+            "color: #2D2E3A; background-color: #2D2E3A; border: none; max-height: 1px;"
+        )
+
+        current_ver = get_local_version() or __version__
+        mode_str = "Portable" if IS_PORTABLE else "安装版"
+        info_label = QLabel(
+            f"当前版本:  v{current_ver}\n"
+            f"运行模式:  {mode_str}\n"
+            f"GitHub:    github.com/ivanhih/dd-rec"
+        )
+        info_label.setStyleSheet(
+            "color: #94A3B8; background: transparent; border: none; "
+            "font-size: 14px; line-height: 1.8;"
+        )
+        info_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        info_label.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+
+        card_layout.addWidget(app_name)
+        card_layout.addWidget(sep)
+        card_layout.addWidget(info_label)
+        layout.addWidget(info_card)
+
+        # ==================== Mirror 酱设置卡片 ====================
+        mirror_card = QFrame()
+        mirror_card.setObjectName("mirrorChyanCard")
+        mirror_card.setStyleSheet("""
+            QFrame#mirrorChyanCard {
+                background-color: #181920;
+                border: 1px solid #2D2E3A;
+                border-radius: 12px;
+            }
+        """)
+        mirror_layout = QVBoxLayout(mirror_card)
+        mirror_layout.setContentsMargins(28, 24, 28, 24)
+        mirror_layout.setSpacing(12)
+
+        mirror_title = QLabel("Mirror 酱设置")
+        mirror_title.setFont(QFont("Microsoft YaHei UI", 16, QFont.Bold))
+        mirror_title.setStyleSheet("color: #F8FAFC; background: transparent; border: none;")
+
+        mirror_desc = QLabel(
+            "Mirror 酱是国内 CDN 加速服务。当 GitHub 不可达时,\n"
+            "DD录播机 可通过 Mirror 酱 API 获取最新版本号（开发者不参与付费流程）。\n"
+            "用户自行购买 CDK 后,在下方填入即可启用。"
+        )
+        mirror_desc.setStyleSheet(
+            "color: #94A3B8; font-size: 13px; background: transparent; border: none; "
+            "line-height: 1.6;"
+        )
+
+        mirror_enable = QCheckBox("启用 Mirror 酱（GitHub 不可达时作为 fallback）")
+        mirror_enable.setChecked(bool(get_global_setting("mirror_chyan_enabled")))
+        mirror_enable.setStyleSheet("""
+            QCheckBox {
+                color: #E2E8F0;
+                background: transparent;
+                spacing: 8px;
+                padding: 4px 0;
+            }
+            QCheckBox::indicator {
+                width: 16px;
+                height: 16px;
+            }
+        """)
+
+        cdk_input = QLineEdit()
+        cdk_input.setEchoMode(QLineEdit.EchoMode.Password)
+        cdk_input.setText(str(get_global_setting("mirror_chyan_cdk") or ""))
+        cdk_input.setPlaceholderText("留空表示仅用 GitHub 检查（Mirror 酱 API 仍可查版本，无 CDK 时不返回 url）")
+
+        cdk_warning = QLabel("⚠️ CDK 以明文存储于本地 config.json,请勿在公用电脑使用")
+        cdk_warning.setStyleSheet(
+            "color: #F59E0B; font-size: 12px; background: transparent; border: none;"
+        )
+
+        get_cdk_btn = QPushButton("获取 CDK →")
+        get_cdk_btn.setCursor(Qt.PointingHandCursor)
+        get_cdk_btn.setFixedHeight(34)
+        get_cdk_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #252631;
+                color: #CBD5E1;
+                border: 1px solid #2D2E3A;
+                border-radius: 6px;
+                font-size: 12px;
+                font-weight: 500;
+                padding: 0 14px;
+            }
+            QPushButton:hover {
+                background-color: #2D2E3A;
+                color: #F8FAFC;
+                border: 1px solid #475569;
+            }
+        """)
+        get_cdk_btn.clicked.connect(
+            lambda: QDesktopServices.openUrl(QUrl("https://mirrorchyan.com"))
+        )
+
+        cdk_row = QHBoxLayout()
+        cdk_row.setSpacing(10)
+        cdk_label = QLabel("CDK:")
+        cdk_label.setStyleSheet("color: #94A3B8; font-size: 13px; background: transparent; border: none;")
+        cdk_label.setFixedWidth(40)
+        cdk_row.addWidget(cdk_label)
+        cdk_row.addWidget(cdk_input, 1)
+        cdk_row.addWidget(get_cdk_btn)
+
+        mirror_status = QLabel("")
+        mirror_status.setStyleSheet(
+            "color: #64748B; font-size: 12px; background: transparent; border: none;"
+        )
+
+        def _refresh_mirror_status():
+            cdk_text = cdk_input.text().strip()
+            if not mirror_enable.isChecked():
+                mirror_status.setText("● 未启用")
+                mirror_status.setStyleSheet(
+                    "color: #64748B; font-size: 12px; background: transparent; border: none;"
+                )
+            elif not cdk_text:
+                mirror_status.setText("● 已启用,但未填 CDK（仍可查版本,下载走 GitHub）")
+                mirror_status.setStyleSheet(
+                    "color: #F59E0B; font-size: 12px; background: transparent; border: none;"
+                )
+            else:
+                if len(cdk_text) <= 6:
+                    masked = "***"
+                else:
+                    masked = cdk_text[:3] + "***" + cdk_text[-3:]
+                mirror_status.setText(f"● 已启用,CDK: {masked}")
+                mirror_status.setStyleSheet(
+                    "color: #4ADE80; font-size: 12px; background: transparent; border: none;"
+                )
+
+        mirror_enable.toggled.connect(_refresh_mirror_status)
+        cdk_input.textChanged.connect(_refresh_mirror_status)
+        _refresh_mirror_status()
+
+        mirror_save_btn = QPushButton("保存")
+        mirror_save_btn.setCursor(Qt.PointingHandCursor)
+        mirror_save_btn.setFixedHeight(34)
+        mirror_save_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #3B82F6;
+                color: white;
+                border: none;
+                border-radius: 6px;
+                font-size: 13px;
+                font-weight: 600;
+                padding: 0 18px;
+            }
+            QPushButton:hover { background-color: #2563EB; }
+        """)
+
+        def _save_mirror():
+            try:
+                set_global_setting("mirror_chyan_enabled", mirror_enable.isChecked())
+                set_global_setting("mirror_chyan_cdk", cdk_input.text().strip())
+                self.show_notification(
+                    "Mirror 酱设置已保存", "提示", "success", merge_key="mirror:saved"
+                )
+            except Exception as e:
+                logger.error(f"保存 Mirror 酱设置失败: {e}")
+                self.show_notification(
+                    f"保存失败: {e}", "提示", "error", merge_key="mirror:save-failed"
+                )
+
+        mirror_save_btn.clicked.connect(_save_mirror)
+
+        save_row = QHBoxLayout()
+        save_row.addStretch()
+        save_row.addWidget(mirror_save_btn)
+
+        mirror_layout.addWidget(mirror_title)
+        mirror_layout.addWidget(mirror_desc)
+        mirror_layout.addSpacing(4)
+        mirror_layout.addWidget(mirror_enable)
+        mirror_layout.addLayout(cdk_row)
+        mirror_layout.addWidget(cdk_warning)
+        mirror_layout.addWidget(mirror_status)
+        mirror_layout.addLayout(save_row)
+
+        layout.addWidget(mirror_card)
+
+        # ==================== 操作按钮区 ====================
+        btn_layout = QHBoxLayout()
+        btn_layout.setSpacing(12)
+
+        github_btn = QPushButton("🌐 打开 GitHub")
+        github_btn.setFixedHeight(40)
+        github_btn.setCursor(Qt.PointingHandCursor)
+        github_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #252631;
+                color: #CBD5E1;
+                border: 1px solid #2D2E3A;
+                border-radius: 8px;
+                font-size: 13px;
+                font-weight: 500;
+                padding: 0 18px;
+            }
+            QPushButton:hover {
+                background-color: #2D2E3A;
+                color: #F8FAFC;
+                border: 1px solid #475569;
+            }
+        """)
+
+        check_btn = QPushButton("🔄 检查更新")
+        check_btn.setFixedHeight(40)
+        check_btn.setCursor(Qt.PointingHandCursor)
+        check_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #3B82F6;
+                color: white;
+                border: none;
+                border-radius: 8px;
+                font-size: 13px;
+                font-weight: 600;
+                padding: 0 18px;
+            }
+            QPushButton:hover {
+                background-color: #2563EB;
+            }
+            QPushButton:disabled {
+                background-color: #1F2937;
+                color: #64748B;
+            }
+        """)
+
+        btn_layout.addWidget(github_btn)
+        btn_layout.addWidget(check_btn)
+        btn_layout.addStretch()
+        layout.addLayout(btn_layout)
+
+        layout.addStretch()
+
+        # ==================== 信号 ====================
+        def open_github():
+            QDesktopServices.openUrl(QUrl("https://github.com/ivanhih/dd-rec"))
+
+        def check_for_update():
+            # 用 Signal 跨线程回主线程（比 QTimer.singleShot(0, lambda) 稳得多）
+            # Signal.emit 跨线程时自动用 QueuedConnection 派发到主线程的 event loop
+
+            def _on_done(info, err_msg):
+                if info is not None:
+                    # 有更新：调现有更新 dialog
+                    show_update_dialog(info, self)
+                else:
+                    # 已是最新 / 检查失败
+                    if err_msg:
+                        self.show_notification(
+                            f"检查更新失败: {err_msg[:80]}",
+                            "提示", "error", merge_key="about:check-failed"
+                        )
+                    else:
+                        self.show_notification(
+                            f"当前已是最新版本 (v{current_ver})",
+                            "提示", "success", merge_key="about:up-to-date"
+                        )
+                # 关键: 无论哪种结果都恢复按钮
+                check_btn.setEnabled(True)
+                check_btn.setText("🔄 检查更新")
+
+            class _Sigs(QObject):
+                done = Signal(object, str)  # (info, err_msg)
+
+            sigs = _Sigs()
+            sigs.done.connect(_on_done)
+
+            def _do_check():
+                try:
+                    info = _check_update()
+                    err_msg = ""
+                except Exception as e:
+                    logging.error(f"检查更新异常: {e}", exc_info=True)
+                    info = None
+                    err_msg = str(e)
+                sigs.done.emit(info, err_msg)
+
+            check_btn.setEnabled(False)
+            check_btn.setText("检查中...")
+            # 用 threading.Thread（Signal 自动切回主线程，比 QThread.create 稳）
+            import threading
+            threading.Thread(target=_do_check, daemon=True).start()
+
+        github_btn.clicked.connect(open_github)
+        check_btn.clicked.connect(check_for_update)
+
+        return page
+
     def start_refresh_timer(self):
         self.timer = QTimer()
         self.timer.timeout.connect(self.refresh_all)
@@ -1346,6 +1744,11 @@ class MainWindow(QMainWindow):
         只有通过托盘右键"退出"才会真正退出进程。
         """
         if self._is_shutting_down:
+            # 真正退出：停止防止休眠线程 + 恢复电源策略
+            try:
+                self._power_keepalive.stop()
+            except Exception:
+                pass
             event.accept()
             return
         # 阻止窗口关闭，隐藏到托盘
@@ -1355,14 +1758,28 @@ class MainWindow(QMainWindow):
 
 if __name__ == "__main__":
     import logging
-    logging.info(f"DD录播机 v{get_current_version()} 启动中...")
+    logging.info(f"DD录播机 v{__version__} 启动中...")
 
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
 
-    # 检查更新
-    check_for_updates(app.activeWindow())
-
     window = MainWindow()
     window.show()
+
+    # 窗口显示后异步检查更新（500ms 延迟避免阻塞首帧渲染）
+    def check_update_async():
+        try:
+            logging.info("[auto-update] 开始检查更新...")
+            info = _check_update()
+            if info:
+                logging.info(f"[auto-update] 发现新版本 v{info.version}，弹出更新 dialog")
+                show_update_dialog(info, window)
+            else:
+                logging.info("[auto-update] 已是最新版本或检查失败")
+        except Exception as e:
+            # 任何异常都不能阻断应用启动
+            logging.error(f"[auto-update] 检查更新异常: {e}", exc_info=True)
+
+    QTimer.singleShot(500, check_update_async)
+
     sys.exit(app.exec())
