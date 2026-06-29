@@ -1,0 +1,37 @@
+{
+  "source": [
+    {
+      "id": "github",
+      "name": "GitHub",
+      "uri": "https://github.com/ivanhih/dd-rec/releases/download/v${version}/dd_rec.Install.v${version}.exe"
+    },
+    {
+      "id": "r2",
+      "name": "Cloudflare R2（国内加速）",
+      "uri": "https://pub-402ecb62c36c4b0ba05c007d3fe1dca2.r2.dev/dd-rec-releases/dd_rec.Install.v${version}.exe"
+    }
+  ],
+  "appName": "dd_rec",
+  "publisher": "ivanhih",
+  "regName": "dd_rec",
+  "exeName": "dd_rec_main.exe",
+  "uninstallName": "dd_rec.uninst.exe",
+  "updaterName": "dd_rec.update.exe",
+  "programFilesPath": "dd_rec",
+  "title": "DD录播机",
+  "description": "B 站直播自动录播工具",
+  "windowTitle": "DD录播机 安装程序",
+  "userDataPath": [
+    "${INSTALL_PATH}/userdata/config.json",
+    "${INSTALL_PATH}/userdata/data.json",
+    "${INSTALL_PATH}/userdata/dd_rec.db"
+  ],
+  "ignoreFolderPath": [
+    "${INSTALL_PATH}/userdata",
+    "${INSTALL_PATH}/录播文件"
+  ],
+  "uacStrategy": "prefer-admin",
+  "runtimes": [
+    "Microsoft.VCRedist.2015+.x64"
+  ]
+}

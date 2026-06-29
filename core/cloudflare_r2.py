@@ -38,12 +38,13 @@ def is_enabled() -> bool:
 
 
 def build_source_uri(version: str) -> Optional[str]:
-    """生成 kachina source.uri 模板字符串
+    """生成 kachina source.uri 模板字符串(供 R2 通道用)
 
     返回示例:
-      https://pub-xxx.r2.dev/dd-rec-releases/dd_rec.Install.${version}.exe#versionRegex=v...
+      https://pub-xxx.r2.dev/dd-rec-releases/dd_rec.Install.${version}.exe
 
-    kachina 会把 ${version} 替换成实际版本号,然后用 versionRegex 从 URL 解析出版本号校验。
+    kachina 不会替换 ${version} 占位符之外的任何东西 —— URL 模板要保持纯净,
+    不能加 #versionRegex= 之类的后缀(那是 mirror 酱的伪语法,kachina 不支持)。
 
     Args:
         version: 当前可用的远端版本号(用于占位检查,实际 kachina 自己替换)
@@ -54,10 +55,7 @@ def build_source_uri(version: str) -> Optional[str]:
     if not is_enabled():
         return None
     base = R2_PUBLIC_BASE.rstrip("/")
-    # versionRegex 跟 GitHub 源一致(URL 编码: + → %2B, . → .)
-    # kachina 用这个正则从 URL 末尾抓出版本号,做版本比较
-    regex = "v([0-9]%2B\\.[0-9]%2B\\.[0-9]%2B)"
-    return f"{base}/dd_rec.Install.${{version}}.exe#versionRegex={regex}"
+    return f"{base}/dd_rec.Install.${{version}}.exe"
 
 
 if __name__ == "__main__":

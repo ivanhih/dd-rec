@@ -48,17 +48,24 @@ installer/*.exe
 installer/Setup.exe
 
 # NSIS 安装器构建产物（PyInstaller onedir 已经在 dist/ 里）
-DD录播机.exe
-DDRecUpdater.exe
+dd_rec_setup.exe
+dd_rec_updater.exe
 
 # 旧版 zip 包
-DD录播机_*.zip
-DD录播机_v*.zip
+dd_rec_*.zip
 
 # PyInstaller bootloader 残留
 *.spec.bak
 
-# ==================== 调研/调试残留 ====================
+# ==================== kachina-installer ====================
+# kachina-builder 本体(不要 commit,从 GitHub release 下载)
+kachina-builder.exe
+# 一次性 build 产物(正式产物走 dist/)
+Kachina.update.exe
+dd_rec.update.exe
+# kachina_help/kachina_help_err(本机调试留的)
+kachina_help.txt
+kachina_help_err.txt
 # Velopack 调研时留下的临时文件（本次不再需要）
 _extract_vp.py
 _extract_vp.ps1

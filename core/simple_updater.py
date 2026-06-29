@@ -18,8 +18,7 @@ from typing import Optional
 
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout,
-    QLabel, QPushButton, QGroupBox,
-    QRadioButton, QButtonGroup,
+    QLabel, QPushButton,
     QInputDialog, QLineEdit,
     QScrollArea, QWidget, QFrame,
     QTextBrowser,
@@ -342,7 +341,7 @@ def show_update_dialog(info: UpdateInfo, parent=None) -> bool:
     note_layout.addWidget(note_browser)
     content_layout.addWidget(note_card)
 
-    # ----- 通道选择卡片 -----
+    # ----- 下载通道说明卡片(kachina 自己处理选择,主程序只显示提示) -----
     channel_card = QFrame()
     channel_card.setStyleSheet("""
         QFrame {
@@ -353,14 +352,14 @@ def show_update_dialog(info: UpdateInfo, parent=None) -> bool:
     """)
     ch_layout = QVBoxLayout(channel_card)
     ch_layout.setContentsMargins(22, 18, 22, 18)
-    ch_layout.setSpacing(12)
+    ch_layout.setSpacing(10)
 
-    ch_title = QLabel("🚀  选择下载通道")
+    ch_title = QLabel("🚀  下载通道")
     ch_title.setFont(QFont("Microsoft YaHei UI", 14, QFont.Bold))
     ch_title.setStyleSheet("color: #F8FAFC; background: transparent; border: none;")
     ch_layout.addWidget(ch_title)
 
-    # Mirror 酱描述根据是否已启用 + 填了 CDK 动态变化
+    # 列出当前可用的下载源(kachina 启动后会让用户在它自己 UI 里选)
     try:
         from core.config import get_global_setting
         mirror_enabled = bool(get_global_setting("mirror_chyan_enabled"))
@@ -369,77 +368,27 @@ def show_update_dialog(info: UpdateInfo, parent=None) -> bool:
         mirror_enabled = False
         mirror_has_cdk = False
 
-    if mirror_enabled and mirror_has_cdk:
-        mirror_desc = "【国内加速】Mirror 酱 CDN,需自行购买 CDK,开发者不参与付费"
-    elif mirror_enabled:
-        mirror_desc = "【国内加速】Mirror 酱已启用但未填 CDK,选此项将弹出输入框"
-    else:
-        mirror_desc = "【国内加速】Mirror 酱 CDN,需先在关于页面启用并填 CDK"
-
-    github_row = _make_channel_row(
-        "🐙",
-        "GitHub",
-        "【官方】直连 GitHub release,海外/有代理用户推荐",
-    )
-    mirror_row = _make_channel_row(
-        "🪞",
-        "Mirror 酱",
-        mirror_desc,
-    )
-
-    # R2 通道(第三个选项)
     try:
         from core.cloudflare_r2 import is_enabled as r2_enabled
     except Exception:
         r2_enabled = False
 
+    available_sources = [
+        "🐙  GitHub — 官方源,直连 release",
+    ]
+    if mirror_enabled and mirror_has_cdk:
+        available_sources.append("🪞  Mirror 酱 — 国内加速(需 CDK)")
     if r2_enabled:
-        r2_row = _make_channel_row(
-            "☁️",
-            "Cloudflare R2",
-            "【国内 fallback】Cloudflare R2 全球 CDN,免费 10GB 存储 + 0 出流量",
-        )
-        r2_row_id = 2
-    else:
-        r2_row = None
-        r2_row_id = -1
+        available_sources.append("☁️  Cloudflare R2 — 国内加速(免费)")
 
-    # 用 QButtonGroup 实现互斥
-    bg = QButtonGroup(page)
-    bg.addButton(github_row["btn"], 0)
-    bg.addButton(mirror_row["btn"], 1)
-    if r2_row is not None:
-        bg.addButton(r2_row["btn"], r2_row_id)
-
-    # 默认勾 GitHub(从 config 读上次选择)
-    try:
-        from core.config import get_global_setting
-        last_choice = get_global_setting("update_channel") or "github"
-    except Exception:
-        last_choice = "github"
-    if last_choice == "cloudflare_r2" and r2_row is not None:
-        r2_row["btn"].setChecked(True)
-    elif last_choice == "mirror_chyan" and mirror_enabled and mirror_has_cdk:
-        mirror_row["btn"].setChecked(True)
-    else:
-        github_row["btn"].setChecked(True)
-
-    ch_layout.addWidget(github_row["frame"])
-    ch_layout.addWidget(mirror_row["frame"])
-    if r2_row is not None:
-        ch_layout.addWidget(r2_row["frame"])
-    else:
-        # R2 未配置,显示一个灰掉的提示行(让用户知道有这个选项)
-        r2_disabled = QLabel("☁️  Cloudflare R2 — 未配置(开发者未填 R2_PUBLIC_BASE)")
-        r2_disabled.setStyleSheet(
-            "color: #64748B; font-size: 12px; background: transparent; border: none; padding: 10px 16px;"
-        )
-        r2_disabled.setWordWrap(True)
-        ch_layout.addWidget(r2_disabled)
+    for src in available_sources:
+        lbl = QLabel(src)
+        lbl.setStyleSheet("color: #CBD5E1; font-size: 13px; background: transparent; border: none;")
+        ch_layout.addWidget(lbl)
 
     channel_hint = QLabel(
-        "💡  本次下载走所选通道的 kachina source URI。Mirror 酱需要 CDK,R2 是免费 fallback。\n"
-        "    GitHub 是默认主通道。"
+        "💡  点击「立即更新」后,kachina 安装器会启动,\n"
+        "    你可以在它自己的窗口里选择下载通道。"
     )
     channel_hint.setStyleSheet(
         "color: #64748B; font-size: 11px; background: transparent; border: none; line-height: 1.5;"
@@ -508,55 +457,16 @@ def show_update_dialog(info: UpdateInfo, parent=None) -> bool:
 
     # ============= 立即更新逻辑 =============
     def _do_update():
-        # 决定哪个通道被选中 → 映射成 channel id
-        if r2_row is not None and r2_row["btn"].isChecked():
-            channel = "cloudflare_r2"
-        elif mirror_row["btn"].isChecked():
-            channel = "mirror_chyan"
-        else:
-            channel = "github"
-
-        # 1) 记用户选择
+        # kachina 自己处理多 source 选择 —— 主程序不参与,直接 spawn update.exe
+        # 记住用户最后选了哪个(用于将来 mirror 酱 / R2 选 CDK 时的默认行为等)
         try:
             from core.config import set_global_setting
-            set_global_setting("update_channel", channel)
+            # 没有 UI 选项,记个默认值
+            set_global_setting("update_channel", "github")
         except Exception as e:
             logger.warning(f"保存 update_channel 失败: {e}")
 
-        # 2a) 选了 Mirror 酱但没 CDK → 弹输入框
-        if channel == "mirror_chyan":
-            try:
-                from core.config import get_global_setting
-                cdk = (get_global_setting("mirror_chyan_cdk") or "").strip()
-            except Exception:
-                cdk = ""
-            if not cdk:
-                new_cdk = _prompt_for_cdk(page)
-                if not new_cdk:
-                    # 用户取消输入 → 提示切回 GitHub
-                    cancel_btn.setText("请切换到 GitHub/R2 后再试")
-                    return
-                try:
-                    from core.config import set_global_setting
-                    set_global_setting("mirror_chyan_cdk", new_cdk)
-                    set_global_setting("mirror_chyan_enabled", True)
-                except Exception as e:
-                    logger.warning(f"保存 mirror_chyan_cdk 失败: {e}")
-
-        # 2b) 选了 R2 → 改 kachina.config.json 的 source[0].uri
-        if channel == "cloudflare_r2":
-            try:
-                from core.portable_updater import apply_kachina_source_for_channel
-                ok = apply_kachina_source_for_channel(channel, info.version)
-                if not ok:
-                    # R2 未配置或异常 → 提示用户但仍继续(走 kachina 默认源,即 GitHub)
-                    cancel_btn.setText("R2 未配置,本次仍走 GitHub")
-                    logger.warning("R2 未配置,kachina 仍走默认 source[0](GitHub)")
-            except Exception as e:
-                logger.error(f"切换到 R2 通道失败: {e}")
-                cancel_btn.setText(f"R2 切换失败:{str(e)[:40]},改走 GitHub")
-
-        # 3) spawn kachina update.exe + 主程序退出
+        # 启动 kachina update.exe
         update_btn.setEnabled(False)
         cancel_btn.setEnabled(False)
         update_btn.setText("正在启动安装器...")

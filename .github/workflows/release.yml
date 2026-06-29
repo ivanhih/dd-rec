@@ -76,20 +76,23 @@ jobs:
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           AWS_DEFAULT_REGION: auto
         run: |
-          $VERSION = "${{ steps.version.outputs.version }}"
-          $TAG = "v$VERSION"
-          $INSTALL_EXE = "dist/DD录播机.Install.${VERSION}.exe"
+          # 关键: kachina source URI 模板用的是 ${version}(带 v 的 vX.Y.Z),
+          # 所以 R2 上的文件名必须也是 dd_rec.Install.vX.Y.Z.exe
+          # 之前没注意这个细节,导致 kachina 找不到文件
+          $VERSION_TAG = "${{ steps.version.outputs.version }}"   # X.Y.Z 不带 v
+          $VERSION_REF = "${{ github.ref_name }}"                 # vX.Y.Z 带 v(GitHub tag 格式)
 
-          if (-not (Test-Path $INSTALL_EXE)) {
-            Write-Error "找不到 install exe: $INSTALL_EXE"
+          if (-not (Test-Path "dist/DD录播机.Install.${VERSION_TAG}.exe")) {
+            Write-Error "找不到 install exe: dist/DD录播机.Install.${VERSION_TAG}.exe"
             exit 1
           }
 
           $ENDPOINT = "https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com"
           $BUCKET = "dd-rec-releases"
+          $KEY = "dd_rec.Install.${VERSION_REF}.exe"   # 带 v 的文件名
 
-          Write-Host "上传到 R2: s3://${BUCKET}/dd_rec.Install.${VERSION}.exe"
-          aws s3 cp "$INSTALL_EXE" "s3://${BUCKET}/dd_rec.Install.${VERSION}.exe" `
+          Write-Host "上传到 R2: s3://${BUCKET}/${KEY}"
+          aws s3 cp "dist/DD录播机.Install.${VERSION_TAG}.exe" "s3://${BUCKET}/${KEY}" `
             --endpoint-url $ENDPOINT `
             --acl public-read
 
@@ -98,7 +101,16 @@ jobs:
             exit 1
           }
 
-          Write-Host "✓ R2 上传成功"
+          # 验证(避免上传完后用户访问 404)
+          Write-Host "验证可访问性..."
+          $PUBLIC_URL = "https://pub-402ecb62c36c4b0ba05c007d3fe1dca2.r2.dev/${BUCKET}/${KEY}"
+          try {
+            $resp = Invoke-WebRequest -Uri $PUBLIC_URL -Method Head -UseBasicParsing -ErrorAction Stop
+            Write-Host "✓ 公开可访问: $PUBLIC_URL (HTTP $($resp.StatusCode))"
+          } catch {
+            Write-Warning "公开 URL 验证失败: $PUBLIC_URL ($($_.Exception.Message))"
+            Write-Warning "可能是: R2 bucket 公开访问没启用 / 公开 URL 不对"
+          }
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2

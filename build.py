@@ -455,7 +455,8 @@ def build_kachina_update() -> str:
     if os.path.exists(APP_ICON):
         cmd += ["--icon", APP_ICON]
     print(f"  $ " + " ".join(cmd))
-    _run_kachina(cmd, wait_for=update_exe)
+    # kachina 第一次跑会解压运行时 + 处理图标,慢则 60-180 秒,给 5 分钟
+    _run_kachina(cmd, wait_for=update_exe, timeout=300)
     print(f"   创建: dd_rec.update.exe")
     return update_exe
 
@@ -497,7 +498,7 @@ def build_kachina_installer(metadata: str, hashed: str) -> str:
     """生成完整的 Install.exe — 给想要安装器的用户"""
     kachina = find_kachina_builder()
     print(f"\n[7/9] 生成 kachina Install.exe...")
-    install_exe = os.path.join(DIST_DIR, f"DD录播机.Install.{VERSION}.exe")
+    install_exe = os.path.join(DIST_DIR, f"dd_rec.Install.{VERSION}.exe")
     if os.path.exists(install_exe):
         os.remove(install_exe)
     cmd = [
@@ -650,7 +651,7 @@ def archive_current_patches(metadata: str, hashed: str) -> None:
         readme = os.path.join(target_dir, "README.txt")
         with open(readme, "w", encoding="utf-8") as f:
             f.write(
-                f"DD录播机 v{VERSION} 的 kachina 更新元数据\n"
+                f"dd_rec v{VERSION} 的 kachina 更新元数据\n"
                 f"由 build.py 自动生成\n"
                 f"提交到 git,下个版本 build 时会用来生成增量 patch\n"
             )
@@ -683,7 +684,7 @@ def build_hdiff_patch_auto(new_metadata: str) -> Optional[str]:
         return None
 
     print(f"\n[8/9] 生成 HDiffPatch ({prev_version} → {VERSION})...")
-    patch = os.path.join(DIST_DIR, f"DD录播机-{VERSION}-patch-from-{prev_version}.zip")
+    patch = os.path.join(DIST_DIR, f"dd_rec-{VERSION}-patch-from-{prev_version}.zip")
     cmd = [
         kachina, "diff",
         "-c", KACHINA_CONFIG,
