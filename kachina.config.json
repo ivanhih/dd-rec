@@ -8,7 +8,7 @@
     {
       "id": "r2",
       "name": "Cloudflare R2（国内加速）",
-      "uri": "https://pub-402ecb62c36c4b0ba05c007d3fe1dca2.r2.dev/dd-rec-releases/dd_rec.Install.v${version}.exe"
+      "uri": "https://pub-402ecb62c36c4b0ba05c007d3fe1dca2.r2.dev/dd_rec.Install.v${version}.exe"
     }
   ],
   "appName": "dd_rec",

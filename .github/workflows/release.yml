@@ -88,7 +88,7 @@ jobs:
           }
 
           $ENDPOINT = "https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com"
-          $BUCKET = "dd-rec-releases"
+          $BUCKET = "dd-rec-release"
           $KEY = "dd_rec.Install.${VERSION_REF}.exe"   # 带 v 的文件名
 
           Write-Host "上传到 R2: s3://${BUCKET}/${KEY}"
@@ -103,7 +103,7 @@ jobs:
 
           # 验证(避免上传完后用户访问 404)
           Write-Host "验证可访问性..."
-          $PUBLIC_URL = "https://pub-402ecb62c36c4b0ba05c007d3fe1dca2.r2.dev/${BUCKET}/${KEY}"
+          $PUBLIC_URL = "https://pub-402ecb62c36c4b0ba05c007d3fe1dca2.r2.dev/${KEY}"
           try {
             $resp = Invoke-WebRequest -Uri $PUBLIC_URL -Method Head -UseBasicParsing -ErrorAction Stop
             Write-Host "✓ 公开可访问: $PUBLIC_URL (HTTP $($resp.StatusCode))"

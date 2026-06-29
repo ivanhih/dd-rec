@@ -25,9 +25,10 @@ logger = logging.getLogger(__name__)
 
 # ==================== 你需要填的 ====================
 # R2 桶公开访问的 base URL
-# 例: https://pub-abc123def456.r2.dev/dd-rec-releases
+# 重要:R2 的公开 URL 不需要带桶名,直接是 pub-xxx.r2.dev/文件名
+# 例: https://pub-abc123def456.r2.dev  ← 注意末尾不要带 /桶名
 # 这个 URL 是公开的(给所有用户下载用),可以提交到 git,会编译进 exe
-R2_PUBLIC_BASE = "https://pub-402ecb62c36c4b0ba05c007d3fe1dca2.r2.dev/dd-rec-releases"
+R2_PUBLIC_BASE = "https://pub-402ecb62c36c4b0ba05c007d3fe1dca2.r2.dev"
 
 
 def is_enabled() -> bool:
