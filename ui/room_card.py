@@ -235,31 +235,39 @@ class AnimatedLabel(QLabel):
     def __init__(self, text="", parent=None):
         super().__init__(text, parent)
         self.setStyleSheet("border: none; background: transparent;")
-        
+
         # 使用 QGraphicsOpacityEffect 来控制透明度！更快更可靠！
         self._effect = QGraphicsOpacityEffect()
         self._effect.setOpacity(0.0)  # 初始完全透明
         self.setGraphicsEffect(self._effect)
-        
+
         # 创建动画对象
         self._anim = QPropertyAnimation(self._effect, b"opacity")
         self._anim.setDuration(200)  # 200ms 快速动画
         self._anim.setEasingCurve(QEasingCurve.InOutQuad)
-    
+        # 动画结束后，若透明度归零则真正隐藏（释放 layout 空间）
+        self._anim.finished.connect(self._on_fade_finished)
+
     def fade_in(self):
+        self.setVisible(True)  # 先占位，再动画
         self._anim.stop()
         self._anim.setStartValue(self._effect.opacity())
         self._anim.setEndValue(1.0)
         self._anim.start()
-    
+
     def fade_out(self):
         self._anim.stop()
         self._anim.setStartValue(self._effect.opacity())
         self._anim.setEndValue(0.0)
         self._anim.start()
-    
+
+    def _on_fade_finished(self):
+        if self._effect.opacity() <= 0.01:
+            self.setVisible(False)
+
     def ensure_visible(self):
         """确保标签可见，直接设置透明度为1.0"""
+        self.setVisible(True)
         self._anim.stop()
         self._effect.setOpacity(1.0)
 
@@ -279,6 +287,7 @@ class RoomCard(QFrame):
         self.room_info = room_info
         self.current_save_path = None
         self._is_recording = False
+        self._stats_visible = False  # 录制统计标签是否当前显示中（避免重复 fade）
         # 保存监控开关状态
         self._is_monitoring = room_info.get("enabled", True)
         
@@ -593,10 +602,16 @@ class RoomCard(QFrame):
             self.lbl_r.setText("⏳ 闲置中")
             self.lbl_r.setStyleSheet("color: #64748B; font-size: 13px; font-weight: 500; border: none; background: transparent;")
             self.lbl_title.setText(title)
-            self.lbl_duration.fade_out()
-            self.lbl_speed.fade_out()
-            self.lbl_size.fade_out()
-            self._is_recording = False
+            # 监控关闭时清零并隐藏录制统计信息
+            if self._stats_visible:
+                self._stats_visible = False
+                self._is_recording = False
+                self.lbl_duration.setText("⏱ 00:00:00")
+                self.lbl_speed.setText("⚡ 0 B/s")
+                self.lbl_size.setText("💾 0 B")
+                self.lbl_duration.fade_out()
+                self.lbl_speed.fade_out()
+                self.lbl_size.fade_out()
             self._refresh_cut_button_state()
             return
 
@@ -637,9 +652,10 @@ class RoomCard(QFrame):
             self.lbl_duration.setText(f"⏱ {duration}")
             self.lbl_speed.setText(f"⚡ {speed}")
             self.lbl_size.setText(f"💾 {size}")
-            
-            if not self._is_recording:
+
+            if not self._stats_visible:
                 # 从非录制状态变为录制状态，执行淡入动画
+                self._stats_visible = True
                 self._is_recording = True
                 self.lbl_duration.fade_in()
                 self.lbl_speed.fade_in()
@@ -649,20 +665,30 @@ class RoomCard(QFrame):
                 self.lbl_duration.ensure_visible()
                 self.lbl_speed.ensure_visible()
                 self.lbl_size.ensure_visible()
-        elif not should_show_stats:
-            # 不管当前 _is_recording 是什么状态，只要不应该显示，就淡出
-            self._is_recording = False
-            self.lbl_duration.fade_out()
-            self.lbl_speed.fade_out()
-            self.lbl_size.fade_out()
+        else:
+            # 下播/闲置：只在从显示变为隐藏时淡出一次，避免重复 fade
+            if self._stats_visible:
+                self._stats_visible = False
+                self._is_recording = False
+                # 隐藏前将文字清零，防止残留旧的录制数值
+                self.lbl_duration.setText("⏱ 00:00:00")
+                self.lbl_speed.setText("⚡ 0 B/s")
+                self.lbl_size.setText("💾 0 B")
+                self.lbl_duration.fade_out()
+                self.lbl_speed.fade_out()
+                self.lbl_size.fade_out()
         self._refresh_cut_button_state()
 
     def on_toggle(self, checked):
         self._is_monitoring = checked
         self.room_info["enabled"] = checked   # 关键：同步 room_info，否则 _start_recorder 拿到 stale False
         # 关闭监控时，不管什么状态，都立即隐藏统计信息！
-        if not checked:
+        if not checked and self._stats_visible:
+            self._stats_visible = False
             self._is_recording = False
+            self.lbl_duration.setText("⏱ 00:00:00")
+            self.lbl_speed.setText("⚡ 0 B/s")
+            self.lbl_size.setText("💾 0 B")
             self.lbl_duration.fade_out()
             self.lbl_speed.fade_out()
             self.lbl_size.fade_out()

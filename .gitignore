@@ -47,6 +47,9 @@ installer/
 installer/*.exe
 installer/Setup.exe
 
+# 手动上传脚本(含 R2 Token,不要 commit)
+manual_upload_r2.py
+
 # NSIS 安装器构建产物（PyInstaller onedir 已经在 dist/ 里）
 dd_rec_setup.exe
 dd_rec_updater.exe

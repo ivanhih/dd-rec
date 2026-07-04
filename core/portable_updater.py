@@ -270,7 +270,12 @@ def _check_update_github_only(local: str, max_retries: int) -> Optional[UpdateIn
 
 
 # ==================== 启动 kachina update.exe ====================
-def launch_kachina_update(app_dir: str) -> None:
+# kachina.config.json 的 source[] 里实际配置的 id 白名单,用于过滤用户传入的 source_id。
+# 任何不在此集合内的值一律拒绝,避免把字符串塞进 ShellExecuteExW 时被 Windows 解析成别的。
+_VALID_KACHINA_SOURCE_IDS = ("github", "cnb")
+
+
+def launch_kachina_update(app_dir: str, source_id: Optional[str] = None) -> None:
     """主程序退出,让 kachina update.exe 接管剩余更新流程。
 
     kachina update.exe (DDRec.update.exe) 是带 UI 的独立 exe,会:
@@ -285,10 +290,23 @@ def launch_kachina_update(app_dir: str) -> None:
 
     Args:
         app_dir: portable 根目录(即 dd-rec/ 那个目录)
+        source_id: kachina source 的 id(github / cnb)。None 表示让 kachina
+            在自己 UI 里让用户选;否则会以 `--source <id>` 形式传过去,kachina
+            跳过选择直接用对应通道下载(参照 BetterGI 的写法)。
 
     Raises:
         FileNotFoundError: 找不到 update.exe
+        ValueError: source_id 给了一个非白名单的值
     """
+    # ---- 校验 source_id(白名单,防止拼参数注入)----
+    if source_id is not None:
+        source_id = str(source_id).strip()
+        if source_id not in _VALID_KACHINA_SOURCE_IDS:
+            raise ValueError(
+                f"非法的 update source_id: {source_id!r} "
+                f"(仅允许 {list(_VALID_KACHINA_SOURCE_IDS)})"
+            )
+
     update_exe = os.path.join(app_dir, KACHINA_UPDATE_EXE)
     if not os.path.exists(update_exe):
         raise FileNotFoundError(
@@ -297,7 +315,15 @@ def launch_kachina_update(app_dir: str) -> None:
             "(绿色版的自更新依赖此文件,kachina update.exe 与主程序必须配套)"
         )
 
-    logger.info(f"启动 kachina update.exe: {update_exe}")
+    # ---- 拼命令行参数 ----
+    # kachina CLI 形式: -I(--self-update) + --source <id>(可选)
+    # 没传 source_id 就让 kachina 自己弹窗让用户选(传 None)
+    parameters = f"-I --source {source_id}" if source_id else None
+
+    logger.info(
+        f"启动 kachina update.exe: {update_exe}"
+        + (f" (args={parameters!r})" if parameters else "")
+    )
     # 用 ShellExecuteExW + runas verb 启动 update.exe —— 让它自己请求 UAC 提权
     # (Windows 行为:非 elevated 进程 spawn 普通 EXE 会被 Windows 自动拦截弹 UAC,
     #  用 runas 让 spawn 那一刻就显式提权,只弹一次 UAC 且用户体验更明确)
@@ -331,7 +357,7 @@ def launch_kachina_update(app_dir: str) -> None:
     sei.hwnd = None
     sei.lpVerb = "runas"          # ← 关键:runas 让 Windows 立刻弹 UAC 提权
     sei.lpFile = update_exe
-    sei.lpParameters = None
+    sei.lpParameters = parameters  # ← None=让 kachina 自己弹窗选;否则强制指定
     sei.lpDirectory = app_dir     # ← 跟 cwd=app_dir 效果一样,让 update.exe 找到 portable 根
     sei.nShow = SW_SHOWNORMAL
 

@@ -484,7 +484,7 @@ def build_kachina_metadata(portable_root: str) -> tuple:
         "-m", metadata,
         "-o", hashed,
         "-r", KACHINA_RID,
-        "-t", VERSION,
+        "-t", f"v{VERSION}",
         "-u", update_exe_abs,
     ]
     print("  $ " + " ".join(cmd))

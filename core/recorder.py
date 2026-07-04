@@ -16,7 +16,7 @@ from PySide6.QtCore import QObject, Signal, QThread
 
 from core.config import (
     get_global_setting, get_room_config, get_effective_format,
-    get_effective_save_dir, VIDEO_SAVE_DIR
+    get_effective_save_dir, VIDEO_SAVE_DIR, RESOURCE_DIR
 )
 from core.bili_api import get_bili_info, get_stream_info
 from core.utils import format_size, render_path_template
@@ -24,35 +24,70 @@ from core.danmaku_recorder import DanmakuRecorder
 
 
 def _get_ffmpeg_path():
-    """获取 ffmpeg 路径，支持打包后的场景"""
+    """获取 ffmpeg 路径，支持 Portable 和打包后的场景。
+
+    Portable 模式下：
+      - 主程序在 dd_rec-{version}/dd_rec_main.exe
+      - ffmpeg 在根目录 dd-rec/ffmpeg/
+      - 需要向上两级找到根目录
+
+    打包模式下：
+      - 主程序在 xxx/dd_rec_main.exe
+      - ffmpeg 在同目录的 ffmpeg/ 或 RESOURCE_DIR
+    """
+    # 如果是 frozen 态（打包后运行）
     if getattr(sys, 'frozen', False):
-        # 打包后：从 exe 同目录查找
-        base_dir = os.path.dirname(sys.executable)
-        if platform.system() == "Windows":
-            return os.path.join(base_dir, "ffmpeg.exe")
-        else:
-            return os.path.join(base_dir, "ffmpeg")
-    else:
-        # 开发时：从项目根目录查找
-        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        if platform.system() == "Windows":
-            return os.path.join(project_root, "ffmpeg.exe")
-        else:
-            return os.path.join(project_root, "ffmpeg")
+        exe_dir = os.path.dirname(sys.executable)
+        parent_dir = os.path.dirname(exe_dir)  # 向上两级找根目录
+
+        # Portable 模式：先查找根目录的 ffmpeg
+        ffmpeg_dir = os.path.join(parent_dir, "ffmpeg")
+        ffmpeg_path = os.path.join(ffmpeg_dir, "ffmpeg.exe")
+        if os.path.exists(ffmpeg_path):
+            return ffmpeg_path
+
+        # 回退：RESOURCE_DIR（兼容旧模式）
+        if os.path.exists(os.path.join(RESOURCE_DIR, "ffmpeg", "ffmpeg.exe")):
+            return os.path.join(RESOURCE_DIR, "ffmpeg", "ffmpeg.exe")
+
+        # 再回退：exe 同级目录
+        ffmpeg_path = os.path.join(exe_dir, "ffmpeg", "ffmpeg.exe")
+        if os.path.exists(ffmpeg_path):
+            return ffmpeg_path
+
+        return "ffmpeg"
+
+    # 开发态
+    return "ffmpeg"
 
 
 def _extract_ffmpeg():
-    """从打包资源中提取 ffmpeg（如果尚未提取）"""
+    """从打包资源中提取 ffmpeg（如果尚未提取）
+
+    注意：Portable 模式下 ffmpeg 在根目录，不需要提取
+    """
     if not getattr(sys, 'frozen', False):
         return  # 开发环境不需要
 
-    base_dir = os.path.dirname(sys.executable)
-    ffmpeg_path = os.path.join(base_dir, "ffmpeg.exe")
-    ffprobe_path = os.path.join(base_dir, "ffprobe.exe")
+    # Portable 模式：ffmpeg 在根目录，不需要提取
+    exe_dir = os.path.dirname(sys.executable)
+    parent_dir = os.path.dirname(exe_dir)
+    root_ffmpeg = os.path.join(parent_dir, "ffmpeg", "ffmpeg.exe")
+    if os.path.exists(root_ffmpeg):
+        return
+
+    # 旧模式：从打包资源提取
+    base_dir = RESOURCE_DIR
+    ffmpeg_dir = os.path.join(base_dir, "ffmpeg")
+    ffmpeg_path = os.path.join(ffmpeg_dir, "ffmpeg.exe")
+    ffprobe_path = os.path.join(ffmpeg_dir, "ffprobe.exe")
 
     # 如果 ffmpeg 已存在，直接返回
     if os.path.exists(ffmpeg_path):
         return
+
+    # 确保目录存在
+    os.makedirs(ffmpeg_dir, exist_ok=True)
 
     # 确定 ffmpeg 源目录（datas 打包到 ffmpeg/ 子目录）
     if hasattr(sys, '_MEIPASS'):
@@ -63,7 +98,7 @@ def _extract_ffmpeg():
     src_ffmpeg = os.path.join(src_dir, "ffmpeg.exe")
     src_ffprobe = os.path.join(src_dir, "ffprobe.exe")
 
-    # 复制到 exe 同目录
+    # 复制到 ffmpeg/ 子目录
     import shutil
     if os.path.exists(src_ffmpeg):
         shutil.copy2(src_ffmpeg, ffmpeg_path)
@@ -1138,10 +1173,14 @@ class BiliRecorder(QObject):
                         # —— 后续 split / stopped 都用同一个，保证 biliupforjava 端 session 一致
                         self.current_session_id = str(uuid.uuid4())
                     else:
-                        # 关键：本次是"防抖期内 API 翻回 1 重启 ffmpeg"或"split 切 part"路径。
-                        # 重置 current_part_start_time 让新 part 的 duration 从 0 开始算；
-                        # session_id 延续（biliupforjava 端同一会话续命）。
+                        # 防抖重连路径：主播曾短暂断流，现在重新开播。
+                        # 必须重置计时器和计数，让新录制 duration 从 0 开始；
+                        # 生成新 session_id（旧 part 的 FileClosed 已由上面发出）。
+                        self.record_start_time = time.time()
+                        self.last_total_size = 0
+                        self.accumulated_size = 0
                         self.current_part_start_time = time.time()
+                        self.current_session_id = str(uuid.uuid4())
 
                     # 启动弹幕录制
                     if get_global_setting("chat_record_enabled"):

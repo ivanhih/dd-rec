@@ -1,8 +1,9 @@
-﻿# ui/settings_dialog.py
+# ui/settings_dialog.py
+import os
 import threading
 import logging
 from PySide6.QtWidgets import (
-    QDialog, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, 
+    QApplication, QDialog, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
     QComboBox, QPushButton, QCheckBox, QScrollArea, QFrame,
     QFormLayout, QTabWidget, QWidget, QTextEdit, QFileDialog
 )
@@ -12,6 +13,12 @@ from PySide6.QtGui import QFont
 from core.config import DEFAULT_GLOBAL_SETTINGS, get_room_config, get_global_setting, get_effective_format, VIDEO_SAVE_DIR, save_config
 from core.config import set_global_setting, get_room_setting, set_room_setting, has_room_override
 from ui.room_card import ToggleSwitch
+
+
+class NoWheelComboBox(QComboBox):
+    """滚轮不切换选项:忽略事件并向上冒泡,交给滚动区域滚动页面。"""
+    def wheelEvent(self, event):
+        event.ignore()
 
 
 class AddChannelDialog(QDialog):
@@ -165,7 +172,7 @@ class RoomSettingsDialog(QDialog):
         form_layout.addRow(QLabel("SESSDATA:"), self.sessdata_input)
 
         # 输出格式
-        self.format_combo = QComboBox()
+        self.format_combo = NoWheelComboBox()
         self.format_combo.addItems(["继承全局", "mp4", "ts", "flv"])
         form_layout.addRow(QLabel("输出格式:"), self.format_combo)
 
@@ -395,11 +402,11 @@ class GlobalSettingsPage(QWidget):
         stream_layout = QFormLayout()
         stream_layout.setSpacing(12)
 
-        self.stream_codec_combo = QComboBox()
+        self.stream_codec_combo = NoWheelComboBox()
         self.stream_codec_combo.addItems(["av1", "hevc", "h264"])
         stream_layout.addRow(QLabel("优先编码:"), self.stream_codec_combo)
 
-        self.stream_resolution_combo = QComboBox()
+        self.stream_resolution_combo = NoWheelComboBox()
         self.stream_resolution_combo.addItems(["原画", "超清", "高清", "流畅"])
         stream_layout.addRow(QLabel("清晰度:"), self.stream_resolution_combo)
 
@@ -420,7 +427,7 @@ class GlobalSettingsPage(QWidget):
         self.save_dir_input.setPlaceholderText(str(VIDEO_SAVE_DIR))
         form_layout.addRow(QLabel("默认保存目录:"), self.save_dir_input)
 
-        self.convert_format_combo = QComboBox()
+        self.convert_format_combo = NoWheelComboBox()
         self.convert_format_combo.addItems(["mp4", "ts", "flv"])
         form_layout.addRow(QLabel("输出格式:"), self.convert_format_combo)
 
@@ -747,6 +754,7 @@ class GlobalSettingsOldStyleReplicaPage(QWidget):
             self._refresh_widget(key, default_value)
             confirm.hide()
             btn.show()
+            btn.setFocus()
 
         btn.clicked.connect(_on_reset)
         confirm.clicked.connect(_do_reset)
@@ -764,21 +772,27 @@ class GlobalSettingsOldStyleReplicaPage(QWidget):
         widget = self._controls.get(key)
         if widget is None:
             return
-        if isinstance(widget, ToggleSwitch):
-            widget.setChecked(bool(default_value))
-        elif isinstance(widget, tuple):       # split_by_duration 三元组
+        if isinstance(widget, tuple):       # split_by_duration 三元组
             h, m, s = widget
             parts = str(default_value).split(":")
             h.setText(parts[0] if len(parts) > 0 else "1")
             m.setText(parts[1] if len(parts) > 1 else "00")
             s.setText(parts[2] if len(parts) > 2 else "00")
-        elif isinstance(widget, QLineEdit):
-            widget.setText(str(default_value) if default_value else "")
-        elif isinstance(widget, QTextEdit):
-            widget.setPlainText(str(default_value) if default_value else "")
-        elif isinstance(widget, QComboBox):
-            idx = widget.findText(str(default_value))
-            widget.setCurrentIndex(idx if idx >= 0 else 0)
+            return
+        # 单控件:刷新时屏蔽信号,避免触发 currentTextChanged/toggled 又写一次配置
+        widget.blockSignals(True)
+        try:
+            if isinstance(widget, ToggleSwitch):
+                widget.setChecked(bool(default_value))
+            elif isinstance(widget, QLineEdit):
+                widget.setText(str(default_value) if default_value else "")
+            elif isinstance(widget, QTextEdit):
+                widget.setPlainText(str(default_value) if default_value else "")
+            elif isinstance(widget, QComboBox):
+                idx = widget.findText(str(default_value))
+                widget.setCurrentIndex(idx if idx >= 0 else 0)
+        finally:
+            widget.blockSignals(False)
 
     def _bind_line_edit(self, widget, key):
         widget.editingFinished.connect(lambda k=key, w=widget: self._save_setting(k, w.text()))
@@ -802,7 +816,7 @@ class GlobalSettingsOldStyleReplicaPage(QWidget):
         return self._bind_line_edit(widget, key)
 
     def _combo(self, key, options, width=130):
-        widget = QComboBox()
+        widget = NoWheelComboBox()
         widget.addItems(options)
         widget.setFixedWidth(width)
         return self._bind_combo(widget, key)
@@ -1737,40 +1751,6 @@ class GlobalSettingsOldStyleReplicaPage(QWidget):
         ])
 
     def _build_system_card(self):
-        # 添加更新按钮
-        self.update_btn = QPushButton("检查更新")
-        self.update_btn.setObjectName("primaryBtn")
-        self.update_btn.setFixedWidth(120)
-        self.update_btn.clicked.connect(self._check_update)
-        self.update_btn.setStyleSheet("""
-            QPushButton#primaryBtn {
-                background-color: #3B82F6;
-                color: white;
-                border: none;
-                border-radius: 10px;
-                padding: 9px 14px;
-                font-size: 13px;
-                font-weight: 600;
-            }
-            QPushButton#primaryBtn:hover {
-                background-color: #2563EB;
-            }
-            QPushButton#primaryBtn:disabled {
-                background-color: #3B82F680;
-                color: #94A3B8;
-            }
-        """)
-        self.update_status_label = QLabel("")
-        self.update_status_label.setStyleSheet("color: #94A3B8; font-size: 12px;")
-
-        update_btn_wrapper = QWidget()
-        update_btn_layout = QHBoxLayout(update_btn_wrapper)
-        update_btn_layout.setContentsMargins(0, 0, 0, 0)
-        update_btn_layout.setSpacing(12)
-        update_btn_layout.addWidget(self.update_btn)
-        update_btn_layout.addWidget(self.update_status_label)
-        update_btn_layout.addStretch()
-
         return self._setting_card("⚙️ 系统", "#6FCF70", [
             self._setting_item("开机自启", "系统启动时自动运行本程序",
                 self._check("auto_start"),
@@ -1778,106 +1758,31 @@ class GlobalSettingsOldStyleReplicaPage(QWidget):
             self._setting_item("阻止休眠", "录制期间阻止系统进入休眠状态",
                 self._check("prevent_sleep"),
                 self._reset_button("prevent_sleep", DEFAULT_GLOBAL_SETTINGS["prevent_sleep"])),
-            self._setting_item("检查更新", "检查是否有新版本可用",
-                update_btn_wrapper,
-                None),
         ])
 
     def _save_setting(self, key, value):
+        # 同步特殊 key 到系统层（注册表 / 电源）
+        if key == "auto_start":
+            try:
+                from core.power import set_auto_start
+                set_auto_start(bool(value))
+            except Exception as e:
+                logging.error(f"同步 auto_start 到注册表失败: {e}")
+        elif key == "prevent_sleep":
+            # 防止休眠: 通知主窗口启停 PowerKeepAlive
+            win = self.window()
+            keepalive = getattr(win, "_power_keepalive", None)
+            if keepalive is not None:
+                try:
+                    if value:
+                        keepalive.start()
+                    else:
+                        keepalive.stop()
+                except Exception as e:
+                    logging.error(f"启停 PowerKeepAlive 失败: {e}")
+
         set_global_setting(key, value)
         self.saved.emit(key)
-
-    def _check_update(self):
-        """检查更新"""
-        from core.updater import check_update
-
-        self.update_btn.setEnabled(False)
-        self.update_status_label.setText("检查中...")
-        self.update_status_label.setStyleSheet("color: #94A3B8; font-size: 12px;")
-
-        def do_check():
-            has_update, latest_version, download_url, release_notes = check_update()
-            # 直接更新 UI（Qt 会自动处理跨线程）
-            if has_update:
-                self.update_status_label.setText(f"发现新版本: {latest_version}")
-                self.update_status_label.setStyleSheet("color: #4ADE80; font-size: 12px;")
-                self.update_btn.setEnabled(True)
-                # 显示更新对话框
-                from PySide6.QtCore import QTimer
-                QTimer.singleShot(100, lambda: self._show_update_dialog(latest_version, download_url, release_notes))
-            elif latest_version:
-                self.update_status_label.setText("已是最新版本")
-                self.update_status_label.setStyleSheet("color: #4ADE80; font-size: 12px;")
-                self.update_btn.setEnabled(True)
-            else:
-                self.update_status_label.setText("检查失败")
-                self.update_status_label.setStyleSheet("color: #EF4444; font-size: 12px;")
-                self.update_btn.setEnabled(True)
-
-        thread = threading.Thread(target=do_check, daemon=True)
-        thread.start()
-
-    def _show_update_dialog(self, version, download_url, release_notes):
-        """显示更新对话框"""
-        from PySide6.QtWidgets import QMessageBox
-
-        msg = QMessageBox(self)
-        msg.setWindowTitle("发现新版本")
-        msg.setText(f"发现新版本 v{version}")
-        msg.setInformativeText(f"更新说明:\n{release_notes[:500]}..." if release_notes else "是否立即下载更新？")
-        msg.setIcon(QMessageBox.Information)
-
-        msg.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
-        msg.button(QMessageBox.Yes).setText("立即下载")
-        msg.button(QMessageBox.No).setText("稍后")
-
-        if msg.exec() == QMessageBox.Yes:
-            self._start_download(version, download_url)
-
-    def _start_download(self, version, download_url):
-        """开始下载更新"""
-        import tempfile
-        import os
-        from core.updater import download_file
-        from PySide6.QtCore import QTimer
-
-        self.update_btn.setEnabled(False)
-        self.update_status_label.setText(f"正在下载 v{version}...")
-        self.update_status_label.setStyleSheet("color: #F59E0B; font-size: 12px;")
-
-        # 下载单个 exe 文件
-        temp_exe = os.path.join(tempfile.gettempdir(), f"DD录播机_v{version}.exe")
-
-        def do_download():
-            success = download_file(download_url, temp_exe)
-            QTimer.singleShot(0, lambda: self._on_download_complete(success, temp_exe))
-
-        thread = threading.Thread(target=do_download, daemon=True)
-        thread.start()
-
-    def _on_download_complete(self, success, exe_path):
-        """下载完成处理"""
-        if success:
-            self.update_status_label.setText("下载完成，正在安装...")
-            self.update_status_label.setStyleSheet("color: #4ADE80; font-size: 12px;")
-
-            # 提示用户关闭程序
-            from PySide6.QtWidgets import QMessageBox
-            msg = QMessageBox(self)
-            msg.setWindowTitle("更新就绪")
-            msg.setText("新版本已下载完成！")
-            msg.setInformativeText("点击「确定」将关闭程序并安装更新...")
-            msg.setIcon(QMessageBox.Information)
-            msg.setStandardButtons(QMessageBox.Ok)
-            msg.button(QMessageBox.Ok).setText("确定")
-
-            if msg.exec() == QMessageBox.Ok:
-                from core.updater import quit_and_update
-                quit_and_update(exe_path)
-        else:
-            self.update_btn.setEnabled(True)
-            self.update_status_label.setText("下载失败")
-            self.update_status_label.setStyleSheet("color: #EF4444; font-size: 12px;")
 
     def _choose_directory(self, key, line_edit):
         current_dir = line_edit.text().strip() or str(VIDEO_SAVE_DIR)

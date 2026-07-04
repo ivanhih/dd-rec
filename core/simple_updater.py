@@ -123,19 +123,21 @@ def _format_published_at(iso_str: str) -> str:
     return iso_str
 
 
-def _make_channel_row(icon: str, title: str, desc: str) -> dict:
-    """构造一个通道行:左边 icon + 中间 title/desc + 右边 checkable 按钮(模拟截图里的"立即更新"位)。
-    返回 {'frame': QFrame, 'btn': QPushButton}
+def _make_channel_row(icon: str, title: str, desc: str, source_id: str) -> dict:
+    """构造一个通道行:左边 icon + 中间 title/desc + 右边 checkable 按钮(单选)。
+    多个 row 用 QButtonGroup 互斥,实现"二选一"。
+
+    返回 {'frame': QFrame, 'btn': QPushButton, 'source_id': str}
     """
     frame = QFrame()
-    frame.setObjectName("channelRow")
-    frame.setStyleSheet("""
-        QFrame#channelRow {
+    frame.setObjectName(f"channelRow_{source_id}")
+    frame.setStyleSheet(f"""
+        QFrame#channelRow_{source_id} {{
             background-color: #252631;
             border: 1px solid #2D2E3A;
             border-radius: 8px;
-        }
-        QFrame#channelRow:hover { background-color: #2A2B36; }
+        }}
+        QFrame#channelRow_{source_id}:hover {{ background-color: #2A2B36; }}
     """)
 
     row = QHBoxLayout(frame)
@@ -159,10 +161,9 @@ def _make_channel_row(icon: str, title: str, desc: str) -> dict:
     text_block.addWidget(title_label)
     text_block.addWidget(desc_label)
 
-    # 用 checkable QPushButton 模拟 radio(配合 setAutoExclusive)
+    # 单选按钮(配合 QButtonGroup.setExclusive 互斥,这样跨 row 互斥)
     radio_btn = QPushButton("选择")
     radio_btn.setCheckable(True)
-    radio_btn.setAutoExclusive(True)  # 同组互斥
     radio_btn.setCursor(Qt.PointingHandCursor)
     radio_btn.setFixedSize(80, 36)
     radio_btn.setStyleSheet("""
@@ -187,7 +188,7 @@ def _make_channel_row(icon: str, title: str, desc: str) -> dict:
     row.addLayout(text_block, 1)
     row.addWidget(radio_btn)
 
-    return {"frame": frame, "btn": radio_btn}
+    return {"frame": frame, "btn": radio_btn, "source_id": source_id}
 
 
 def _prompt_for_cdk(parent) -> Optional[str]:
@@ -201,6 +202,22 @@ def _prompt_for_cdk(parent) -> Optional[str]:
     if not ok:
         return None
     return cdk.strip() if cdk else ""
+
+
+# 用户可见的下载通道元数据(id 必须跟 kachina.config.json 的 source[].id 对应)
+# key 是 kachina source id,value 是 UI 展示信息(title/desc/icon)
+CHANNEL_DISPLAY = {
+    "github": {
+        "icon": "🐙",
+        "title": "GitHub",
+        "desc": "官方源,直连 GitHub release,海外/有代理选这个",
+    },
+    "cnb": {
+        "icon": "🇨🇳",
+        "title": "CNB",
+        "desc": "国内加速(腾讯节点),国内网络选这个更快",
+    },
+}
 
 
 def show_update_dialog(info: UpdateInfo, parent=None) -> bool:
@@ -341,7 +358,10 @@ def show_update_dialog(info: UpdateInfo, parent=None) -> bool:
     note_layout.addWidget(note_browser)
     content_layout.addWidget(note_card)
 
-    # ----- 下载通道说明卡片(kachina 自己处理选择,主程序只显示提示) -----
+    # ----- 下载通道卡片:GitHub / CNB 二选一 -----
+    # 通道列表硬编码在这里,不用再去解析 kachina.config.json:
+    # - frozen 模式下 sys.executable 的临时目录猜不到项目根,解析不稳定
+    # - 通道就这两个,加新通道时改这里 + kachina.config.json 两处即可
     channel_card = QFrame()
     channel_card.setStyleSheet("""
         QFrame {
@@ -359,36 +379,41 @@ def show_update_dialog(info: UpdateInfo, parent=None) -> bool:
     ch_title.setStyleSheet("color: #F8FAFC; background: transparent; border: none;")
     ch_layout.addWidget(ch_title)
 
-    # 列出当前可用的下载源(kachina 启动后会让用户在它自己 UI 里选)
+    # 默认勾选 = 上次用户选择(持久化在 config.update_channel),否则 github
     try:
         from core.config import get_global_setting
-        mirror_enabled = bool(get_global_setting("mirror_chyan_enabled"))
-        mirror_has_cdk = bool((get_global_setting("mirror_chyan_cdk") or "").strip())
+        default_channel = get_global_setting("update_channel") or "github"
     except Exception:
-        mirror_enabled = False
-        mirror_has_cdk = False
+        default_channel = "github"
+    if default_channel not in CHANNEL_DISPLAY:
+        default_channel = "github"
 
-    try:
-        from core.cloudflare_r2 import is_enabled as r2_enabled
-    except Exception:
-        r2_enabled = False
+    # 跨 row 互斥:QButtonGroup(exclusive=True)
+    from PySide6.QtWidgets import QButtonGroup
+    channel_group = QButtonGroup(page)
+    channel_group.setExclusive(True)
 
-    available_sources = [
-        "🐙  GitHub — 官方源,直连 release",
-    ]
-    if mirror_enabled and mirror_has_cdk:
-        available_sources.append("🪞  Mirror 酱 — 国内加速(需 CDK)")
-    if r2_enabled:
-        available_sources.append("☁️  Cloudflare R2 — 国内加速(免费)")
+    channel_rows: dict = {}  # source_id -> dict(包含 btn)
+    for idx, (sid, meta) in enumerate(CHANNEL_DISPLAY.items()):
+        row = _make_channel_row(meta["icon"], meta["title"], meta["desc"], sid)
+        ch_layout.addWidget(row["frame"])
+        channel_group.addButton(row["btn"], idx)
+        row["btn"].setProperty("source_id", sid)
+        channel_rows[sid] = row
+        if sid == default_channel:
+            row["btn"].setChecked(True)
+            row["btn"].setText("已选")
 
-    for src in available_sources:
-        lbl = QLabel(src)
-        lbl.setStyleSheet("color: #CBD5E1; font-size: 13px; background: transparent; border: none;")
-        ch_layout.addWidget(lbl)
+    # 选中态切换:其他按钮恢复"选择"文案
+    def _on_channel_changed(checked_btn):
+        for sid, r in channel_rows.items():
+            btn = r["btn"]
+            btn.setText("已选" if btn is checked_btn and btn.isChecked() else "选择")
+    channel_group.buttonClicked.connect(_on_channel_changed)
 
     channel_hint = QLabel(
-        "💡  点击「立即更新」后,kachina 安装器会启动,\n"
-        "    你可以在它自己的窗口里选择下载通道。"
+        "💡  选择通道后点「立即更新」,安装器会自动用对应通道下载,\n"
+        "    不会再让你在安装器里选一次。"
     )
     channel_hint.setStyleSheet(
         "color: #64748B; font-size: 11px; background: transparent; border: none; line-height: 1.5;"
@@ -457,16 +482,22 @@ def show_update_dialog(info: UpdateInfo, parent=None) -> bool:
 
     # ============= 立即更新逻辑 =============
     def _do_update():
-        # kachina 自己处理多 source 选择 —— 主程序不参与,直接 spawn update.exe
-        # 记住用户最后选了哪个(用于将来 mirror 酱 / R2 选 CDK 时的默认行为等)
+        # 找出当前勾选的通道(只可能有一个,因 QButtonGroup exclusive)
+        selected_id = default_channel
+        for sid, r in channel_rows.items():
+            if r["btn"].isChecked():
+                selected_id = sid
+                break
+
+        # 把用户这次的选写回 config.json(下次更新弹窗默认勾这个)
         try:
             from core.config import set_global_setting
-            # 没有 UI 选项,记个默认值
-            set_global_setting("update_channel", "github")
+            set_global_setting("update_channel", selected_id)
         except Exception as e:
             logger.warning(f"保存 update_channel 失败: {e}")
 
-        # 启动 kachina update.exe
+        # 启动 kachina update.exe,把通道作为 --source 参数传过去
+        # kachina 收到 --source 后,会在自己 UI 里跳过"选通道"那步,直接用对应源下载
         update_btn.setEnabled(False)
         cancel_btn.setEnabled(False)
         update_btn.setText("正在启动安装器...")
@@ -474,7 +505,7 @@ def show_update_dialog(info: UpdateInfo, parent=None) -> bool:
             from core.portable_updater import launch_kachina_update, get_app_dir
             app_dir = get_app_dir()
             # launch_kachina_update 内部会 os._exit(0),执行不到这里
-            launch_kachina_update(app_dir)
+            launch_kachina_update(app_dir, source_id=selected_id)
         except Exception as e:
             logger.error(f"启动 kachina update 失败: {e}")
             update_btn.setEnabled(True)

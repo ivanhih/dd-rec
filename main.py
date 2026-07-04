@@ -30,10 +30,8 @@ from core.utils import render_path_template
 from ui.room_card import RoomCard, HoverLabel, _HoverToolButton, _HoverPushButton
 from ui.settings_dialog import RoomSettingsDialog, GlobalSettingsOldStyleReplicaPage, AddChannelDialog, open_room_settings_overlay, open_room_settings_overlay
 
-# 插件系统
-from plugins import PluginManager
-from plugins.page import PluginsPage
-from plugins.host import PluginHostBar, PluginStackController
+# 高能剪切(内置功能)
+from core.high_energy_cut import HighEnergyCutPage
 
 
 # ==================== Path preview (mirrors recorder._build_save_path) ====================
@@ -495,7 +493,7 @@ class MainWindow(QMainWindow):
             }
         """
         self.nav_channels_btn.setStyleSheet(active_style if self.current_page == "channels" else inactive_style)
-        self.nav_plugins_btn.setStyleSheet(active_style if self.current_page == "plugins" else inactive_style)
+        self.nav_high_energy_btn.setStyleSheet(active_style if self.current_page == "high_energy" else inactive_style)
         self.nav_settings_btn.setStyleSheet(active_style if self.current_page == "settings" else inactive_style)
         self.nav_about_btn.setStyleSheet(active_style if self.current_page == "about" else inactive_style)
 
@@ -514,26 +512,13 @@ class MainWindow(QMainWindow):
         sidebar_layout = QVBoxLayout(sidebar)
         sidebar_layout.setContentsMargins(8, 20, 8, 20)
         sidebar_layout.setSpacing(16)
-        
-        # Logo/图标按钮
-        logo_btn = QToolButton()
-        logo_btn.setText("🎮")
-        logo_btn.setFixedSize(56, 56)
-        logo_btn.setStyleSheet("""
-            QToolButton {
-                background-color: #3b82f6;
-                color: white;
-                border-radius: 12px;
-                font-size: 24px;
-            }
-        """)
-        
+
         self.nav_channels_btn = self._create_sidebar_nav_button("📋", "频道")
         self._wire_hover(self.nav_channels_btn, "频道")
         self.nav_channels_btn.clicked.connect(self.show_channels_page)
-        self.nav_plugins_btn = self._create_sidebar_nav_button("🧩", "插件")
-        self._wire_hover(self.nav_plugins_btn, "插件")
-        self.nav_plugins_btn.clicked.connect(self.show_plugins_page)
+        self.nav_high_energy_btn = self._create_sidebar_nav_button("🎬", "高能剪切")
+        self._wire_hover(self.nav_high_energy_btn, "高能剪切")
+        self.nav_high_energy_btn.clicked.connect(self.show_high_energy_page)
         self.nav_settings_btn = self._create_sidebar_nav_button("⚙️", "全局设置")
         self._wire_hover(self.nav_settings_btn, "全局设置")
         self.nav_settings_btn.clicked.connect(self.show_global_settings_page)
@@ -541,14 +526,8 @@ class MainWindow(QMainWindow):
         self._wire_hover(self.nav_about_btn, "关于")
         self.nav_about_btn.clicked.connect(self.show_about_page)
 
-        sidebar_layout.addWidget(logo_btn)
         sidebar_layout.addWidget(self.nav_channels_btn)
-        sidebar_layout.addWidget(self.nav_plugins_btn)
-
-        # 插件宿主 sidebar 区 —— 已启用插件的图标会动态追加到这里
-        # 注:plugin_manager 还在后面才创建,先放占位 widget,稍后回填
-        self.plugin_host_bar = PluginHostBar(None)
-        sidebar_layout.addWidget(self.plugin_host_bar)
+        sidebar_layout.addWidget(self.nav_high_energy_btn)
 
         sidebar_layout.addWidget(self.nav_settings_btn)
         sidebar_layout.addStretch()
@@ -701,13 +680,13 @@ class MainWindow(QMainWindow):
         self.page_stack.addWidget(self.channels_page)
         self.page_stack.addWidget(self.settings_page)
 
-        # 关于页面（不是 dialog，是和频道/插件/全局设置一样的主内容页面）
+        # 关于页面（不是 dialog，是和频道/高能剪切/全局设置一样的主内容页面）
         self.about_page = self._build_about_page()
         self._about_page_index = self.page_stack.addWidget(self.about_page)
 
-        # 插件页面（懒加载）
-        self.plugins_page = None
-        self._plugins_page_index = -1
+        # 高能剪切页面（原插件，已内置到 core/high_energy_cut）
+        self.high_energy_page = HighEnergyCutPage(self)
+        self.page_stack.addWidget(self.high_energy_page)
 
         main_layout.addWidget(sidebar)
         main_layout.addWidget(self.page_stack, 1)
@@ -735,18 +714,6 @@ class MainWindow(QMainWindow):
         self._layout_update_timer.setSingleShot(True)
         self._layout_update_timer.timeout.connect(self._rearrange_cards)
         self._layout_ready = True
-
-        # 插件管理器
-        self.plugin_manager = PluginManager()
-        self.plugin_manager.initialize(self)
-        # 把 manager 回填到 host bar(它构造时还没有 manager)
-        self.plugin_host_bar.set_plugin_manager(self.plugin_manager)
-
-        # 插件宿主:把已启用插件挂到 sidebar + page_stack
-        self._plugin_stack_controller = PluginStackController(
-            self.plugin_manager, self.page_stack, self.plugin_host_bar, parent=self
-        )
-        self._plugin_stack_controller.refresh_from_manager()
 
         # 初始定位
         self._position_notification_container()
@@ -975,16 +942,7 @@ class MainWindow(QMainWindow):
         self._layout_ready = True
         self.request_rearrange_cards(0)
 
-    def _init_plugins(self):
-        """初始化插件系统（懒加载插件页面）"""
-        if self.plugins_page is None:
-            self.plugins_page = PluginsPage(self.plugin_manager)
-            self._plugins_page_index = self.page_stack.addWidget(self.plugins_page)
-        # 启动时让已启用的插件在 sidebar 自动出现
-        if getattr(self, "_plugin_stack_controller", None) is not None:
-            self._plugin_stack_controller.refresh_from_manager()
-
-    # ==================== 插件宿主 API（PluginContext 委托调用） ====================
+    # ==================== 宿主 API（高能剪切等内置模块调用） ====================
     def get_save_dir(self) -> str:
         """全局默认录播目录。"""
         return VIDEO_SAVE_DIR
@@ -1006,14 +964,6 @@ class MainWindow(QMainWindow):
         except Exception:
             return []
         return list(data.get("channels", []) or [])
-
-    def show_plugins_page(self):
-        """显示插件页面"""
-        self._init_plugins()  # 确保插件页面已初始化
-        self.current_page = "plugins"
-        self.page_stack.setCurrentIndex(self._plugins_page_index)
-        self._update_sidebar_nav_styles()
-        self.plugins_page.refresh()
 
     def add_card(self, room_info: dict, save=True, rearrange=True):
         room_id = str(room_info["room_id"])
@@ -1399,6 +1349,12 @@ class MainWindow(QMainWindow):
         """切换到关于页面（用 page_stack，和其他页面一致，不弹 dialog）"""
         self.current_page = "about"
         self.page_stack.setCurrentWidget(self.about_page)
+        self._update_sidebar_nav_styles()
+
+    def show_high_energy_page(self):
+        """切换到高能剪切页面"""
+        self.current_page = "high_energy"
+        self.page_stack.setCurrentWidget(self.high_energy_page)
         self._update_sidebar_nav_styles()
 
     def _build_about_page(self):
