@@ -30,9 +30,6 @@ from core.utils import render_path_template
 from ui.room_card import RoomCard, HoverLabel, _HoverToolButton, _HoverPushButton
 from ui.settings_dialog import RoomSettingsDialog, GlobalSettingsOldStyleReplicaPage, AddChannelDialog, open_room_settings_overlay, open_room_settings_overlay
 
-# 高能剪切(内置功能)
-from core.high_energy_cut import HighEnergyCutPage
-
 
 # ==================== Path preview (mirrors recorder._build_save_path) ====================
 def _preview_save_path(room_id: str, uname: str, title: str, now_dt) -> str:
@@ -493,7 +490,6 @@ class MainWindow(QMainWindow):
             }
         """
         self.nav_channels_btn.setStyleSheet(active_style if self.current_page == "channels" else inactive_style)
-        self.nav_high_energy_btn.setStyleSheet(active_style if self.current_page == "high_energy" else inactive_style)
         self.nav_settings_btn.setStyleSheet(active_style if self.current_page == "settings" else inactive_style)
         self.nav_about_btn.setStyleSheet(active_style if self.current_page == "about" else inactive_style)
 
@@ -516,9 +512,6 @@ class MainWindow(QMainWindow):
         self.nav_channels_btn = self._create_sidebar_nav_button("📋", "频道")
         self._wire_hover(self.nav_channels_btn, "频道")
         self.nav_channels_btn.clicked.connect(self.show_channels_page)
-        self.nav_high_energy_btn = self._create_sidebar_nav_button("🎬", "高能剪切")
-        self._wire_hover(self.nav_high_energy_btn, "高能剪切")
-        self.nav_high_energy_btn.clicked.connect(self.show_high_energy_page)
         self.nav_settings_btn = self._create_sidebar_nav_button("⚙️", "全局设置")
         self._wire_hover(self.nav_settings_btn, "全局设置")
         self.nav_settings_btn.clicked.connect(self.show_global_settings_page)
@@ -527,7 +520,6 @@ class MainWindow(QMainWindow):
         self.nav_about_btn.clicked.connect(self.show_about_page)
 
         sidebar_layout.addWidget(self.nav_channels_btn)
-        sidebar_layout.addWidget(self.nav_high_energy_btn)
 
         sidebar_layout.addWidget(self.nav_settings_btn)
         sidebar_layout.addStretch()
@@ -680,13 +672,9 @@ class MainWindow(QMainWindow):
         self.page_stack.addWidget(self.channels_page)
         self.page_stack.addWidget(self.settings_page)
 
-        # 关于页面（不是 dialog，是和频道/高能剪切/全局设置一样的主内容页面）
+        # 关于页面（不是 dialog，是和频道/全局设置一样的主内容页面）
         self.about_page = self._build_about_page()
         self._about_page_index = self.page_stack.addWidget(self.about_page)
-
-        # 高能剪切页面（原插件，已内置到 core/high_energy_cut）
-        self.high_energy_page = HighEnergyCutPage(self)
-        self.page_stack.addWidget(self.high_energy_page)
 
         main_layout.addWidget(sidebar)
         main_layout.addWidget(self.page_stack, 1)
@@ -942,29 +930,7 @@ class MainWindow(QMainWindow):
         self._layout_ready = True
         self.request_rearrange_cards(0)
 
-    # ==================== 宿主 API（高能剪切等内置模块调用） ====================
-    def get_save_dir(self) -> str:
-        """全局默认录播目录。"""
-        return VIDEO_SAVE_DIR
-
-    def get_effective_save_dir_for_room(self, room_id: str, uname: str) -> str:
-        """按主程序一致的规则解析某直播间的录播目录。"""
-        from core.config import get_effective_save_dir as _gesd
-        return _gesd(room_id, uname)
-
-    def get_ffmpeg_cmd(self) -> str:
-        """返回当前可用的 ffmpeg 可执行路径。"""
-        from core.recorder import FFMPEG_CMD
-        return FFMPEG_CMD
-
-    def list_known_rooms(self) -> list:
-        """返回已添加的直播间列表 [{room_id, uname, ...}]。"""
-        try:
-            data = load_app_data() or {}
-        except Exception:
-            return []
-        return list(data.get("channels", []) or [])
-
+    # ==================== 宿主 API（保留给未来内置模块调用） ====================
     def add_card(self, room_info: dict, save=True, rearrange=True):
         room_id = str(room_info["room_id"])
         if room_id in self.cards:
@@ -1349,12 +1315,6 @@ class MainWindow(QMainWindow):
         """切换到关于页面（用 page_stack，和其他页面一致，不弹 dialog）"""
         self.current_page = "about"
         self.page_stack.setCurrentWidget(self.about_page)
-        self._update_sidebar_nav_styles()
-
-    def show_high_energy_page(self):
-        """切换到高能剪切页面"""
-        self.current_page = "high_energy"
-        self.page_stack.setCurrentWidget(self.high_energy_page)
         self._update_sidebar_nav_styles()
 
     def _build_about_page(self):
