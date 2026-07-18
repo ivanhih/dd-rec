@@ -7,12 +7,170 @@ from PySide6.QtWidgets import (
     QComboBox, QPushButton, QCheckBox, QScrollArea, QFrame,
     QFormLayout, QTabWidget, QWidget, QTextEdit, QFileDialog
 )
-from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtCore import QObject, QRunnable, QSignalBlocker, QThreadPool, Qt, QTimer, Signal, Slot
 from PySide6.QtGui import QFont
 
-from core.config import DEFAULT_GLOBAL_SETTINGS, get_room_config, get_global_setting, get_effective_format, VIDEO_SAVE_DIR, save_config
-from core.config import set_global_setting, get_room_setting, set_room_setting, has_room_override
+from core.config import (
+    DEFAULT_GLOBAL_SETTINGS,
+    VIDEO_SAVE_DIR,
+    get_effective_format,
+    get_global_setting,
+    get_room_config,
+    get_room_setting,
+    has_room_override,
+    save_config,
+    set_global_setting,
+    set_room_setting,
+)
 from ui.room_card import ToggleSwitch
+from ui.theme import enable_surface
+
+
+SETTING_COMBO_OPTIONS = {
+    "language": (
+        ("简体中文", "settings.option.language.zh_cn"),
+        ("繁體中文", "settings.option.language.zh_tw"),
+        ("English", "settings.option.language.en"),
+    ),
+    "theme": (
+        ("深色", "settings.option.theme.dark"),
+        ("浅色", "settings.option.theme.light"),
+    ),
+    "proxy_mode": (
+        ("禁用", "settings.option.proxy.disabled"),
+        ("系统", "settings.option.proxy.system"),
+        ("自定义", "settings.option.proxy.custom"),
+    ),
+    "stream_priority_param": (
+        ("分辨率", "settings.option.priority.resolution"),
+        ("帧率", "settings.option.priority.fps"),
+        ("码率", "settings.option.priority.bitrate"),
+        ("编码", "settings.option.priority.codec"),
+        ("格式", "settings.option.priority.format"),
+        ("网址", "settings.option.priority.url"),
+    ),
+    "stream_resolution": (
+        ("原画", "settings.option.resolution.original"),
+        ("超清", "settings.option.resolution.uhd"),
+        ("高清", "settings.option.resolution.hd"),
+        ("流畅", "settings.option.resolution.smooth"),
+    ),
+    "stream_fps": tuple(
+        (value, f"settings.option.fps.{value.split()[0]}")
+        for value in ("30 fps", "60 fps", "120 fps", "25 fps", "20 fps", "15 fps")
+    ),
+    "stream_codec": tuple(
+        (value, f"settings.option.codec.{value}")
+        for value in ("h264", "hevc", "av1")
+    ),
+    "stream_format": tuple(
+        (value, f"settings.option.format.{value}")
+        for value in ("flv", "fmp4", "ts")
+    ),
+    "stream_fallback_policy": (
+        ("compatible", "settings.option.fallback.compatible"),
+        ("strict", "settings.option.fallback.strict"),
+        ("best_effort", "settings.option.fallback.best_effort"),
+    ),
+    "chat_format": (
+        ("jsonl 数据", "settings.option.chat.jsonl"),
+        ("xml", "settings.option.chat.xml"),
+        ("ass 弹幕", "settings.option.chat.ass"),
+    ),
+    "schedule_timezone": (
+        ("UTC", "settings.option.timezone.utc"),
+        ("Asia/Shanghai", "settings.option.timezone.shanghai"),
+        ("Asia/Tokyo", "settings.option.timezone.tokyo"),
+        ("America/New_York", "settings.option.timezone.new_york"),
+        ("Europe/London", "settings.option.timezone.london"),
+    ),
+    "convert_format": tuple(
+        (value, f"settings.option.format.{value}")
+        for value in ("mp4", "mkv", "ts", "flv")
+    ),
+    "monitor_delay": (
+        ("自动", "settings.option.duration.auto"),
+        ("5 秒", "settings.option.duration.5_seconds"),
+        ("10 秒", "settings.option.duration.10_seconds"),
+        ("30 秒", "settings.option.duration.30_seconds"),
+        ("1 分钟", "settings.option.duration.1_minute"),
+    ),
+    "monitor_interval": (
+        ("自动", "settings.option.duration.auto"),
+        ("10 秒", "settings.option.duration.10_seconds"),
+        ("30 秒", "settings.option.duration.30_seconds"),
+        ("1 分钟", "settings.option.duration.1_minute"),
+        ("5 分钟", "settings.option.duration.5_minutes"),
+    ),
+    "monitor_concurrency": (
+        ("自动", "settings.option.duration.auto"),
+        ("5", "settings.option.number.5"),
+        ("10", "settings.option.number.10"),
+        ("20", "settings.option.number.20"),
+        ("50", "settings.option.number.50"),
+    ),
+    "monitor_debounce": (
+        ("禁用", "settings.option.disabled"),
+        ("30 秒", "settings.option.duration.30_seconds"),
+        ("1 分钟", "settings.option.duration.1_minute"),
+        ("3 分钟", "settings.option.duration.3_minutes"),
+        ("5 分钟", "settings.option.duration.5_minutes"),
+    ),
+    "room_format": (
+        ("", "settings.option.inherit_global"),
+        ("mp4", "settings.option.format.mp4"),
+        ("ts", "settings.option.format.ts"),
+        ("flv", "settings.option.format.flv"),
+    ),
+}
+
+
+def _populate_combo(combo, key, values=None):
+    from ui.i18n import t
+    registered = SETTING_COMBO_OPTIONS.get(key)
+    if registered is None:
+        specs = tuple((value, value) for value in (values or ()))
+    elif values is None:
+        specs = registered
+    else:
+        labels = dict(registered)
+        specs = tuple((value, labels[value]) for value in values)
+    combo.clear()
+    for value, label_key in specs:
+        combo.addItem(t(label_key), value)
+    return specs
+
+
+def _set_combo_value(combo, value, fallback_index=0):
+    index = combo.findData(value, Qt.UserRole)
+    if index < 0 and combo.itemData(0, Qt.UserRole) is None:
+        index = combo.findText(str(value))
+    combo.setCurrentIndex(index if index >= 0 else fallback_index)
+
+
+class _AddChannelWorkerSignals(QObject):
+    finished = Signal(object, str)
+
+
+class _AddChannelWorker(QRunnable):
+    """在共享线程池中获取直播间信息，避免网络请求阻塞 Qt 主线程。"""
+
+    def __init__(self, text):
+        super().__init__()
+        self.text = text
+        self.signals = _AddChannelWorkerSignals()
+
+    @Slot()
+    def run(self):
+        from core.bili_api import get_bili_info
+
+        try:
+            info = get_bili_info(self.text)
+            error = "" if info else "获取直播间信息失败，请检查输入"
+            self.signals.finished.emit(info, error)
+        except Exception as exc:
+            logging.exception("获取直播间信息失败")
+            self.signals.finished.emit(None, str(exc) or "获取直播间信息失败，请检查输入")
 
 
 class NoWheelComboBox(QComboBox):
@@ -25,44 +183,41 @@ class AddChannelDialog(QDialog):
     """添加直播间对话框"""
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("添加直播间")
+        from ui.i18n import t
+        self.setWindowTitle(t("add_room.title"))
         self.setModal(True)
         self.setFixedSize(400, 200)
         self.result = None  # 保存获取到的房间信息
+        self._add_worker = None
+        self._loading_frame = 0
+        self._loading_timer = QTimer(self)
+        self._loading_timer.setInterval(360)
+        self._loading_timer.timeout.connect(self._advance_loading_animation)
         self.setup_ui()
 
     def setup_ui(self):
+        from ui.i18n import t
         layout = QVBoxLayout(self)
         layout.setContentsMargins(24, 24, 24, 24)
         layout.setSpacing(16)
 
         # 提示标签
-        tip_label = QLabel("请输入直播间号或完整链接")
-        tip_label.setStyleSheet("color: #94A3B8; font-size: 13px;")
+        tip_label = QLabel(t("add_room.tip"))
+        tip_label.setProperty("role", "secondary")
+        tip_label.setStyleSheet("font-size: 13px;")
         layout.addWidget(tip_label)
 
         # 输入框
         self.input = QLineEdit()
-        self.input.setPlaceholderText("例如：23058 或 https://live.bilibili.com/23058")
-        self.input.setStyleSheet("""
-            QLineEdit {
-                background-color: #181920;
-                border: 1px solid #2D2E3A;
-                border-radius: 10px;
-                padding: 12px 16px;
-                color: #E2E8F0;
-                font-size: 14px;
-            }
-            QLineEdit:focus {
-                border: 1px solid #3B82F6;
-            }
-        """)
+        self.input.setPlaceholderText(t("add_room.placeholder"))
+        self.input.setStyleSheet("padding: 12px 16px; font-size: 14px;")
         self.input.returnPressed.connect(self.confirm)
         layout.addWidget(self.input)
-        
+
         # 错误提示标签（初始隐藏）
-        self.error_label = QLabel("获取直播间信息失败，请检查输入")
-        self.error_label.setStyleSheet("color: #EF4444; font-size: 12px;")
+        self.error_label = QLabel(t("add_room.error"))
+        self.error_label.setProperty("statusTone", "danger")
+        self.error_label.setStyleSheet("font-size: 12px;")
         self.error_label.setVisible(False)
         layout.addWidget(self.error_label)
 
@@ -70,80 +225,75 @@ class AddChannelDialog(QDialog):
         btn_layout = QHBoxLayout()
         btn_layout.addStretch()
 
-        cancel_btn = QPushButton("取消")
+        cancel_btn = QPushButton(t("common.cancel"))
         cancel_btn.setFixedWidth(100)
-        cancel_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #252631;
-                color: #94A3B8;
-                border-radius: 10px;
-                padding: 10px 24px;
-                font-size: 14px;
-                border: none;
-            }
-            QPushButton:hover {
-                background-color: #2D2E3A;
-                color: white;
-            }
-        """)
+        cancel_btn.setProperty("variant", "secondary")
+        cancel_btn.setStyleSheet("border: none;")
         cancel_btn.clicked.connect(self.reject)
         btn_layout.addWidget(cancel_btn)
 
-        self.confirm_btn = QPushButton("添加")
+        self.confirm_btn = QPushButton(t("add_room.confirm"))
         self.confirm_btn.setFixedWidth(100)
-        self.confirm_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #3B82F6;
-                color: white;
-                border-radius: 10px;
-                padding: 10px 24px;
-                font-size: 14px;
-                font-weight: 600;
-                border: none;
-            }
-            QPushButton:hover {
-                background-color: #2563EB;
-            }
-            QPushButton:disabled {
-                background-color: #252631;
-                color: #64748B;
-            }
-        """)
+        self.confirm_btn.setProperty("variant", "primary")
         self.confirm_btn.clicked.connect(self.confirm)
         btn_layout.addWidget(self.confirm_btn)
 
         layout.addLayout(btn_layout)
 
+    def _advance_loading_animation(self):
+        from ui.i18n import t
+        self._loading_frame = (self._loading_frame + 1) % 4
+        self.confirm_btn.setText(t("add_room.loading") + "." * self._loading_frame)
+
+    def _start_loading_animation(self):
+        from ui.i18n import t
+        self._loading_frame = 0
+        self.confirm_btn.setText(t("add_room.loading"))
+        self._loading_timer.start()
+
+    def _stop_loading_animation(self):
+        from ui.i18n import t
+        self._loading_timer.stop()
+        self._loading_frame = 0
+        self.confirm_btn.setText(t("add_room.confirm"))
+
     def confirm(self):
         text = self.input.text().strip()
         if not text:
             return
-        
+
         # 禁用按钮避免重复点击
         self.confirm_btn.setEnabled(False)
-        self.confirm_btn.setText("添加...")
+        self._start_loading_animation()
         self.error_label.setVisible(False)
-        
-        # 使用 QTimer.singleShot 立即返回，让按钮先更新
-        QTimer.singleShot(0, lambda: self._do_add(text))
-    
+
+        self.input.setEnabled(False)
+        self._do_add(text)
+
     def _do_add(self, text):
-        from core.bili_api import get_bili_info
-        try:
-            info = get_bili_info(text)
-            if info:
-                self.result = info
-                self.accept()
-            else:
-                self.error_label.setVisible(True)
-                QTimer.singleShot(3000, lambda: self.error_label.setVisible(False))
-        except Exception as e:
-            self.error_label.setVisible(True)
-            QTimer.singleShot(3000, lambda: self.error_label.setVisible(False))
-        finally:
-            # 恢复按钮
-            self.confirm_btn.setEnabled(True)
-            self.confirm_btn.setText("添加")
+        worker = _AddChannelWorker(text)
+        self._add_worker = worker
+        worker.signals.finished.connect(self._on_add_finished)
+        QThreadPool.globalInstance().start(worker)
+
+    @Slot(object, str)
+    def _on_add_finished(self, info, error):
+        from ui.i18n import t
+        self._add_worker = None
+        self._stop_loading_animation()
+        self.confirm_btn.setEnabled(True)
+        self.confirm_btn.setText(t("add_room.confirm"))
+        self.input.setEnabled(True)
+
+        if info:
+            self.result = info
+            self.accept()
+            return
+
+        self.error_label.setText(error or t("add_room.error"))
+        self.error_label.setVisible(True)
+        self.input.setFocus()
+        QTimer.singleShot(3000, lambda: self.error_label.setVisible(False))
 
 
 class RoomSettingsDialog(QDialog):
@@ -173,7 +323,7 @@ class RoomSettingsDialog(QDialog):
 
         # 输出格式
         self.format_combo = NoWheelComboBox()
-        self.format_combo.addItems(["继承全局", "mp4", "ts", "flv"])
+        _populate_combo(self.format_combo, "room_format")
         form_layout.addRow(QLabel("输出格式:"), self.format_combo)
 
         # 清晰度
@@ -193,7 +343,7 @@ class RoomSettingsDialog(QDialog):
         button_layout = QHBoxLayout()
         button_layout.addStretch()
 
-        cancel_btn = QPushButton("取消")
+        cancel_btn = QPushButton(__import__("ui.i18n", fromlist=["t"]).t("common.cancel"))
         cancel_btn.setFixedWidth(100)
         cancel_btn.setStyleSheet("""
             QPushButton {
@@ -210,7 +360,7 @@ class RoomSettingsDialog(QDialog):
         cancel_btn.clicked.connect(self.reject)
         button_layout.addWidget(cancel_btn)
 
-        save_btn = QPushButton("保存")
+        save_btn = QPushButton(__import__("ui.i18n", fromlist=["t"]).t("common.save"))
         save_btn.setFixedWidth(100)
         save_btn.setStyleSheet("""
             QPushButton {
@@ -238,7 +388,7 @@ class RoomSettingsDialog(QDialog):
         if format_value == "":
             self.format_combo.setCurrentIndex(0)
         else:
-            index = self.format_combo.findText(format_value)
+            index = self.format_combo.findData(format_value, Qt.UserRole)
             if index >= 0:
                 self.format_combo.setCurrentIndex(index)
         
@@ -252,7 +402,7 @@ class RoomSettingsDialog(QDialog):
         if self.format_combo.currentIndex() == 0:
             cfg["format"] = ""
         else:
-            cfg["format"] = self.format_combo.currentText()
+            cfg["format"] = self.format_combo.currentData(Qt.UserRole)
         
         try:
             cfg["quality"] = int(self.quality_input.text())
@@ -403,11 +553,11 @@ class GlobalSettingsPage(QWidget):
         stream_layout.setSpacing(12)
 
         self.stream_codec_combo = NoWheelComboBox()
-        self.stream_codec_combo.addItems(["av1", "hevc", "h264"])
+        _populate_combo(self.stream_codec_combo, "stream_codec", ("av1", "hevc", "h264"))
         stream_layout.addRow(QLabel("优先编码:"), self.stream_codec_combo)
 
         self.stream_resolution_combo = NoWheelComboBox()
-        self.stream_resolution_combo.addItems(["原画", "超清", "高清", "流畅"])
+        _populate_combo(self.stream_resolution_combo, "stream_resolution")
         stream_layout.addRow(QLabel("清晰度:"), self.stream_resolution_combo)
 
         self.auto_switch_check = QCheckBox("自动切换更好的流")
@@ -428,7 +578,7 @@ class GlobalSettingsPage(QWidget):
         form_layout.addRow(QLabel("默认保存目录:"), self.save_dir_input)
 
         self.convert_format_combo = NoWheelComboBox()
-        self.convert_format_combo.addItems(["mp4", "ts", "flv"])
+        _populate_combo(self.convert_format_combo, "convert_format", ("mp4", "ts", "flv"))
         form_layout.addRow(QLabel("输出格式:"), self.convert_format_combo)
 
         layout.addLayout(form_layout)
@@ -442,15 +592,15 @@ class GlobalSettingsPage(QWidget):
         self.auto_switch_check.setChecked(get_global_setting("auto_switch_stream"))
         self.save_dir_input.setText(get_global_setting("save_dir"))
 
-        codec_index = self.stream_codec_combo.findText(get_global_setting("stream_codec"))
+        codec_index = self.stream_codec_combo.findData(get_global_setting("stream_codec"), Qt.UserRole)
         if codec_index >= 0:
             self.stream_codec_combo.setCurrentIndex(codec_index)
 
-        res_index = self.stream_resolution_combo.findText(get_global_setting("stream_resolution"))
+        res_index = self.stream_resolution_combo.findData(get_global_setting("stream_resolution"), Qt.UserRole)
         if res_index >= 0:
             self.stream_resolution_combo.setCurrentIndex(res_index)
 
-        fmt_index = self.convert_format_combo.findText(get_global_setting("convert_format"))
+        fmt_index = self.convert_format_combo.findData(get_global_setting("convert_format"), Qt.UserRole)
         if fmt_index >= 0:
             self.convert_format_combo.setCurrentIndex(fmt_index)
 
@@ -460,13 +610,13 @@ class GlobalSettingsPage(QWidget):
         set_global_setting("split_by_size", self.split_size_input.text())
         set_global_setting("split_on_title_change", self.split_title_check.isChecked())
         set_global_setting("split_on_category_change", self.split_category_check.isChecked())
-        set_global_setting("stream_codec", self.stream_codec_combo.currentText())
-        set_global_setting("stream_resolution", self.stream_resolution_combo.currentText())
+        set_global_setting("stream_codec", self.stream_codec_combo.currentData(Qt.UserRole))
+        set_global_setting("stream_resolution", self.stream_resolution_combo.currentData(Qt.UserRole))
         set_global_setting("auto_switch_stream", self.auto_switch_check.isChecked())
         
         # 保存保存设置
         set_global_setting("save_dir", self.save_dir_input.text())
-        set_global_setting("convert_format", self.convert_format_combo.currentText())
+        set_global_setting("convert_format", self.convert_format_combo.currentData(Qt.UserRole))
         self.saved.emit()
 
 
@@ -477,81 +627,17 @@ class GlobalSettingsOldStyleReplicaPage(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._controls = {}
+        # (widget, key, kind, prefix)：语言切换时批量刷新
+        # kind: text | placeholder | button
+        self._i18n_bindings = []
+        self._combo_bindings = []
+        from ui.i18n import language_manager
+        language_manager().changed.connect(self.retranslate_ui)
         self._build_ui()
         self._load_values()
 
     def _build_ui(self):
-        self.setStyleSheet("""
-            QWidget {
-                background-color: transparent;
-                color: #E2E8F0;
-            }
-            QFrame#settingsCard {
-                background-color: #1A1B21;
-                border: 1px solid #272833;
-                border-radius: 14px;
-            }
-            QFrame#settingDivider {
-                background-color: #252631;
-                min-height: 1px;
-                max-height: 1px;
-                border: none;
-            }
-            QLabel[role="title"] {
-                color: #F8FAFC;
-                font-size: 15px;
-                font-weight: 700;
-            }
-            QLabel[role="desc"] {
-                color: #94A3B8;
-                font-size: 12px;
-            }
-            QLabel[role="itemTitle"] {
-                color: #E2E8F0;
-                font-size: 13px;
-                font-weight: 600;
-            }
-            QLabel[role="itemDesc"] {
-                color: #94A3B8;
-                font-size: 12px;
-            }
-            QLineEdit, QComboBox, QTextEdit {
-                background-color: #15161D;
-                border: 1px solid #2D2E3A;
-                border-radius: 10px;
-                padding: 8px 10px;
-                color: #E2E8F0;
-                font-size: 13px;
-            }
-            QLineEdit:focus, QComboBox:focus, QTextEdit:focus {
-                border: 1px solid #3B82F6;
-            }
-            QCheckBox {
-                color: #CBD5E1;
-                spacing: 8px;
-                font-size: 13px;
-            }
-            QPushButton {
-                background-color: #252631;
-                color: #E2E8F0;
-                border: none;
-                border-radius: 10px;
-                padding: 9px 14px;
-                font-size: 13px;
-                font-weight: 600;
-            }
-            QPushButton:hover {
-                background-color: #2D2E3A;
-            }
-            QPushButton#primaryBtn {
-                background-color: #3B82F6;
-                color: white;
-            }
-            QPushButton#primaryBtn:hover {
-                background-color: #2563EB;
-            }
-        """)
-
+        # 颜色由应用级主题 QSS 控制（ui/theme.py）；这里不设局部样式。
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
@@ -563,24 +649,21 @@ class GlobalSettingsOldStyleReplicaPage(QWidget):
         header_left = QHBoxLayout()
         header_left.setSpacing(10)
         icon = QLabel("⚙")
-        icon.setStyleSheet("color: #2D9CDB; font-size: 22px; font-weight: 700;")
-        title = QLabel("全局设置")
+        icon.setProperty("role", "link")
+        icon.setStyleSheet("font-size: 22px; font-weight: 700;")
+        title = QLabel()
         title.setFont(QFont("Microsoft YaHei UI", 22, QFont.Bold))
-        title.setStyleSheet("color: #F8FAFC;")
+        title.setProperty("role", "title")
+        self._page_title = title
+        self._bind_i18n(title, "settings.window_title")
         header_left.addWidget(icon)
         header_left.addWidget(title)
         header_left.addStretch()
 
-        badge = QLabel("所有更改实时保存，立即生效")
-        badge.setStyleSheet("""
-            color: #4ADE80;
-            background-color: #15251A;
-            border: 1px solid #1E3A26;
-            border-radius: 8px;
-            padding: 6px 10px;
-            font-size: 12px;
-            font-weight: 600;
-        """)
+        badge = QLabel()
+        badge.setObjectName("saveBadge")
+        self._page_badge = badge
+        self._bind_i18n(badge, "settings.badge")
 
         header.addLayout(header_left, 1)
         header.addWidget(badge, 0, Qt.AlignRight | Qt.AlignVCenter)
@@ -590,25 +673,6 @@ class GlobalSettingsOldStyleReplicaPage(QWidget):
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.NoFrame)
-        scroll.setStyleSheet("""
-            QScrollArea {
-                border: none;
-                background: transparent;
-            }
-            QScrollBar:vertical {
-                background-color: #15161D;
-                width: 8px;
-                border-radius: 4px;
-            }
-            QScrollBar::handle:vertical {
-                background-color: #3B3D4F;
-                border-radius: 4px;
-                min-height: 40px;
-            }
-            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
-                height: 0px;
-            }
-        """)
 
         content = QWidget()
         content_layout = QHBoxLayout(content)
@@ -646,14 +710,39 @@ class GlobalSettingsOldStyleReplicaPage(QWidget):
         content_layout.addWidget(right_wrap, 1)
         scroll.setWidget(content)
         root.addWidget(scroll, 1)
+        # 非默认语言启动时，外观卡/页头按当前语言显示
+        self.retranslate_ui()
 
     # 通知模板默认值
     # Template defaults are now in config.py
     # Template defaults are now in config.py
 
-    def _setting_card(self, title_text, color, items):
+    def _bind_i18n(self, widget, key, kind="text", prefix=""):
+        """登记可热更文案；立即按当前语言填充。"""
+        self._i18n_bindings.append((widget, key, kind, prefix))
+        self._apply_i18n_binding(widget, key, kind, prefix)
+        return widget
+
+    def _apply_i18n_binding(self, widget, key, kind="text", prefix=""):
+        from ui.i18n import t
+        text = f"{prefix}{t(key)}" if prefix else t(key)
+        if kind == "placeholder":
+            widget.setPlaceholderText(text)
+        else:
+            widget.setText(text)
+
+    @staticmethod
+    def _compact_button(button, *, height, min_width=0):
+        button.setProperty("settingsCompact", True)
+        button.setFixedHeight(height)
+        if min_width:
+            button.setMinimumWidth(min_width)
+        return button
+
+    def _setting_card(self, title_key, color, items, title_prefix=""):
         card = QFrame()
         card.setObjectName("settingsCard")
+        enable_surface(card)
         layout = QVBoxLayout(card)
         layout.setContentsMargins(18, 18, 18, 18)
         layout.setSpacing(14)
@@ -665,8 +754,9 @@ class GlobalSettingsOldStyleReplicaPage(QWidget):
         accent.setFixedWidth(4)
         accent.setStyleSheet(f"background-color: {color}; border-radius: 2px; border: none;")
 
-        title = QLabel(title_text)
+        title = QLabel()
         title.setProperty("role", "title")
+        self._bind_i18n(title, title_key, prefix=title_prefix)
 
         header.addWidget(accent)
         header.addWidget(title)
@@ -684,7 +774,7 @@ class GlobalSettingsOldStyleReplicaPage(QWidget):
         line.setObjectName("settingDivider")
         return line
 
-    def _setting_item(self, title_text, desc_text, control, reset_widget=None):
+    def _setting_item(self, title_key, desc_key, control, reset_widget=None):
         wrapper = QWidget()
         layout = QHBoxLayout(wrapper)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -694,11 +784,13 @@ class GlobalSettingsOldStyleReplicaPage(QWidget):
         text_col.setContentsMargins(0, 0, 0, 0)
         text_col.setSpacing(4)
 
-        title = QLabel(title_text)
+        title = QLabel()
         title.setProperty("role", "itemTitle")
-        desc = QLabel(desc_text)
+        self._bind_i18n(title, title_key)
+        desc = QLabel()
         desc.setProperty("role", "itemDesc")
         desc.setWordWrap(True)
+        self._bind_i18n(desc, desc_key)
 
         text_col.addWidget(title)
         text_col.addWidget(desc)
@@ -711,38 +803,12 @@ class GlobalSettingsOldStyleReplicaPage(QWidget):
 
     def _reset_button(self, key, default_value):
         """生成两阶段确认重置按钮（点重置 -> 显示确认重置 -> 点确认才执行）"""
-        btn = QPushButton("重置")
-        btn.setFixedSize(60, 28)
-        btn.setStyleSheet("""
-            QPushButton {
-                background: transparent;
-                border: 1px solid #3D3E4A;
-                border-radius: 6px;
-                color: #94A3B8;
-                font-size: 11px;
-                padding: 0 8px;
-            }
-            QPushButton:hover {
-                background: #2D2E3A;
-                color: #F87171;
-                border-color: #F87171;
-            }
-        """)
-        confirm = QPushButton("确认重置")
-        confirm.setFixedSize(60, 28)
-        confirm.setStyleSheet("""
-            QPushButton {
-                background: #EF4444;
-                border: none;
-                border-radius: 6px;
-                color: white;
-                font-size: 11px;
-                padding: 0 8px;
-            }
-            QPushButton:hover {
-                background: #DC2626;
-            }
-        """)
+        btn = self._compact_button(QPushButton(), height=28, min_width=60)
+        btn.setProperty("variant", "reset")
+        self._bind_i18n(btn, "settings.action.reset")
+        confirm = self._compact_button(QPushButton(), height=28, min_width=60)
+        confirm.setProperty("variant", "danger")
+        self._bind_i18n(confirm, "settings.action.confirm_reset")
         confirm.hide()
 
         def _on_reset():
@@ -779,18 +845,16 @@ class GlobalSettingsOldStyleReplicaPage(QWidget):
             m.setText(parts[1] if len(parts) > 1 else "00")
             s.setText(parts[2] if len(parts) > 2 else "00")
             return
-        # 单控件:刷新时屏蔽信号,避免触发 currentTextChanged/toggled 又写一次配置
         widget.blockSignals(True)
         try:
             if isinstance(widget, ToggleSwitch):
-                widget.setChecked(bool(default_value))
+                widget.setChecked(bool(default_value), animate=False)
             elif isinstance(widget, QLineEdit):
                 widget.setText(str(default_value) if default_value else "")
             elif isinstance(widget, QTextEdit):
                 widget.setPlainText(str(default_value) if default_value else "")
             elif isinstance(widget, QComboBox):
-                idx = widget.findText(str(default_value))
-                widget.setCurrentIndex(idx if idx >= 0 else 0)
+                _set_combo_value(widget, default_value)
         finally:
             widget.blockSignals(False)
 
@@ -805,7 +869,9 @@ class GlobalSettingsOldStyleReplicaPage(QWidget):
         return widget
 
     def _bind_combo(self, widget, key):
-        widget.currentTextChanged.connect(lambda text, k=key: self._save_setting(k, text))
+        widget.currentIndexChanged.connect(
+            lambda _index, k=key, w=widget: self._save_setting(k, w.currentData(Qt.UserRole))
+        )
         self._controls[key] = widget
         return widget
 
@@ -815,10 +881,11 @@ class GlobalSettingsOldStyleReplicaPage(QWidget):
         widget.setFixedWidth(width)
         return self._bind_line_edit(widget, key)
 
-    def _combo(self, key, options, width=130):
+    def _combo(self, key, options=None, width=130):
         widget = NoWheelComboBox()
-        widget.addItems(options)
+        _populate_combo(widget, key, options)
         widget.setFixedWidth(width)
+        self._combo_bindings.append((widget, key, tuple(options) if options else None))
         return self._bind_combo(widget, key)
 
     def _check(self, key):
@@ -832,8 +899,8 @@ class GlobalSettingsOldStyleReplicaPage(QWidget):
         layout.setSpacing(8)
 
         line_edit = self._line_edit(key, hint, width)
-        button = QPushButton("📁")
-        button.setFixedSize(42, 40)
+        button = self._compact_button(QPushButton("📁"), height=40)
+        button.setFixedWidth(42)
         button.setToolTip("选择文件夹")
         button.clicked.connect(lambda: self._choose_directory(key, line_edit))
 
@@ -847,12 +914,14 @@ class GlobalSettingsOldStyleReplicaPage(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(8)
         summary = QLabel()
-        summary.setStyleSheet("color: #64748B; font-size: 12px;")
+        summary.setProperty("role", "muted")
+        summary.setStyleSheet("font-size: 12px;")
         if not hasattr(self, "_template_summary_labels"):
             self._template_summary_labels = {}
         self._template_summary_labels[key] = summary
         self._update_template_summary(key)
-        button = QPushButton("编辑路径模板")
+        button = QPushButton()
+        self._bind_i18n(button, "settings.action.edit_template")
         button.setFixedWidth(140)
         button.clicked.connect(lambda: self._open_path_template_overlay(key))
         layout.addStretch()
@@ -861,20 +930,37 @@ class GlobalSettingsOldStyleReplicaPage(QWidget):
         return wrapper
 
     def _build_appearance_card(self):
-        return self._setting_card("外观", "#7B61FF", [
-            self._setting_item("语言", "界面显示语言",
-                self._combo("language", ["简体中文"], 120),
+        return self._setting_card("settings.appearance", "#7B61FF", [
+            self._setting_item("settings.appearance.language", "settings.appearance.language_desc",
+                self._combo("language", width=140),
                 self._reset_button("language", DEFAULT_GLOBAL_SETTINGS["language"])),
-            self._setting_item("主题", "应用主题模式",
-                self._combo("theme", ["深色"], 120),
+            self._setting_item("settings.appearance.theme", "settings.appearance.theme_desc",
+                self._combo("theme", width=120),
                 self._reset_button("theme", DEFAULT_GLOBAL_SETTINGS["theme"])),
         ])
+
+    def retranslate_ui(self):
+        """语言切换时重译设置页所有已绑定文案。"""
+        for widget, key, kind, prefix in list(getattr(self, "_i18n_bindings", [])):
+            try:
+                self._apply_i18n_binding(widget, key, kind, prefix)
+            except RuntimeError:
+                continue
+        for widget, key, options in list(getattr(self, "_combo_bindings", [])):
+            try:
+                selected = widget.currentData(Qt.UserRole)
+                blocker = QSignalBlocker(widget)
+                _populate_combo(widget, key, options)
+                _set_combo_value(widget, selected)
+                del blocker
+            except RuntimeError:
+                continue
 
     @staticmethod
     def _format_bytes(val: int) -> str:
         """把字节数格式化成可读字符串"""
         if val <= 0:
-            return "禁用"
+            from ui.i18n import t as _t_dis; return _t_dis("settings.common.disabled")
         if val < 1024:
             return f"{val} B"
         if val < 1024 ** 2:
@@ -894,7 +980,7 @@ class GlobalSettingsOldStyleReplicaPage(QWidget):
 
         # 半透明遮罩
         mask = QWidget(root)
-        mask.setStyleSheet("background: rgba(0,0,0,0.55);")
+        mask.setObjectName("modalOverlay")
         mask.resize(root.size())
         mask.move(0, 0)
         mask.show()
@@ -902,19 +988,9 @@ class GlobalSettingsOldStyleReplicaPage(QWidget):
 
         # 面板
         panel = QFrame(root)
-        panel.setObjectName("sizePanel")
+        panel.setObjectName("settingsOverlayPanel")
+        enable_surface(panel)
         panel.setFixedSize(440, 290)
-        panel.setStyleSheet("""
-            QFrame#sizePanel {
-                background: #1A1B21;
-                border: 1px solid #2D2E3A;
-                border-radius: 14px;
-            }
-            QLabel {
-                background: transparent;
-                color: #E2E8F0;
-            }
-        """)
         # 居中定位
         cx = (root.width() - panel.width()) // 2
         cy = (root.height() - panel.height()) // 2
@@ -927,14 +1003,16 @@ class GlobalSettingsOldStyleReplicaPage(QWidget):
         vbox.setSpacing(16)
 
         # 标题
-        title = QLabel("按文件大小分割")
-        title.setStyleSheet("color: #E2E8F0; font-size: 17px; font-weight: 600; background: transparent;")
+        from ui.i18n import t as _t_ov; title = QLabel(_t_ov("settings.overlay.size_title"))
+        title.setProperty("role", "title")
+        title.setStyleSheet("font-size: 17px; font-weight: 600;")
         vbox.addWidget(title)
 
         # 禁用/启用行
         enabled_row = QHBoxLayout()
-        enabled_lbl = QLabel("启用")
-        enabled_lbl.setStyleSheet("color: #CBD5E1; font-size: 15px; background: transparent;")
+        enabled_lbl = QLabel(_t_ov("settings.overlay.enable"))
+        enabled_lbl.setProperty("role", "itemTitle")
+        enabled_lbl.setStyleSheet("font-size: 15px;")
         enabled_toggle = ToggleSwitch()
         enabled_row.addWidget(enabled_lbl)
         enabled_row.addStretch()
@@ -944,22 +1022,20 @@ class GlobalSettingsOldStyleReplicaPage(QWidget):
         # 输入行
         input_row = QHBoxLayout()
         inp = QLineEdit()
-        inp.setPlaceholderText("输入字节数")
+        inp.setPlaceholderText(_t_ov("settings.overlay.bytes_placeholder"))
         inp.setFixedWidth(180)
-        inp.setStyleSheet("""
-            QLineEdit {
-                background: #252631; border: 1px solid #2D2E3A;
-                border-radius: 8px; padding: 10px 14px;
-                color: #E2E8F0; font-size: 16px;
-            }
-            QLineEdit:focus { border: 1px solid #3B82F6; }
-            QLineEdit:disabled { color: #4B5563; background: #1A1B21; }
-        """)
-        unit_lbl = QLabel("字节")
-        unit_lbl.setStyleSheet("color: #64748B; font-size: 13px; background: transparent;")
+        inp.setStyleSheet("font-size: 16px;")
+        unit_lbl = QLabel(_t_ov("settings.overlay.bytes_unit"))
+        unit_lbl.setProperty("role", "muted")
 
         preview = QLabel("—")
-        preview.setStyleSheet("color: #64748B; font-size: 13px; min-width: 110px; background: transparent;")
+        preview.setProperty("statusTone", "neutral")
+        preview.setStyleSheet("font-size: 13px; min-width: 110px;")
+
+        def _set_preview_tone(tone):
+            from ui.theme import repolish
+            preview.setProperty("statusTone", tone)
+            repolish(preview)
 
         def _update_preview(text):
             # 合并过滤 + 显示，避免双重 textChanged 触发
@@ -972,13 +1048,13 @@ class GlobalSettingsOldStyleReplicaPage(QWidget):
             val = int(text) if text.strip() else 0
             if val == 0:
                 preview.setText("—")
-                preview.setStyleSheet("color: #64748B; font-size: 13px; min-width: 110px; background: transparent;")
+                _set_preview_tone("neutral")
             elif val < 10 * 1024 * 1024:
                 preview.setText(f"≈ {self._format_bytes(val)}  ⚠️ 建议 ≥ 10 MB")
-                preview.setStyleSheet("color: #F59E0B; font-size: 13px; min-width: 110px; background: transparent;")
+                _set_preview_tone("warning")
             else:
                 preview.setText(f"≈ {self._format_bytes(val)}")
-                preview.setStyleSheet("color: #60A5FA; font-size: 13px; min-width: 110px; background: transparent;")
+                _set_preview_tone("info")
 
         inp.textChanged.connect(_update_preview)
 
@@ -1000,38 +1076,31 @@ class GlobalSettingsOldStyleReplicaPage(QWidget):
         inp.setEnabled(is_enabled)
         if cur_val > 0:
             preview.setText(f"≈ {self._format_bytes(cur_val)}")
-            preview.setStyleSheet("color: #60A5FA; font-size: 13px; min-width: 110px; background: transparent;")
+            _set_preview_tone("info")
 
         def _on_toggle(checked):
             inp.setEnabled(checked)
             if not checked:
                 inp.setText("")
                 preview.setText("—")
-                preview.setStyleSheet("color: #64748B; font-size: 13px; min-width: 110px; background: transparent;")
+                _set_preview_tone("neutral")
         enabled_toggle.toggled.connect(_on_toggle)
 
         # 按钮行
         btn_row = QHBoxLayout()
-        cancel_btn = QPushButton("取消")
-        cancel_btn.setFixedWidth(90)
-        cancel_btn.setFixedHeight(36)
-        cancel_btn.setStyleSheet("""
-            QPushButton {
-                background: #2D2E3A; border: none; border-radius: 8px;
-                color: #94A3B8; font-size: 13px;
-            }
-            QPushButton:hover { background: #374151; color: white; }
-        """)
-        save_btn = QPushButton("保存")
-        save_btn.setFixedWidth(90)
-        save_btn.setFixedHeight(36)
-        save_btn.setStyleSheet("""
-            QPushButton {
-                background: #3B82F6; border: none; border-radius: 8px;
-                color: white; font-size: 13px; font-weight: 600;
-            }
-            QPushButton:hover { background: #2563EB; }
-        """)
+        cancel_btn = self._compact_button(
+            QPushButton(__import__("ui.i18n", fromlist=["t"]).t("common.cancel")),
+            height=36,
+            min_width=90,
+        )
+        cancel_btn.setProperty("variant", "secondary")
+        cancel_btn.setStyleSheet("border: none;")
+        save_btn = self._compact_button(
+            QPushButton(__import__("ui.i18n", fromlist=["t"]).t("common.save")),
+            height=36,
+            min_width=90,
+        )
+        save_btn.setProperty("variant", "primary")
 
         def _close():
             panel.hide(); panel.deleteLater()
@@ -1070,17 +1139,7 @@ class GlobalSettingsOldStyleReplicaPage(QWidget):
             b.setFixedWidth(52)
             b.setAlignment(Qt.AlignCenter)
             b.setValidator(QIntValidator(0, max_val))
-            b.setStyleSheet("""
-                QLineEdit {
-                    background: #181920;
-                    border: 1px solid #2D2E3A;
-                    border-radius: 8px;
-                    padding: 6px 4px;
-                    color: #E2E8F0;
-                    font-size: 14px;
-                }
-                QLineEdit:focus { border: 1px solid #3B82F6; }
-            """)
+            b.setStyleSheet("padding: 6px 4px; font-size: 14px;")
             return b
 
         h_box = _small_box("时", 99)
@@ -1089,7 +1148,8 @@ class GlobalSettingsOldStyleReplicaPage(QWidget):
 
         def _sep():
             lbl = QLabel(":")
-            lbl.setStyleSheet("color: #64748B; font-size: 16px;")
+            lbl.setProperty("role", "muted")
+            lbl.setStyleSheet("font-size: 16px;")
             return lbl
 
         def _on_change(_=None):
@@ -1106,19 +1166,10 @@ class GlobalSettingsOldStyleReplicaPage(QWidget):
         m_box.textChanged.connect(_on_change)
         s_box.textChanged.connect(_on_change)
 
-        reset_btn = QPushButton("重置")
-        reset_btn.setFixedWidth(48)
-        reset_btn.setFixedHeight(34)
-        reset_btn.setStyleSheet("""
-            QPushButton {
-                background: #2D2E3A;
-                border: none;
-                border-radius: 8px;
-                color: #94A3B8;
-                font-size: 12px;
-            }
-            QPushButton:hover { background: #3B82F6; color: white; }
-        """)
+        reset_btn = self._compact_button(QPushButton(), height=34, min_width=48)
+        self._bind_i18n(reset_btn, "settings.action.reset")
+        reset_btn.setProperty("variant", "secondary")
+        reset_btn.setStyleSheet("border: none;")
 
         def _reset():
             default = DEFAULT_GLOBAL_SETTINGS["split_by_duration"]
@@ -1148,8 +1199,10 @@ class GlobalSettingsOldStyleReplicaPage(QWidget):
         size_row.setSpacing(8)
 
         # 摘要标签
-        summary = QLabel("禁用")
-        summary.setStyleSheet("color: #64748B; font-size: 13px;")
+        summary = QLabel()
+        summary.setProperty("role", "muted")
+        summary.setStyleSheet("font-size: 13px;")
+        self._bind_i18n(summary, "settings.common.disabled")
         raw = get_global_setting("split_by_size")
         try:
             init_val = int(raw) if raw and str(raw).isdigit() else 0
@@ -1158,31 +1211,19 @@ class GlobalSettingsOldStyleReplicaPage(QWidget):
         summary.setText(self._format_bytes(init_val))
         self._size_summary_label = summary
 
-        edit_btn = QPushButton("编辑")
-        edit_btn.setFixedWidth(52)
-        edit_btn.setFixedHeight(30)
-        edit_btn.setStyleSheet("""
-            QPushButton { background: #2D2E3A; border: none; border-radius: 8px; color: #94A3B8; font-size: 12px; }
-            QPushButton:hover { background: #3B82F6; color: white; }
-        """)
+        edit_btn = self._compact_button(QPushButton(), height=30, min_width=52)
+        self._bind_i18n(edit_btn, "settings.action.edit")
+        edit_btn.setProperty("variant", "secondary")
+        edit_btn.setStyleSheet("border: none;")
         edit_btn.clicked.connect(lambda: self._open_size_overlay())
 
-        reset_btn = QPushButton("重置")
-        reset_btn.setFixedWidth(52)
-        reset_btn.setFixedHeight(30)
-        reset_btn.setStyleSheet("""
-            QPushButton { background: transparent; border: 1px solid #3D3E4A; border-radius: 6px; color: #94A3B8; font-size: 11px; padding: 0 8px; }
-            QPushButton:hover { background: #2D2E3A; color: #F87171; border-color: #F87171; }
-        """)
-        confirm_btn = QPushButton("确认重置")
-        confirm_btn.setFixedWidth(60)
-        confirm_btn.setFixedHeight(30)
-        confirm_btn.setStyleSheet("""
-            QPushButton { background: #EF4444; border: none; border-radius: 6px; color: white; font-size: 11px; padding: 0 8px; }
-            QPushButton:hover { background: #DC2626; }
-        """)
+        reset_btn = self._compact_button(QPushButton(), height=30, min_width=52)
+        self._bind_i18n(reset_btn, "settings.action.reset")
+        reset_btn.setProperty("variant", "reset")
+        confirm_btn = self._compact_button(QPushButton(), height=30, min_width=60)
+        self._bind_i18n(confirm_btn, "settings.action.confirm_reset")
+        confirm_btn.setProperty("variant", "danger")
         confirm_btn.hide()
-        confirm_btn.setFixedHeight(30)
 
         def _on_size_reset():
             reset_btn.hide()
@@ -1190,7 +1231,7 @@ class GlobalSettingsOldStyleReplicaPage(QWidget):
 
         def _do_size_reset():
             self._save_setting("split_by_size", "")
-            summary.setText("禁用")
+            from ui.i18n import t as _t_dis; summary.setText(_t_dis("settings.common.disabled"))
             confirm_btn.hide()
             reset_btn.show()
 
@@ -1203,21 +1244,21 @@ class GlobalSettingsOldStyleReplicaPage(QWidget):
         size_row.addWidget(reset_btn)
         size_row.addWidget(confirm_btn)
 
-        return self._setting_card("✂️ 文件分割", "#EB5757", [
-            self._setting_item("文件大小", "输入字节数，留空或 0 表示不使用", size_wrapper),
-            self._setting_item("视频时长", "留空或 00:00:00 表示不使用，默认 1 小时",
+        return self._setting_card("settings.group.file_split", "#EB5757", [
+            self._setting_item("settings.split.size", "settings.split.size_desc", size_wrapper),
+            self._setting_item("settings.split.duration", "settings.split.duration_desc",
                 self._build_duration_input(),
                 self._reset_button("split_by_duration", DEFAULT_GLOBAL_SETTINGS["split_by_duration"])),
-            self._setting_item("编码改变", "在编码改变处自动切割文件",
+            self._setting_item("settings.split.codec", "settings.split.codec_desc",
                 self._check("split_on_codec_change"),
                 self._reset_button("split_on_codec_change", DEFAULT_GLOBAL_SETTINGS["split_on_codec_change"])),
-            self._setting_item("流不连续", "在流不连续处自动切割文件",
+            self._setting_item("settings.split.discontinuity", "settings.split.discontinuity_desc",
                 self._check("split_on_stream_discontinuity"),
                 self._reset_button("split_on_stream_discontinuity", DEFAULT_GLOBAL_SETTINGS["split_on_stream_discontinuity"])),
-            self._setting_item("标题改变", "直播标题改变时自动切割",
+            self._setting_item("settings.split.title", "settings.split.title_desc",
                 self._check("split_on_title_change"),
                 self._reset_button("split_on_title_change", DEFAULT_GLOBAL_SETTINGS["split_on_title_change"])),
-            self._setting_item("类别改变", "直播类别改变时自动切割",
+            self._setting_item("settings.split.category", "settings.split.category_desc",
                 self._check("split_on_category_change"),
                 self._reset_button("split_on_category_change", DEFAULT_GLOBAL_SETTINGS["split_on_category_change"])),
         ])
@@ -1228,57 +1269,71 @@ class GlobalSettingsOldStyleReplicaPage(QWidget):
         row.setContentsMargins(0, 0, 0, 0)
         row.setSpacing(8)
 
-        mode_combo = self._combo("proxy_mode", ["禁用", "系统", "自定义"], 110)
+        mode_combo = self._combo("proxy_mode", width=110)
         proxy_input = self._line_edit("proxy", "http://127.0.0.1:7890", 180)
         bypass_input = self._line_edit("proxy_bypass", "localhost,127.0.0.1", 180)
 
-        def _update_proxy_state(mode_text):
-            enabled = (mode_text == "自定义")
+        def _update_proxy_state(mode_value):
+            enabled = (mode_value == "自定义")
             proxy_input.setEnabled(enabled)
             bypass_input.setEnabled(enabled)
 
         init_mode = get_global_setting("proxy_mode") or "禁用"
         _update_proxy_state(init_mode)
-        mode_combo.currentTextChanged.connect(_update_proxy_state)
+        mode_combo.currentIndexChanged.connect(
+            lambda _index: _update_proxy_state(mode_combo.currentData(Qt.UserRole))
+        )
 
         row.addWidget(mode_combo)
         row.addWidget(proxy_input)
-        return self._setting_card("🌐 网络", "#27AE60", [
-            self._setting_item("全局代理", "HTTP/SOCKS5 代理地址与模式", proxy_box,
+        return self._setting_card("settings.group.network", "#27AE60", [
+            self._setting_item("settings.network.proxy", "settings.network.proxy_desc", proxy_box,
                 self._reset_button("proxy_mode", DEFAULT_GLOBAL_SETTINGS["proxy_mode"])),
-            self._setting_item("绕过列表", "代理绕过规则，多个用逗号分隔", bypass_input,
+            self._setting_item("settings.network.bypass", "settings.network.bypass_desc", bypass_input,
                 self._reset_button("proxy_bypass", DEFAULT_GLOBAL_SETTINGS["proxy_bypass"])),
         ])
 
     def _build_stream_record_card(self):
-        return self._setting_card("📡 直播流录制", "#2D9CDB", [
-            self._setting_item("启用录制", "全局开关，关闭后所有房间停止录制",
+        return self._setting_card("settings.group.stream", "#2D9CDB", [
+            self._setting_item("settings.stream.enabled", "settings.stream.enabled_desc",
                 self._check("stream_record_enabled"),
                 self._reset_button("stream_record_enabled", DEFAULT_GLOBAL_SETTINGS["stream_record_enabled"])),
-            self._setting_item("允许仅音频", "允许录制仅音频的直播流",
+            self._setting_item("settings.stream.audio_only", "settings.stream.audio_only_desc",
                 self._check("allow_audio_only"),
                 self._reset_button("allow_audio_only", DEFAULT_GLOBAL_SETTINGS["allow_audio_only"])),
-            self._setting_item("自动切换", "有新画质或格式时自动切换流",
+            self._setting_item("settings.stream.auto_switch", "settings.stream.auto_switch_desc",
                 self._check("auto_switch_stream"),
                 self._reset_button("auto_switch_stream", DEFAULT_GLOBAL_SETTINGS["auto_switch_stream"])),
-            self._setting_item("流优先参数", "优先级排序依据",
-                self._combo("stream_priority_param", ["分辨率", "帧率", "码率", "编码", "格式", "网址"], 120),
+            self._setting_item("settings.stream.priority", "settings.stream.priority_desc",
+                self._combo("stream_priority_param", width=120),
                 self._reset_button("stream_priority_param", DEFAULT_GLOBAL_SETTINGS["stream_priority_param"])),
-            self._setting_item("分辨率优先", "优先选择的分辨率",
-                self._combo("stream_resolution", ["原画", "超清", "高清", "流畅"], 110),
+            self._setting_item("settings.stream.resolution", "settings.stream.resolution_desc",
+                self._combo("stream_resolution", width=110),
                 self._reset_button("stream_resolution", DEFAULT_GLOBAL_SETTINGS["stream_resolution"])),
-            self._setting_item("帧率优先", "优先选择的帧率",
-                self._combo("stream_fps", ["30 fps", "60 fps", "120 fps", "25 fps", "20 fps", "15 fps"], 110),
+            self._setting_item("settings.stream.fps", "settings.stream.fps_desc",
+                self._combo("stream_fps", width=110),
                 self._reset_button("stream_fps", DEFAULT_GLOBAL_SETTINGS["stream_fps"])),
-            self._setting_item("码率优先", "优先选择的码率",
+            self._setting_item("settings.stream.bitrate", "settings.stream.bitrate_desc",
                 self._line_edit("stream_bitrate", "30.0 Mb/s", 120),
                 self._reset_button("stream_bitrate", DEFAULT_GLOBAL_SETTINGS["stream_bitrate"])),
-            self._setting_item("编码优先", "优先选择的编码",
-                self._combo("stream_codec", ["av1", "hevc", "h264"], 100),
+            self._setting_item("settings.stream.codec", "settings.stream.codec_desc",
+                self._combo("stream_codec", width=100),
                 self._reset_button("stream_codec", DEFAULT_GLOBAL_SETTINGS["stream_codec"])),
-            self._setting_item("格式优先", "优先选择的封装格式",
-                self._combo("stream_format", ["fmp4", "flv", "ts"], 100),
+            self._setting_item("settings.stream.format", "settings.stream.format_desc",
+                self._combo("stream_format", width=100),
                 self._reset_button("stream_format", DEFAULT_GLOBAL_SETTINGS["stream_format"])),
+            self._setting_item("settings.stream.fallback", "settings.stream.fallback_desc",
+                self._combo("stream_fallback_policy", width=140),
+                self._reset_button("stream_fallback_policy", DEFAULT_GLOBAL_SETTINGS.get("stream_fallback_policy", "compatible"))),
+            self._setting_item("settings.stream.native_flv", "settings.stream.native_flv_desc",
+                self._check("flv_native_capture"),
+                self._reset_button("flv_native_capture", DEFAULT_GLOBAL_SETTINGS.get("flv_native_capture", True))),
+            self._setting_item("settings.stream.keep_source", "settings.stream.keep_source_desc",
+                self._check("artifact_keep_source"),
+                self._reset_button("artifact_keep_source", DEFAULT_GLOBAL_SETTINGS.get("artifact_keep_source", True))),
+            self._setting_item("settings.stream.webhook_verified", "settings.stream.webhook_verified_desc",
+                self._check("webhook_only_verified_artifacts"),
+                self._reset_button("webhook_only_verified_artifacts", DEFAULT_GLOBAL_SETTINGS.get("webhook_only_verified_artifacts", True))),
         ])
 
     def _build_chat_record_card(self):
@@ -1288,21 +1343,16 @@ class GlobalSettingsOldStyleReplicaPage(QWidget):
         cred_row.setContentsMargins(0, 0, 0, 0)
         cred_row.setSpacing(8)
 
-        cred_summary = QLabel("未设置")
-        cred_summary.setStyleSheet("color: #64748B; font-size: 13px; background: transparent;")
-        saved = get_global_setting("chat_credential") or ""
-        if saved:
-            masked = saved[:6] + "..." + saved[-4:] if len(saved) > 10 else "已设置"
-            cred_summary.setText(masked)
+        cred_summary = QLabel()
+        cred_summary.setProperty("role", "muted")
+        cred_summary.setStyleSheet("font-size: 13px;")
+        cred_summary.setText(self._format_credential_summary(get_global_setting("chat_credential") or ""))
         self._cred_summary_label = cred_summary
 
-        edit_btn = QPushButton("编辑")
-        edit_btn.setFixedWidth(52)
-        edit_btn.setFixedHeight(30)
-        edit_btn.setStyleSheet("""
-            QPushButton { background:#2D2E3A; border:none; border-radius:8px; color:#94A3B8; font-size:12px; }
-            QPushButton:hover { background:#3B82F6; color:white; }
-        """)
+        edit_btn = self._compact_button(QPushButton(), height=30, min_width=52)
+        self._bind_i18n(edit_btn, "settings.action.edit")
+        edit_btn.setProperty("variant", "secondary")
+        edit_btn.setStyleSheet("border: none;")
         edit_btn.clicked.connect(self._open_cookie_overlay)
 
         cred_row.addWidget(cred_summary)
@@ -1312,45 +1362,58 @@ class GlobalSettingsOldStyleReplicaPage(QWidget):
         # 凭据重置按钮（清除 cookie）
         def _do_cred_reset():
             self._save_setting("chat_credential", "")
-            self._cred_summary_label.setText("未设置")
+            self._cred_summary_label.setText(self._format_credential_summary(""))
         cred_reset = self._reset_button("chat_credential", "")
 
-        return self._setting_card("💬 聊天消息录制", "#BB6BD9", [
-            self._setting_item("启用", "录制直播间弹幕和聊天消息",
+        return self._setting_card("settings.group.chat", "#BB6BD9", [
+            self._setting_item("settings.chat.enabled", "settings.chat.enabled_desc",
                 self._check("chat_record_enabled"),
                 self._reset_button("chat_record_enabled", DEFAULT_GLOBAL_SETTINGS["chat_record_enabled"])),
-            self._setting_item("凭据", "下载聊天消息使用的 SESSDATA（B站 cookie）",
+            self._setting_item("settings.chat.credential", "settings.chat.credential_desc",
                 cred_widget,
                 cred_reset),
-            self._setting_item("输出格式", "聊天记录保存格式",
-                self._combo("chat_format", ["jsonl 数据", "xml", "ass 弹幕"], 120),
+            self._setting_item("settings.chat.format", "settings.chat.format_desc",
+                self._combo("chat_format", width=120),
                 self._reset_button("chat_format", DEFAULT_GLOBAL_SETTINGS["chat_format"])),
         ])
 
+    @staticmethod
+    def _format_credential_summary(value):
+        from ui.i18n import t
+        text = (value or "").strip()
+        if not text:
+            return t("settings.common.unset")
+        if len(text) > 10:
+            return text[:6] + "..." + text[-4:]
+        return t("settings.common.set")
+
     def _open_cookie_overlay(self):
-        """在设置页内部弹出 cookie 编辑面板"""
+        """全局聊天凭据 cookie 编辑面板。"""
+        self._open_cookie_overlay_impl(
+            load_value=lambda: get_global_setting("chat_credential") or "",
+            save_value=lambda val: self._save_setting("chat_credential", val),
+            summary_label=getattr(self, "_cred_summary_label", None),
+        )
+
+    def _open_cookie_overlay_impl(self, load_value, save_value, summary_label=None):
+        """共享 cookie 编辑 overlay：load/save 由调用方决定作用域。"""
+        from ui.i18n import t
+
         root = self
         while root.parent() and not isinstance(root.parent(), QScrollArea):
             root = root.parent()
 
         mask = QWidget(root)
-        mask.setStyleSheet("background: rgba(0,0,0,0.6);")
+        mask.setObjectName("modalOverlay")
         mask.resize(root.size())
         mask.move(0, 0)
         mask.show()
         mask.raise_()
 
         panel = QFrame(root)
-        panel.setObjectName("cookiePanel")
+        panel.setObjectName("settingsOverlayPanel")
+        enable_surface(panel)
         panel.setFixedSize(520, 360)
-        panel.setStyleSheet("""
-            QFrame#cookiePanel {
-                background: #1A1B21;
-                border: 1px solid #2D2E3A;
-                border-radius: 14px;
-            }
-            QLabel { background: transparent; }
-        """)
         cx = (root.width() - panel.width()) // 2
         cy = (root.height() - panel.height()) // 2
         panel.move(cx, cy)
@@ -1361,135 +1424,135 @@ class GlobalSettingsOldStyleReplicaPage(QWidget):
         vbox.setContentsMargins(28, 24, 28, 20)
         vbox.setSpacing(14)
 
-        # 标题
-        title = QLabel("编辑 B站 Cookie 凭据")
-        title.setStyleSheet("color:#E2E8F0; font-size:16px; font-weight:600;")
+        title = QLabel(t("settings.overlay.cookie_title"))
+        title.setProperty("role", "title")
+        title.setStyleSheet("font-size:16px; font-weight:600;")
         vbox.addWidget(title)
 
-        hint = QLabel("输入你的 SESSDATA（在浏览器 B站 cookie 中找到）")
-        hint.setStyleSheet("color:#64748B; font-size:12px;")
+        hint = QLabel(t("settings.overlay.cookie_hint"))
+        hint.setProperty("role", "muted")
         vbox.addWidget(hint)
 
-        # 输入框
         inp = QLineEdit()
-        inp.setPlaceholderText("粘贴你的 SESSDATA …")
+        inp.setPlaceholderText(t("settings.overlay.cookie_placeholder"))
         inp.setEchoMode(QLineEdit.Password)
-        inp.setStyleSheet("""
-            QLineEdit {
-                background:#252631; border:1px solid #2D2E3A;
-                border-radius:8px; padding:10px 14px;
-                color:#E2E8F0; font-size:14px;
-            }
-            QLineEdit:focus { border:1px solid #3B82F6; }
-        """)
-        saved = get_global_setting("chat_credential") or ""
-        inp.setText(saved)
+        inp.setText(load_value() or "")
 
-        show_btn = QPushButton("显示")
-        show_btn.setFixedWidth(52)
-        show_btn.setFixedHeight(36)
-        show_btn.setStyleSheet("""
-            QPushButton { background:#2D2E3A; border:none; border-radius:8px; color:#94A3B8; font-size:12px; }
-            QPushButton:hover { background:#374151; color:white; }
-        """)
+        show_btn = self._compact_button(
+            QPushButton(t("settings.overlay.show")),
+            height=36,
+            min_width=72,
+        )
+        show_btn.setProperty("variant", "secondary")
+        show_btn.setStyleSheet("border: none;")
+
         def _toggle_show():
             if inp.echoMode() == QLineEdit.Password:
                 inp.setEchoMode(QLineEdit.Normal)
-                show_btn.setText("隐藏")
+                show_btn.setText(t("settings.overlay.hide"))
             else:
                 inp.setEchoMode(QLineEdit.Password)
-                show_btn.setText("显示")
+                show_btn.setText(t("settings.overlay.show"))
+
         show_btn.clicked.connect(_toggle_show)
 
         inp_row = QHBoxLayout()
         inp_row.setSpacing(6)
         inp_row.addWidget(inp, 1)
-        inp_row.addWidget(show_btn)
+        inp_row.addWidget(show_btn, 0)
         vbox.addLayout(inp_row)
 
-        # 验证区域
-        verify_btn = QPushButton("验证 Cookie")
-        verify_btn.setFixedHeight(36)
-        verify_btn.setStyleSheet("""
-            QPushButton { background:#374151; border:none; border-radius:8px; color:#CBD5E1; font-size:13px; }
-            QPushButton:hover { background:#4B5563; }
-        """)
+        verify_btn = self._compact_button(
+            QPushButton(t("settings.overlay.verify_cookie")),
+            height=36,
+            min_width=110,
+        )
+        verify_btn.setProperty("variant", "secondary")
+        verify_btn.setStyleSheet("border: none;")
         vbox.addWidget(verify_btn)
 
-        # 账号信息区（左下角）
         account_frame = QFrame()
-        account_frame.setStyleSheet("background:#131419; border-radius:8px;")
+        account_frame.setObjectName("accountFrame")
         account_layout = QVBoxLayout(account_frame)
         account_layout.setContentsMargins(12, 10, 12, 10)
         account_layout.setSpacing(4)
 
-        account_name = QLabel("— 尚未验证 —")
-        account_name.setStyleSheet("color:#94A3B8; font-size:13px; background:transparent;")
+        account_name = QLabel(t("settings.overlay.not_verified"))
+        account_name.setProperty("statusTone", "neutral")
+        account_name.setStyleSheet("font-size:13px;")
         account_mid = QLabel("")
-        account_mid.setStyleSheet("color:#64748B; font-size:11px; background:transparent;")
+        account_mid.setProperty("role", "muted")
+        account_mid.setStyleSheet("font-size:11px;")
         account_layout.addWidget(account_name)
         account_layout.addWidget(account_mid)
         vbox.addWidget(account_frame, 1)
 
+        def _set_account_tone(tone):
+            from ui.theme import repolish
+            account_name.setProperty("statusTone", tone)
+            repolish(account_name)
+
         def _verify():
             sessdata = inp.text().strip()
             if not sessdata:
-                account_name.setText("❌ 请先输入 SESSDATA")
+                account_name.setText(t("settings.overlay.cookie_empty"))
                 account_mid.setText("")
+                _set_account_tone("danger")
                 return
             verify_btn.setEnabled(False)
-            verify_btn.setText("验证中…")
-            account_name.setText("⌛ 验证中…")
+            verify_btn.setText(t("settings.overlay.verifying"))
+            account_name.setText(t("settings.overlay.verifying"))
             account_mid.setText("")
+            _set_account_tone("neutral")
 
             def _do_verify():
                 import urllib.request, json as _json
+                from core.http_ssl import urlopen as _ssl_urlopen
                 try:
                     url = "https://api.bilibili.com/x/web-interface/nav"
                     req = urllib.request.Request(url, headers={
                         "User-Agent": "Mozilla/5.0",
                         "Cookie": f"SESSDATA={sessdata}"
                     })
-                    with urllib.request.urlopen(req, timeout=10) as resp:
+                    with _ssl_urlopen(req, timeout=10) as resp:
                         data = _json.loads(resp.read())
                     if data["code"] == 0 and data["data"]["isLogin"]:
                         uname = data["data"]["uname"]
                         mid = data["data"]["mid"]
                         account_name.setText(f"✅  {uname}")
                         account_mid.setText(f"UID: {mid}")
-                        account_name.setStyleSheet("color:#4ADE80; font-size:14px; font-weight:600; background:transparent;")
+                        _set_account_tone("success")
+                        account_name.setStyleSheet("font-size:14px; font-weight:600;")
                     else:
-                        account_name.setText("❌ Cookie 无效或已过期")
+                        account_name.setText(t("settings.overlay.cookie_invalid"))
                         account_mid.setText("")
-                        account_name.setStyleSheet("color:#F87171; font-size:13px; background:transparent;")
+                        _set_account_tone("danger")
                 except Exception as e:
-                    account_name.setText(f"❌ 网络错误：{e}")
+                    account_name.setText(t("settings.overlay.network_error", error=e))
                     account_mid.setText("")
-                    account_name.setStyleSheet("color:#F87171; font-size:13px; background:transparent;")
+                    _set_account_tone("danger")
                 finally:
                     verify_btn.setEnabled(True)
-                    verify_btn.setText("验证 Cookie")
+                    verify_btn.setText(t("settings.overlay.verify_cookie"))
 
             threading.Thread(target=_do_verify, daemon=True).start()
 
         verify_btn.clicked.connect(_verify)
 
-        # 底部按钮行（右下角）
         btn_row = QHBoxLayout()
-        cancel_btn = QPushButton("取消")
-        cancel_btn.setFixedWidth(90)
-        cancel_btn.setFixedHeight(36)
-        cancel_btn.setStyleSheet("""
-            QPushButton { background:#2D2E3A; border:none; border-radius:8px; color:#94A3B8; font-size:13px; }
-            QPushButton:hover { background:#374151; color:white; }
-        """)
-        save_btn = QPushButton("保存")
-        save_btn.setFixedWidth(90)
-        save_btn.setFixedHeight(36)
-        save_btn.setStyleSheet("""
-            QPushButton { background:#3B82F6; border:none; border-radius:8px; color:white; font-size:13px; font-weight:600; }
-            QPushButton:hover { background:#2563EB; }
-        """)
+        cancel_btn = self._compact_button(
+            QPushButton(t("common.cancel")),
+            height=36,
+            min_width=90,
+        )
+        cancel_btn.setProperty("variant", "secondary")
+        cancel_btn.setStyleSheet("border: none;")
+        save_btn = self._compact_button(
+            QPushButton(t("common.save")),
+            height=36,
+            min_width=90,
+        )
+        save_btn.setProperty("variant", "primary")
 
         def _close():
             panel.hide(); panel.deleteLater()
@@ -1497,12 +1560,9 @@ class GlobalSettingsOldStyleReplicaPage(QWidget):
 
         def _save():
             val = inp.text().strip()
-            self._save_setting("chat_credential", val)
-            if val:
-                masked = val[:6] + "..." + val[-4:] if len(val) > 10 else "已设置"
-                self._cred_summary_label.setText(masked)
-            else:
-                self._cred_summary_label.setText("未设置")
+            save_value(val)
+            if summary_label is not None:
+                summary_label.setText(self._format_credential_summary(val))
             _close()
 
         cancel_btn.clicked.connect(_close)
@@ -1513,84 +1573,84 @@ class GlobalSettingsOldStyleReplicaPage(QWidget):
         vbox.addLayout(btn_row)
 
     def _build_schedule_card(self):
-        return self._setting_card("📅 录制计划", "#F2994A", [
-            self._setting_item("时区", "录制计划使用的时区",
-                self._combo("schedule_timezone", ["UTC", "Asia/Shanghai", "Asia/Tokyo", "America/New_York", "Europe/London"], 160),
+        return self._setting_card("settings.group.schedule", "#F2994A", [
+            self._setting_item("settings.schedule.timezone", "settings.schedule.timezone_desc",
+                self._combo("schedule_timezone", width=160),
                 self._reset_button("schedule_timezone", DEFAULT_GLOBAL_SETTINGS["schedule_timezone"])),
-            self._setting_item("开始录制", "仅在此时间后开始（HH:MM，留空不限）",
+            self._setting_item("settings.schedule.start", "settings.schedule.start_desc",
                 self._line_edit("schedule_start", "如: 08:00", 110),
                 self._reset_button("schedule_start", DEFAULT_GLOBAL_SETTINGS["schedule_start"])),
-            self._setting_item("停止录制", "到达此时间后停止（HH:MM，留空不限）",
+            self._setting_item("settings.schedule.stop", "settings.schedule.stop_desc",
                 self._line_edit("schedule_stop", "如: 23:00", 110),
                 self._reset_button("schedule_stop", DEFAULT_GLOBAL_SETTINGS["schedule_stop"])),
         ])
 
     def _build_automation_card(self):
-        return self._setting_card("⚡ 自动化", "#56CCF2", [
-            self._setting_item("Webhooks", "录制事件通知的 Webhook 地址（每行一个）",
+        return self._setting_card("settings.group.automation", "#56CCF2", [
+            self._setting_item("settings.automation.webhooks", "settings.automation.webhooks_desc",
                 self._line_edit("webhooks", "https://...", 220),
                 self._reset_button("webhooks", DEFAULT_GLOBAL_SETTINGS["webhooks"])),
         ])
 
     def _build_file_location_card(self):
         # path_template 摘要需要刷新
-        return self._setting_card("📁 文件位置", "#F2C94C", [
-            self._setting_item("保存目录", "所有录制文件的根目录",
+        return self._setting_card("settings.group.location", "#F2C94C", [
+            self._setting_item("settings.location.dir", "settings.location.dir_desc",
                 self._directory_field("save_dir", VIDEO_SAVE_DIR, 220),
                 self._reset_button("save_dir", VIDEO_SAVE_DIR)),
-            self._setting_item("路径模板", "点击按钮弹出编辑器修改 liquid 模板",
+            self._setting_item("settings.location.template", "settings.location.template_desc",
                 self._template_editor_button("path_template"),
                 self._reset_button("path_template", DEFAULT_GLOBAL_SETTINGS["path_template"])),
         ])
 
     def _build_convert_card(self):
-        return self._setting_card("🔄 转换格式", "#EB5757", [
-            self._setting_item("启用转换", "录制完成后自动转换视频格式",
+        return self._setting_card("settings.group.convert", "#EB5757", [
+            self._setting_item("settings.convert.enabled", "settings.convert.enabled_desc",
                 self._check("convert_enabled"),
                 self._reset_button("convert_enabled", DEFAULT_GLOBAL_SETTINGS["convert_enabled"])),
-            self._setting_item("删除原文件", "转换成功后删除原始录制文件",
+            self._setting_item("settings.convert.delete_source", "settings.convert.delete_source_desc",
                 self._check("convert_delete_source"),
                 self._reset_button("convert_delete_source", DEFAULT_GLOBAL_SETTINGS["convert_delete_source"])),
-            self._setting_item("目标格式", "转换的目标视频格式",
-                self._combo("convert_format", ["mp4", "mkv", "ts", "flv"], 100),
+            self._setting_item("settings.convert.format", "settings.convert.format_desc",
+                self._combo("convert_format", width=100),
                 self._reset_button("convert_format", DEFAULT_GLOBAL_SETTINGS["convert_format"])),
         ])
 
     def _build_monitor_card(self):
-        return self._setting_card("👁️ 直播监控", "#2D9CDB", [
-            self._setting_item("轮询延时", "每次轮询之间的等待时间",
-                self._combo("monitor_delay", ["自动", "5 秒", "10 秒", "30 秒", "1 分钟"], 110),
+        return self._setting_card("settings.group.monitor", "#2D9CDB", [
+            self._setting_item("settings.monitor.delay", "settings.monitor.delay_desc",
+                self._combo("monitor_delay", width=110),
                 self._reset_button("monitor_delay", DEFAULT_GLOBAL_SETTINGS["monitor_delay"])),
-            self._setting_item("轮询间隔", "检查直播状态的时间间隔",
-                self._combo("monitor_interval", ["自动", "10 秒", "30 秒", "1 分钟", "5 分钟"], 110),
+            self._setting_item("settings.monitor.interval", "settings.monitor.interval_desc",
+                self._combo("monitor_interval", width=110),
                 self._reset_button("monitor_interval", DEFAULT_GLOBAL_SETTINGS["monitor_interval"])),
-            self._setting_item("并发数", "同时轮询的房间数量上限",
-                self._combo("monitor_concurrency", ["自动", "5", "10", "20", "50"], 110),
+            self._setting_item("settings.monitor.concurrency", "settings.monitor.concurrency_desc",
+                self._combo("monitor_concurrency", width=110),
                 self._reset_button("monitor_concurrency", DEFAULT_GLOBAL_SETTINGS["monitor_concurrency"])),
-            self._setting_item("防抖延迟", "下播状态确认延迟，防止误触发",
-                self._combo("monitor_debounce", ["禁用", "30 秒", "1 分钟", "3 分钟", "5 分钟"], 110),
+            self._setting_item("settings.monitor.debounce", "settings.monitor.debounce_desc",
+                self._combo("monitor_debounce", width=110),
                 self._reset_button("monitor_debounce", DEFAULT_GLOBAL_SETTINGS["monitor_debounce"])),
-            self._setting_item("监控代理", "专用于监控请求的代理地址",
+            self._setting_item("settings.monitor.proxy", "settings.monitor.proxy_desc",
                 self._line_edit("monitor_proxy", "留空使用全局代理", 180),
                 self._reset_button("monitor_proxy", DEFAULT_GLOBAL_SETTINGS["monitor_proxy"])),
         ])
 
     def _build_cover_card(self):
-        return self._setting_card("🖼️ 封面下载", "#BB6BD9", [
-            self._setting_item("启用", "开播时自动下载直播封面图片",
+        return self._setting_card("settings.group.cover", "#BB6BD9", [
+            self._setting_item("settings.cover.enabled", "settings.cover.enabled_desc",
                 self._check("download_cover"),
                 self._reset_button("download_cover", DEFAULT_GLOBAL_SETTINGS["download_cover"])),
         ])
 
     def _build_conditions_card(self):
-        return self._setting_card("🎯 录制条件", "#F2994A", [
-            self._setting_item("直播标题", "仅录制标题包含以下关键词的直播（多个用英文逗号分隔）",
+        return self._setting_card("settings.group.conditions", "#F2994A", [
+            self._setting_item("settings.conditions.title", "settings.conditions.title_desc",
                 self._line_edit("condition_title", "留空不过滤", 200),
                 self._reset_button("condition_title", DEFAULT_GLOBAL_SETTINGS["condition_title"])),
-            self._setting_item("直播类别", "仅录制分区包含以下关键词的直播（多个用英文逗号分隔）",
+            self._setting_item("settings.conditions.category", "settings.conditions.category_desc",
                 self._line_edit("condition_category", "留空不过滤", 200),
                 self._reset_button("condition_category", DEFAULT_GLOBAL_SETTINGS["condition_category"])),
-            self._setting_item("直播时段", "仅在指定时段录制（格式: 08:00-23:00，留空不限）",
+            self._setting_item("settings.conditions.hours", "settings.conditions.hours_desc",
                 self._line_edit("condition_time_range", "如: 08:00-23:00", 140),
                 self._reset_button("condition_time_range", DEFAULT_GLOBAL_SETTINGS["condition_time_range"])),
         ])
@@ -1601,50 +1661,27 @@ class GlobalSettingsOldStyleReplicaPage(QWidget):
         label = self._template_summary_labels.get(key)
         if not label:
             return
+        from ui.theme import repolish
         value = (get_global_setting(key) or "").strip()
         if not value:
             label.setText("(未设置)")
-            label.setStyleSheet("color: #64748B; font-size: 12px;")
+            label.setProperty("role", "muted")
         else:
             first_line = value.split("\n")[0][:60]
             display = first_line + ("..." if len(first_line) >= 60 else "")
             label.setText(display)
-            label.setStyleSheet("color: #E2E8F0; font-size: 12px;")
+            label.setProperty("role", "itemDesc")
+        label.setStyleSheet("font-size: 12px;")
+        repolish(label)
 
     def _build_notify_template_item(self, key):
-        reset_btn = QPushButton("重置")
-        reset_btn.setFixedSize(60, 28)
+        reset_btn = self._compact_button(QPushButton(), height=28, min_width=60)
+        self._bind_i18n(reset_btn, "settings.action.reset")
         reset_btn.setToolTip("重置为默认模板")
-        reset_btn.setStyleSheet("""
-            QPushButton {
-                background: transparent;
-                border: 1px solid #3D3E4A;
-                border-radius: 6px;
-                color: #94A3B8;
-                font-size: 11px;
-                padding: 0 8px;
-            }
-            QPushButton:hover {
-                background: #2D2E3A;
-                color: #F87171;
-                border-color: #F87171;
-            }
-        """)
-        confirm_btn = QPushButton("确认重置")
-        confirm_btn.setFixedSize(60, 28)
-        confirm_btn.setStyleSheet("""
-            QPushButton {
-                background: #EF4444;
-                border: none;
-                border-radius: 6px;
-                color: white;
-                font-size: 11px;
-                padding: 0 8px;
-            }
-            QPushButton:hover {
-                background: #DC2626;
-            }
-        """)
+        reset_btn.setProperty("variant", "reset")
+        confirm_btn = self._compact_button(QPushButton(), height=28, min_width=60)
+        self._bind_i18n(confirm_btn, "settings.action.confirm_reset")
+        confirm_btn.setProperty("variant", "danger")
         confirm_btn.hide()
         def on_reset():
             reset_btn.hide()
@@ -1664,31 +1701,35 @@ class GlobalSettingsOldStyleReplicaPage(QWidget):
         if not hasattr(self, "_template_summary_labels"):
             self._template_summary_labels = {}
         # No summary label preview - user didn't want template text shown
-        edit_btn = QPushButton("\u25b6")
-        edit_btn.setFixedSize(32, 32)
-        edit_btn.setToolTip("编辑模板")
-        edit_btn.setStyleSheet("QPushButton { background: transparent; border: none; color: #94A3B8; font-size: 14px; } QPushButton:hover { color: #3B82F6; }")
-        edit_btn.clicked.connect(lambda checked=False, k=key: self._open_notify_template_overlay(k, "编辑"))
+        from ui.i18n import t as _t_edit
+        edit_btn = self._compact_button(QPushButton("▶"), height=32)
+        edit_btn.setFixedWidth(32)
+        edit_btn.setToolTip(_t_edit("settings.action.edit_template"))
+        edit_btn.setProperty("variant", "ghost")
+        edit_btn.setStyleSheet("font-size: 14px;")
+        edit_btn.clicked.connect(lambda checked=False, k=key: self._open_notify_template_overlay(k, ""))
         layout.addStretch()
         layout.addWidget(reset_btn)
         layout.addWidget(edit_btn)
         layout.addWidget(confirm_btn)
         return wrapper
 
-    def _open_notify_template_overlay(self, key, window_title):
+    def _open_notify_template_overlay(self, key, window_title=""):
+        from ui.i18n import t
+
         root = self
         while root.parent() and not isinstance(root.parent(), QScrollArea):
             root = root.parent()
         mask = QWidget(root)
-        mask.setStyleSheet("background: rgba(0,0,0,0.6);")
+        mask.setObjectName("modalOverlay")
         mask.resize(root.size())
         mask.move(0, 0)
         mask.show()
         mask.raise_()
         panel = QFrame(root)
-        panel.setObjectName("notifyTemplatePanel")
+        panel.setObjectName("settingsOverlayPanel")
+        enable_surface(panel)
         panel.setFixedSize(680, 480)
-        panel.setStyleSheet('''QFrame#notifyTemplatePanel { background: #1A1B21; border: 1px solid #2D2E3A; border-radius: 14px; } QLabel { background: transparent; }''')
         cx = (root.width() - panel.width()) // 2
         cy = (root.height() - panel.height()) // 2
         panel.move(cx, cy)
@@ -1697,25 +1738,31 @@ class GlobalSettingsOldStyleReplicaPage(QWidget):
         vbox = QVBoxLayout(panel)
         vbox.setContentsMargins(24, 20, 24, 20)
         vbox.setSpacing(14)
-        title = QLabel("编辑" + window_title)
-        title.setStyleSheet("color: #E2E8F0; font-size: 16px; font-weight: 600;")
+        title = QLabel((t("settings.action.edit") + window_title) if window_title else t("settings.action.edit_template"))
+        title.setProperty("role", "title")
+        title.setStyleSheet("font-size: 16px; font-weight: 600;")
         vbox.addWidget(title)
         editor = QTextEdit()
         val = str(get_global_setting(key) or "")
         logging.info(f"TPL_OVERLAY key={key} len={len(val)}")
         editor.setPlainText(val)
-        editor.setPlaceholderText("请输入 Liquid 模板...")
-        editor.setStyleSheet('''QTextEdit { background-color: #15161D; border: 1px solid #2D2E3A; border-radius: 10px; padding: 12px; color: #E2E8F0; font-size: 12px; } QTextEdit:focus { border: 1px solid #3B82F6; }''')
+        editor.setPlaceholderText(t("settings.overlay.path_placeholder"))
+        editor.setStyleSheet("font-size: 12px; padding: 12px;")
         vbox.addWidget(editor, 1)
         btn_row = QHBoxLayout()
-        cancel_btn = QPushButton("取消")
-        cancel_btn.setFixedWidth(90)
-        cancel_btn.setFixedHeight(36)
-        cancel_btn.setStyleSheet("QPushButton { background: #2D2E3A; border: none; border-radius: 8px; color: #94A3B8; font-size: 13px; } QPushButton:hover { background: #374151; color: white; }")
-        save_btn = QPushButton("保存")
-        save_btn.setFixedWidth(90)
-        save_btn.setFixedHeight(36)
-        save_btn.setStyleSheet("QPushButton { background: #3B82F6; border: none; border-radius: 8px; color: white; font-size: 13px; font-weight: 600; } QPushButton:hover { background: #2563EB; }")
+        cancel_btn = self._compact_button(
+            QPushButton(t("common.cancel")),
+            height=36,
+            min_width=90,
+        )
+        cancel_btn.setProperty("variant", "secondary")
+        cancel_btn.setStyleSheet("border: none;")
+        save_btn = self._compact_button(
+            QPushButton(t("common.save")),
+            height=36,
+            min_width=90,
+        )
+        save_btn.setProperty("variant", "primary")
         def _close():
             panel.hide(); panel.deleteLater()
             mask.hide(); mask.deleteLater()
@@ -1731,31 +1778,31 @@ class GlobalSettingsOldStyleReplicaPage(QWidget):
         vbox.addLayout(btn_row)
 
     def _build_notify_card(self):
-        return self._setting_card("🔔 通知", "#56CCF2", [
-            self._setting_item("启用通知", "开播/下播/错误时发送通知",
+        return self._setting_card("settings.group.notify", "#56CCF2", [
+            self._setting_item("settings.notify.enabled", "settings.notify.enabled_desc",
                 self._check("notify_enabled"),
                 self._reset_button("notify_enabled", DEFAULT_GLOBAL_SETTINGS["notify_enabled"])),
-            self._setting_item("通知地址", "通知服务的 Webhook 地址",
+            self._setting_item("settings.notify.url", "settings.notify.url_desc",
                 self._line_edit("notify_url", "https://...", 220),
                 self._reset_button("notify_url", DEFAULT_GLOBAL_SETTINGS["notify_url"])),
-            self._setting_item("标题模板", "通知标题的模板（{uname}, {room_id}, {title}, {time}）",
+            self._setting_item("settings.notify.title_tpl", "settings.notify.title_tpl_desc",
                 self._build_notify_template_item("notify_title_template")),
-            self._setting_item("正文模板", "通知正文的模板（{uname}, {room_id}, {title}, {time}）",
+            self._setting_item("settings.notify.body_tpl", "settings.notify.body_tpl_desc",
                 self._build_notify_template_item("notify_body_template")),
-            self._setting_item("直播结束通知", "直播结束时发送通知",
+            self._setting_item("settings.notify.end", "settings.notify.end_desc",
                 self._check("notify_on_live_end"),
                 self._reset_button("notify_on_live_end", DEFAULT_GLOBAL_SETTINGS["notify_on_live_end"])),
-            self._setting_item("错误通知", "发生录制错误时发送通知",
+            self._setting_item("settings.notify.error", "settings.notify.error_desc",
                 self._check("notify_on_error"),
                 self._reset_button("notify_on_error", DEFAULT_GLOBAL_SETTINGS["notify_on_error"])),
         ])
 
     def _build_system_card(self):
-        return self._setting_card("⚙️ 系统", "#6FCF70", [
-            self._setting_item("开机自启", "系统启动时自动运行本程序",
+        return self._setting_card("settings.group.system", "#6FCF70", [
+            self._setting_item("settings.system.auto_start", "settings.system.auto_start_desc",
                 self._check("auto_start"),
                 self._reset_button("auto_start", DEFAULT_GLOBAL_SETTINGS["auto_start"])),
-            self._setting_item("阻止休眠", "录制期间阻止系统进入休眠状态",
+            self._setting_item("settings.system.prevent_sleep", "settings.system.prevent_sleep_desc",
                 self._check("prevent_sleep"),
                 self._reset_button("prevent_sleep", DEFAULT_GLOBAL_SETTINGS["prevent_sleep"])),
         ])
@@ -1782,6 +1829,14 @@ class GlobalSettingsOldStyleReplicaPage(QWidget):
                     logging.error(f"启停 PowerKeepAlive 失败: {e}")
 
         set_global_setting(key, value)
+        if key == "theme":
+            app = QApplication.instance()
+            if app is not None:
+                from ui.theme import theme_manager
+                theme_manager().apply(app, value)
+        elif key == "language":
+            from ui.i18n import set_language
+            set_language(value)
         self.saved.emit(key)
 
     def _choose_directory(self, key, line_edit):
@@ -1796,15 +1851,15 @@ class GlobalSettingsOldStyleReplicaPage(QWidget):
         while root.parent() and not isinstance(root.parent(), QScrollArea):
             root = root.parent()
         mask = QWidget(root)
-        mask.setStyleSheet("background: rgba(0,0,0,0.6);")
+        mask.setObjectName("modalOverlay")
         mask.resize(root.size())
         mask.move(0, 0)
         mask.show()
         mask.raise_()
         panel = QFrame(root)
-        panel.setObjectName("pathTemplatePanel")
+        panel.setObjectName("settingsOverlayPanel")
+        enable_surface(panel)
         panel.setFixedSize(680, 480)
-        panel.setStyleSheet('''QFrame#pathTemplatePanel { background: #1A1B21; border: 1px solid #2D2E3A; border-radius: 14px; } QLabel { background: transparent; }''')
         cx = (root.width() - panel.width()) // 2
         cy = (root.height() - panel.height()) // 2
         panel.move(cx, cy)
@@ -1813,26 +1868,32 @@ class GlobalSettingsOldStyleReplicaPage(QWidget):
         vbox = QVBoxLayout(panel)
         vbox.setContentsMargins(24, 20, 24, 20)
         vbox.setSpacing(14)
-        title = QLabel("编辑路径模板")
-        title.setStyleSheet("color: #E2E8F0; font-size: 16px; font-weight: 600;")
-        desc = QLabel("修改 Liquid 路径模板后，点击保存立即生效。")
-        desc.setStyleSheet("color: #94A3B8; font-size: 12px;")
+        from ui.i18n import t as _t_path; title = QLabel(_t_path("settings.overlay.path_title"))
+        title.setProperty("role", "title")
+        title.setStyleSheet("font-size: 16px; font-weight: 600;")
+        desc = QLabel(_t_path("settings.overlay.path_desc"))
+        desc.setProperty("role", "muted")
         vbox.addWidget(title)
         vbox.addWidget(desc)
         editor = QTextEdit()
         editor.setPlainText(str(get_global_setting(key) or ""))
-        editor.setPlaceholderText("请输入路径模板")
-        editor.setStyleSheet('''QTextEdit { background-color: #15161D; border: 1px solid #2D2E3A; border-radius: 10px; padding: 12px; color: #E2E8F0; font-size: 12px; } QTextEdit:focus { border: 1px solid #3B82F6; }''')
+        editor.setPlaceholderText(_t_path("settings.overlay.path_placeholder"))
+        editor.setStyleSheet("font-size: 12px; padding: 12px;")
         vbox.addWidget(editor, 1)
         btn_row = QHBoxLayout()
-        cancel_btn = QPushButton("取消")
-        cancel_btn.setFixedWidth(90)
-        cancel_btn.setFixedHeight(36)
-        cancel_btn.setStyleSheet("QPushButton { background: #2D2E3A; border: none; border-radius: 8px; color: #94A3B8; font-size: 13px; } QPushButton:hover { background: #374151; color: white; }")
-        save_btn = QPushButton("保存")
-        save_btn.setFixedWidth(90)
-        save_btn.setFixedHeight(36)
-        save_btn.setStyleSheet("QPushButton { background: #3B82F6; border: none; border-radius: 8px; color: white; font-size: 13px; font-weight: 600; } QPushButton:hover { background: #2563EB; }")
+        cancel_btn = self._compact_button(
+            QPushButton(__import__("ui.i18n", fromlist=["t"]).t("common.cancel")),
+            height=36,
+            min_width=90,
+        )
+        cancel_btn.setProperty("variant", "secondary")
+        cancel_btn.setStyleSheet("border: none;")
+        save_btn = self._compact_button(
+            QPushButton(__import__("ui.i18n", fromlist=["t"]).t("common.save")),
+            height=36,
+            min_width=90,
+        )
+        save_btn.setProperty("variant", "primary")
         def _close():
             panel.hide(); panel.deleteLater()
             mask.hide(); mask.deleteLater()
@@ -1852,37 +1913,51 @@ class GlobalSettingsOldStyleReplicaPage(QWidget):
         dialog.accept()
 
     def _load_values(self):
-        for key, widget in self._controls.items():
-            value = get_global_setting(key)
-            # 视频时长：三元组 (h_box, m_box, s_box)
-            if isinstance(widget, tuple):
-                h_box, m_box, s_box = widget
-                raw = "" if value is None else str(value)
-                parts = raw.split(":") if raw else []
-                try:
-                    hh = int(parts[0]) if len(parts) > 0 else 1
-                    mm = int(parts[1]) if len(parts) > 1 else 0
-                    ss = int(parts[2]) if len(parts) > 2 else 0
-                except (ValueError, IndexError):
-                    hh, mm, ss = 1, 0, 0
-                h_box.setText(str(hh))
-                m_box.setText(f"{mm:02d}")
-                s_box.setText(f"{ss:02d}")
-            # 文件大小：字节数字输入框
-            elif key == "split_by_size" and isinstance(widget, QLineEdit):
-                raw = "" if value is None else str(value)
-                widget.setText(raw if raw.isdigit() and int(raw) > 0 else "")
-            elif isinstance(widget, QLineEdit):
-                widget.setText("" if value is None else str(value))
-            elif isinstance(widget, QTextEdit):
-                widget.setPlainText("" if value is None else str(value))
-            elif isinstance(widget, ToggleSwitch):
-                widget.setChecked(bool(value))
-            elif isinstance(widget, QComboBox):
-                text = "" if value is None else str(value)
-                index = widget.findText(text)
-                if index >= 0:
-                    widget.setCurrentIndex(index)
+        blockers = []
+        for widget in self._controls.values():
+            widgets = widget if isinstance(widget, tuple) else (widget,)
+            blockers.extend(QSignalBlocker(item) for item in widgets)
+
+        try:
+            for key, widget in self._controls.items():
+                value = get_global_setting(key)
+                # 视频时长：三元组 (h_box, m_box, s_box)
+                if isinstance(widget, tuple):
+                    h_box, m_box, s_box = widget
+                    raw = "" if value is None else str(value)
+                    parts = raw.split(":") if raw else []
+                    try:
+                        hh = int(parts[0]) if len(parts) > 0 else 1
+                        mm = int(parts[1]) if len(parts) > 1 else 0
+                        ss = int(parts[2]) if len(parts) > 2 else 0
+                    except (ValueError, IndexError):
+                        hh, mm, ss = 1, 0, 0
+                    h_box.setText(str(hh))
+                    m_box.setText(f"{mm:02d}")
+                    s_box.setText(f"{ss:02d}")
+                # 文件大小：字节数字输入框
+                elif key == "split_by_size" and isinstance(widget, QLineEdit):
+                    raw = "" if value is None else str(value)
+                    widget.setText(raw if raw.isdigit() and int(raw) > 0 else "")
+                elif isinstance(widget, QLineEdit):
+                    widget.setText("" if value is None else str(value))
+                elif isinstance(widget, QTextEdit):
+                    widget.setPlainText("" if value is None else str(value))
+                elif isinstance(widget, ToggleSwitch):
+                    widget.setChecked(bool(value), animate=False)
+                elif isinstance(widget, QComboBox):
+                    data = value
+                    if key == "theme":
+                        # 未知/缺失主题值：UI 显示深色回退，但不改写用户配置
+                        from ui.theme import normalize_theme
+                        data = normalize_theme(value)
+                    index = widget.findData(data, Qt.UserRole)
+                    if index < 0 and widget.itemData(0, Qt.UserRole) is None:
+                        index = widget.findText(str(data))
+                    if index >= 0:
+                        widget.setCurrentIndex(index)
+        finally:
+            blockers.clear()
 
     def load_settings(self):
         self._load_values()
@@ -1924,41 +1999,7 @@ class RoomSettingsPage(GlobalSettingsOldStyleReplicaPage):
     # Override _build_ui: show only per-room relevant cards, no header
     # ------------------------------------------------------------------
     def _build_ui(self):
-        self.setStyleSheet("""
-            QWidget { background-color: transparent; color: #E2E8F0; }
-            QFrame#settingsCard {
-                background-color: #1A1B21;
-                border: 1px solid #272833;
-                border-radius: 14px;
-            }
-            QFrame#settingDivider {
-                background-color: #252631;
-                min-height: 1px; max-height: 1px; border: none;
-            }
-            QLabel[role="title"]     { color: #F8FAFC; font-size: 15px; font-weight: 700; }
-            QLabel[role="desc"]      { color: #94A3B8; font-size: 12px; }
-            QLabel[role="itemTitle"] { color: #E2E8F0; font-size: 13px; font-weight: 600; }
-            QLabel[role="itemDesc"]  { color: #94A3B8; font-size: 12px; }
-            QLineEdit, QComboBox, QTextEdit {
-                background-color: #15161D;
-                border: 1px solid #2D2E3A;
-                border-radius: 10px;
-                padding: 8px 10px;
-                color: #E2E8F0;
-                font-size: 13px;
-            }
-            QLineEdit:focus, QComboBox:focus, QTextEdit:focus { border: 1px solid #3B82F6; }
-            QCheckBox { color: #CBD5E1; spacing: 8px; font-size: 13px; }
-            QPushButton {
-                background-color: #252631; color: #E2E8F0;
-                border: none; border-radius: 10px;
-                padding: 9px 14px; font-size: 13px; font-weight: 600;
-            }
-            QPushButton:hover { background-color: #2D2E3A; }
-            QPushButton#primaryBtn { background-color: #3B82F6; color: white; }
-            QPushButton#primaryBtn:hover { background-color: #2563EB; }
-        """)
-
+        # 颜色由应用级主题 QSS 控制（ui/theme.py）；与全局设置页共用选择器。
         self._controls = {}
 
         root = QVBoxLayout(self)
@@ -1968,16 +2009,6 @@ class RoomSettingsPage(GlobalSettingsOldStyleReplicaPage):
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.NoFrame)
-        scroll.setStyleSheet("""
-            QScrollArea { border: none; background: transparent; }
-            QScrollBar:vertical {
-                background-color: #15161D; width: 8px; border-radius: 4px;
-            }
-            QScrollBar::handle:vertical {
-                background-color: #3B3D4F; border-radius: 4px; min-height: 40px;
-            }
-            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0px; }
-        """)
 
         content = QWidget()
         content_layout = QHBoxLayout(content)
@@ -2021,35 +2052,45 @@ class RoomSettingsPage(GlobalSettingsOldStyleReplicaPage):
         self.saved.emit(key)
 
     def _load_values(self):
-        for key, widget in self._controls.items():
-            value = get_room_setting(self.room_id, key)
-            if isinstance(widget, tuple):          # split_by_duration triple
-                h_box, m_box, s_box = widget
-                raw = "" if value is None else str(value)
-                parts = raw.split(":") if raw else []
-                try:
-                    hh = int(parts[0]) if len(parts) > 0 else 1
-                    mm = int(parts[1]) if len(parts) > 1 else 0
-                    ss = int(parts[2]) if len(parts) > 2 else 0
-                except (ValueError, IndexError):
-                    hh, mm, ss = 1, 0, 0
-                h_box.setText(str(hh))
-                m_box.setText(f"{mm:02d}")
-                s_box.setText(f"{ss:02d}")
-            elif key == "split_by_size" and isinstance(widget, QLineEdit):
-                raw = "" if value is None else str(value)
-                widget.setText(raw if raw.isdigit() and int(raw) > 0 else "")
-            elif isinstance(widget, QLineEdit):
-                widget.setText("" if value is None else str(value))
-            elif isinstance(widget, QTextEdit):
-                widget.setPlainText("" if value is None else str(value))
-            elif isinstance(widget, ToggleSwitch):
-                widget.setChecked(bool(value))
-            elif isinstance(widget, QComboBox):
-                text = "" if value is None else str(value)
-                idx = widget.findText(text)
-                if idx >= 0:
-                    widget.setCurrentIndex(idx)
+        blockers = []
+        for widget in self._controls.values():
+            widgets = widget if isinstance(widget, tuple) else (widget,)
+            blockers.extend(QSignalBlocker(item) for item in widgets)
+
+        try:
+            for key, widget in self._controls.items():
+                value = get_room_setting(self.room_id, key)
+                if isinstance(widget, tuple):          # split_by_duration triple
+                    h_box, m_box, s_box = widget
+                    raw = "" if value is None else str(value)
+                    parts = raw.split(":") if raw else []
+                    try:
+                        hh = int(parts[0]) if len(parts) > 0 else 1
+                        mm = int(parts[1]) if len(parts) > 1 else 0
+                        ss = int(parts[2]) if len(parts) > 2 else 0
+                    except (ValueError, IndexError):
+                        hh, mm, ss = 1, 0, 0
+                    h_box.setText(str(hh))
+                    m_box.setText(f"{mm:02d}")
+                    s_box.setText(f"{ss:02d}")
+                elif key == "split_by_size" and isinstance(widget, QLineEdit):
+                    raw = "" if value is None else str(value)
+                    widget.setText(raw if raw.isdigit() and int(raw) > 0 else "")
+                elif isinstance(widget, QLineEdit):
+                    widget.setText("" if value is None else str(value))
+                elif isinstance(widget, QTextEdit):
+                    widget.setPlainText("" if value is None else str(value))
+                elif isinstance(widget, ToggleSwitch):
+                    widget.setChecked(bool(value), animate=False)
+                elif isinstance(widget, QComboBox):
+                    data = value
+                    idx = widget.findData(data, Qt.UserRole)
+                    if idx < 0 and widget.itemData(0, Qt.UserRole) is None:
+                        idx = widget.findText(str(value))
+                    if idx >= 0:
+                        widget.setCurrentIndex(idx)
+        finally:
+            blockers.clear()
 
     # ------------------------------------------------------------------
     # Override template / overlay helpers to use room-scoped values
@@ -2060,50 +2101,56 @@ class RoomSettingsPage(GlobalSettingsOldStyleReplicaPage):
         label = self._template_summary_labels.get(key)
         if not label:
             return
+        from ui.i18n import t
+        from ui.theme import repolish
         value = (get_room_setting(self.room_id, key) or "").strip()
         if not value:
-            label.setText("(\u672a\u8bbe\u7f6e)")
-            label.setStyleSheet("color: #64748B; font-size: 12px;")
+            label.setText(f"({t('settings.common.unset')})")
+            label.setProperty("role", "muted")
         else:
             first_line = value.split("\n")[0][:60]
             label.setText(first_line + ("..." if len(first_line) >= 60 else ""))
-            label.setStyleSheet("color: #E2E8F0; font-size: 12px;")
+            label.setProperty("role", "itemDesc")
+        label.setStyleSheet("font-size: 12px;")
+        repolish(label)
 
-    def _open_notify_template_overlay(self, key, window_title):
+    def _open_notify_template_overlay(self, key, window_title=""):
+        from ui.i18n import t
+        title = (t("settings.action.edit") + window_title) if window_title else t("settings.action.edit_template")
         self._open_text_overlay(
             key,
-            "\u7f16\u8f91" + window_title,
-            "\u8bf7\u8f93\u5165 Liquid \u6a21\u677f...",
+            title,
+            t("settings.overlay.path_placeholder"),
             "notifyTemplatePanel",
         )
 
     def _open_path_template_overlay(self, key):
+        from ui.i18n import t
         self._open_text_overlay(
             key,
-            "\u7f16\u8f91\u8def\u5f84\u6a21\u677f",
-            "\u8bf7\u8f93\u5165\u8def\u5f84\u6a21\u677f",
+            t("settings.overlay.path_title"),
+            t("settings.overlay.path_placeholder"),
             "pathTemplatePanel",
-            extra_desc="\u4fee\u6539 Liquid \u8def\u5f84\u6a21\u677f\u540e\uff0c\u70b9\u51fb\u4fdd\u5b58\u7acb\u5373\u751f\u6548\u3002",
+            extra_desc=t("settings.overlay.path_desc"),
         )
 
     def _open_text_overlay(self, key, title_text, placeholder, obj_name, extra_desc=None):
         """Generic text-editor overlay for template editing."""
+        from ui.i18n import t
+
         root = self
         while root.parent() and not isinstance(root.parent(), QScrollArea):
             root = root.parent()
         mask = QWidget(root)
-        mask.setStyleSheet("background: rgba(0,0,0,0.6);")
+        mask.setObjectName("modalOverlay")
         mask.resize(root.size())
         mask.move(0, 0)
         mask.show(); mask.raise_()
 
         panel = QFrame(root)
-        panel.setObjectName(obj_name)
+        panel.setObjectName("settingsOverlayPanel")
+        enable_surface(panel)
         panel.setFixedSize(680, 480)
-        panel.setStyleSheet(
-            f"QFrame#{obj_name} {{ background: #1A1B21; border: 1px solid #2D2E3A; border-radius: 14px; }} "
-            "QLabel { background: transparent; }"
-        )
         cx = (root.width() - panel.width()) // 2
         cy = (root.height() - panel.height()) // 2
         panel.move(cx, cy)
@@ -2114,38 +2161,26 @@ class RoomSettingsPage(GlobalSettingsOldStyleReplicaPage):
         vbox.setSpacing(14)
 
         title_lbl = QLabel(title_text)
-        title_lbl.setStyleSheet("color: #E2E8F0; font-size: 16px; font-weight: 600;")
+        title_lbl.setProperty("role", "title")
+        title_lbl.setStyleSheet("font-size: 16px; font-weight: 600;")
         vbox.addWidget(title_lbl)
         if extra_desc:
             desc_lbl = QLabel(extra_desc)
-            desc_lbl.setStyleSheet("color: #94A3B8; font-size: 12px;")
+            desc_lbl.setProperty("role", "muted")
             vbox.addWidget(desc_lbl)
 
         editor = QTextEdit()
         editor.setPlainText(str(get_room_setting(self.room_id, key) or ""))
         editor.setPlaceholderText(placeholder)
-        editor.setStyleSheet(
-            "QTextEdit { background-color: #15161D; border: 1px solid #2D2E3A; border-radius: 10px; "
-            "padding: 12px; color: #E2E8F0; font-size: 12px; } "
-            "QTextEdit:focus { border: 1px solid #3B82F6; }"
-        )
+        editor.setStyleSheet("font-size: 12px; padding: 12px;")
         vbox.addWidget(editor, 1)
 
         btn_row = QHBoxLayout()
-        cancel_btn = QPushButton("\u53d6\u6d88")
-        cancel_btn.setFixedWidth(90); cancel_btn.setFixedHeight(36)
-        cancel_btn.setStyleSheet(
-            "QPushButton { background: #2D2E3A; border: none; border-radius: 8px; "
-            "color: #94A3B8; font-size: 13px; } "
-            "QPushButton:hover { background: #374151; color: white; }"
-        )
-        save_btn = QPushButton("\u4fdd\u5b58")
-        save_btn.setFixedWidth(90); save_btn.setFixedHeight(36)
-        save_btn.setStyleSheet(
-            "QPushButton { background: #3B82F6; border: none; border-radius: 8px; "
-            "color: white; font-size: 13px; font-weight: 600; } "
-            "QPushButton:hover { background: #2563EB; }"
-        )
+        cancel_btn = self._compact_button(QPushButton(t("common.cancel")), height=36, min_width=90)
+        cancel_btn.setProperty("variant", "secondary")
+        cancel_btn.setStyleSheet("border: none;")
+        save_btn = self._compact_button(QPushButton(t("common.save")), height=36, min_width=90)
+        save_btn.setProperty("variant", "primary")
 
         def _close():
             panel.hide(); panel.deleteLater()
@@ -2165,142 +2200,12 @@ class RoomSettingsPage(GlobalSettingsOldStyleReplicaPage):
 
     def _open_cookie_overlay(self):
         """Cookie editor writing to room config sessdata field."""
-        root = self
-        while root.parent() and not isinstance(root.parent(), QScrollArea):
-            root = root.parent()
-        mask = QWidget(root)
-        mask.setStyleSheet("background: rgba(0,0,0,0.6);")
-        mask.resize(root.size())
-        mask.move(0, 0)
-        mask.show(); mask.raise_()
+        from core.config import CONFIG as _CFG, get_room_config as _grc, save_config as _sc
 
-        panel = QFrame(root)
-        panel.setObjectName("cookiePanel")
-        panel.setFixedSize(520, 380)
-        panel.setStyleSheet(
-            "QFrame#cookiePanel { background: #1A1B21; border: 1px solid #2D2E3A; border-radius: 14px; } "
-            "QLabel { background: transparent; }"
-        )
-        cx = (root.width() - panel.width()) // 2
-        cy = (root.height() - panel.height()) // 2
-        panel.move(cx, cy)
-        panel.show(); panel.raise_()
+        def _load():
+            return _grc(self.room_id).get("sessdata", "")
 
-        vbox = QVBoxLayout(panel)
-        vbox.setContentsMargins(28, 24, 28, 20)
-        vbox.setSpacing(14)
-
-        title_lbl = QLabel("\u7f16\u8f91 B\u7aef Cookie \u51ed\u8bc1")
-        title_lbl.setStyleSheet("color:#E2E8F0; font-size:16px; font-weight:600;")
-        vbox.addWidget(title_lbl)
-
-        hint_lbl = QLabel("\u8f93\u5165\u4f60\u7684 SESSDATA\uff08\u5728\u6d4f\u89c8\u5668 B\u7aef cookie \u4e2d\u627e\u5230\uff09")
-        hint_lbl.setStyleSheet("color:#64748B; font-size:12px;")
-        vbox.addWidget(hint_lbl)
-
-        inp = QLineEdit()
-        inp.setPlaceholderText("\u7c98\u8d34\u4f60\u7684 SESSDATA \u2026")
-        inp.setEchoMode(QLineEdit.Password)
-        inp.setStyleSheet(
-            "QLineEdit { background:#252631; border:1px solid #2D2E3A; border-radius:8px; "
-            "padding:10px 14px; color:#E2E8F0; font-size:14px; } "
-            "QLineEdit:focus { border:1px solid #3B82F6; }"
-        )
-        from core.config import get_room_config as _grc
-        inp.setText(_grc(self.room_id).get("sessdata", ""))
-
-        show_btn = QPushButton("\u663e\u793a")
-        show_btn.setFixedWidth(52); show_btn.setFixedHeight(36)
-        show_btn.setStyleSheet(
-            "QPushButton { background:#2D2E3A; border:none; border-radius:8px; color:#94A3B8; font-size:12px; } "
-            "QPushButton:hover { background:#374151; color:white; }"
-        )
-        def _toggle_show():
-            if inp.echoMode() == QLineEdit.Password:
-                inp.setEchoMode(QLineEdit.Normal); show_btn.setText("\u9690\u85cf")
-            else:
-                inp.setEchoMode(QLineEdit.Password); show_btn.setText("\u663e\u793a")
-        show_btn.clicked.connect(_toggle_show)
-
-        inp_row = QHBoxLayout()
-        inp_row.setSpacing(6)
-        inp_row.addWidget(inp, 1)
-        inp_row.addWidget(show_btn)
-        vbox.addLayout(inp_row)
-
-        verify_btn = QPushButton("\u9a8c\u8bc1 Cookie")
-        verify_btn.setFixedHeight(36)
-        verify_btn.setStyleSheet(
-            "QPushButton { background:#374151; border:none; border-radius:8px; color:#CBD5E1; font-size:13px; } "
-            "QPushButton:hover { background:#4B5563; }"
-        )
-        vbox.addWidget(verify_btn)
-
-        account_frame = QFrame()
-        account_frame.setStyleSheet("background:#131419; border-radius:8px;")
-        acct_layout = QVBoxLayout(account_frame)
-        acct_layout.setContentsMargins(12, 10, 12, 10)
-        acct_layout.setSpacing(4)
-        acct_name = QLabel("\u2014 \u5c1a\u672a\u9a8c\u8bc1 \u2014")
-        acct_name.setStyleSheet("color:#94A3B8; font-size:13px; background:transparent;")
-        acct_mid = QLabel("")
-        acct_mid.setStyleSheet("color:#64748B; font-size:11px; background:transparent;")
-        acct_layout.addWidget(acct_name)
-        acct_layout.addWidget(acct_mid)
-        vbox.addWidget(account_frame, 1)
-
-        def _verify():
-            sessdata = inp.text().strip()
-            if not sessdata:
-                acct_name.setText("\u274c \u8bf7\u5148\u8f93\u5165 SESSDATA"); acct_mid.setText(""); return
-            verify_btn.setEnabled(False); verify_btn.setText("\u9a8c\u8bc1\u4e2d\u2026")
-            acct_name.setText("\u23f3 \u9a8c\u8bc1\u4e2d\u2026"); acct_mid.setText("")
-            def _do():
-                import urllib.request as _ur, json as _j
-                try:
-                    req = _ur.Request("https://api.bilibili.com/x/web-interface/nav",
-                                      headers={"User-Agent": "Mozilla/5.0",
-                                               "Cookie": f"SESSDATA={sessdata}"})
-                    with _ur.urlopen(req, timeout=10) as resp:
-                        data = _j.loads(resp.read())
-                    if data["code"] == 0 and data["data"]["isLogin"]:
-                        acct_name.setText(f"\u2705 {data['data']['uname']}")
-                        acct_mid.setText(f"UID: {data['data']['mid']}")
-                        acct_name.setStyleSheet("color:#4ADE80; font-size:14px; font-weight:600; background:transparent;")
-                    else:
-                        acct_name.setText("\u274c Cookie \u65e0\u6548\u6216\u5df2\u8fc7\u671f")
-                        acct_name.setStyleSheet("color:#F87171; font-size:13px; background:transparent;")
-                except Exception as e:
-                    acct_name.setText(f"\u274c \u7f51\u7edc\u9519\u8bef: {e}")
-                    acct_name.setStyleSheet("color:#F87171; font-size:13px; background:transparent;")
-                finally:
-                    verify_btn.setEnabled(True); verify_btn.setText("\u9a8c\u8bc1 Cookie")
-            import threading as _t
-            _t.Thread(target=_do, daemon=True).start()
-        verify_btn.clicked.connect(_verify)
-
-        btn_row = QHBoxLayout()
-        cancel_btn = QPushButton("\u53d6\u6d88")
-        cancel_btn.setFixedWidth(90); cancel_btn.setFixedHeight(36)
-        cancel_btn.setStyleSheet(
-            "QPushButton { background:#2D2E3A; border:none; border-radius:8px; color:#94A3B8; font-size:13px; } "
-            "QPushButton:hover { background:#374151; color:white; }"
-        )
-        save_btn2 = QPushButton("\u4fdd\u5b58")
-        save_btn2.setFixedWidth(90); save_btn2.setFixedHeight(36)
-        save_btn2.setStyleSheet(
-            "QPushButton { background:#3B82F6; border:none; border-radius:8px; color:white; "
-            "font-size:13px; font-weight:600; } "
-            "QPushButton:hover { background:#2563EB; }"
-        )
-
-        def _close():
-            panel.hide(); panel.deleteLater()
-            mask.hide(); mask.deleteLater()
-
-        def _save():
-            from core.config import CONFIG as _CFG, save_config as _sc
-            val = inp.text().strip()
+        def _save(val):
             if self.room_id not in _CFG["rooms"]:
                 _CFG["rooms"][self.room_id] = {
                     "sessdata": "", "format": "", "quality": 10000,
@@ -2308,48 +2213,43 @@ class RoomSettingsPage(GlobalSettingsOldStyleReplicaPage):
                 }
             _CFG["rooms"][self.room_id]["sessdata"] = val
             _sc()
-            if val:
-                masked = val[:6] + "..." + val[-4:] if len(val) > 10 else "\u5df2\u8bbe\u7f6e"
-                self._cred_summary_label.setText(masked)
-            else:
-                self._cred_summary_label.setText("\u672a\u8bbe\u7f6e")
-            _close()
 
-        cancel_btn.clicked.connect(_close)
-        save_btn2.clicked.connect(_save)
-        btn_row.addStretch()
-        btn_row.addWidget(cancel_btn)
-        btn_row.addWidget(save_btn2)
-        vbox.addLayout(btn_row)
+        self._open_cookie_overlay_impl(
+            load_value=_load,
+            save_value=_save,
+            summary_label=getattr(self, "_cred_summary_label", None),
+        )
 
     # ------------------------------------------------------------------
     # Cookie card (new, room-only)
     # ------------------------------------------------------------------
     def _build_cookie_card(self):
+        from core.config import get_room_config as _grc
+
         cred_widget = QWidget()
         cred_row = QHBoxLayout(cred_widget)
         cred_row.setContentsMargins(0, 0, 0, 0)
         cred_row.setSpacing(8)
-        from core.config import get_room_config as _grc
+
         saved_val = _grc(self.room_id).get("sessdata", "")
-        summary_text = (saved_val[:6] + "..." + saved_val[-4:] if len(saved_val) > 10 else "\u5df2\u8bbe\u7f6e") if saved_val else "\u672a\u8bbe\u7f6e"
-        cred_summary = QLabel(summary_text)
-        cred_summary.setStyleSheet("color: #64748B; font-size: 13px; background: transparent;")
+        cred_summary = QLabel(self._format_credential_summary(saved_val))
+        cred_summary.setProperty("role", "muted")
+        cred_summary.setStyleSheet("font-size: 13px;")
         self._cred_summary_label = cred_summary
-        edit_btn = QPushButton("\u7f16\u8f91")
-        edit_btn.setFixedWidth(52); edit_btn.setFixedHeight(30)
-        edit_btn.setStyleSheet(
-            "QPushButton { background:#2D2E3A; border:none; border-radius:8px; color:#94A3B8; font-size:12px; } "
-            "QPushButton:hover { background:#3B82F6; color:white; }"
-        )
+
+        edit_btn = self._compact_button(QPushButton(), height=30, min_width=52)
+        self._bind_i18n(edit_btn, "settings.action.edit")
+        edit_btn.setProperty("variant", "secondary")
+        edit_btn.setStyleSheet("border: none;")
         edit_btn.clicked.connect(self._open_cookie_overlay)
+
         cred_row.addWidget(cred_summary)
         cred_row.addStretch()
         cred_row.addWidget(edit_btn)
-        return self._setting_card("\U0001f511 Cookie \u51ed\u8bc1", "#F59E0B", [
+        return self._setting_card("settings.group.cookie", "#F59E0B", [
             self._setting_item(
                 "SESSDATA",
-                "\u8f93\u5165 B\u7ad9 Cookie \u4ee5\u83b7\u53d6\u66f4\u9ad8\u753b\u8d28\u76f4\u64ad\u6d41",
+                "settings.room.cookie_desc",
                 cred_widget,
             ),
         ])
@@ -2361,9 +2261,10 @@ class RoomSettingsPage(GlobalSettingsOldStyleReplicaPage):
 def open_room_settings_overlay(room_id, uname, main_window):
     """Open a full-screen overlay on main_window with per-room settings."""
     from PySide6.QtGui import QFont as _QFont
+    from ui.i18n import t
 
     overlay = QWidget(main_window)
-    overlay.setStyleSheet("background: rgba(0,0,0,0.72);")
+    overlay.setObjectName("modalOverlay")
     overlay.resize(main_window.size())
     overlay.move(0, 0)
     overlay.show(); overlay.raise_()
@@ -2372,14 +2273,8 @@ def open_room_settings_overlay(room_id, uname, main_window):
     panel_h = min(main_window.height() - 60, 920)
     panel = QFrame(main_window)
     panel.setObjectName("roomSettingsPanel")
+    enable_surface(panel)
     panel.setFixedSize(panel_w, panel_h)
-    panel.setStyleSheet("""
-        QFrame#roomSettingsPanel {
-            background: #13141A;
-            border: 1px solid #2D2E3A;
-            border-radius: 16px;
-        }
-    """)
     panel.move(
         (main_window.width() - panel_w) // 2,
         (main_window.height() - panel_h) // 2,
@@ -2392,41 +2287,33 @@ def open_room_settings_overlay(room_id, uname, main_window):
 
     # ---- top bar ----
     top_bar = QWidget()
+    top_bar.setObjectName("roomSettingsTopBar")
     top_bar.setFixedHeight(56)
-    top_bar.setStyleSheet(
-        "background: #1A1B21; border-top-left-radius: 16px; border-top-right-radius: 16px; "
-        "border-bottom: 1px solid #272833;"
-    )
     top_layout = QHBoxLayout(top_bar)
     top_layout.setContentsMargins(24, 0, 16, 0)
     top_layout.setSpacing(10)
 
     icon_lbl = QLabel("\U0001f4f9")
-    icon_lbl.setStyleSheet("color: #3B82F6; font-size: 18px;")
+    icon_lbl.setProperty("role", "link")
+    icon_lbl.setStyleSheet("font-size: 18px;")
 
-    room_title_lbl = QLabel(f"\u9891\u9053\u8bbe\u7f6e  \u2014  {uname}")
+    room_title_lbl = QLabel(t("settings.room.title", name=uname))
     room_title_lbl.setFont(_QFont("Microsoft YaHei UI", 14, _QFont.Bold))
-    room_title_lbl.setStyleSheet("color: #F8FAFC;")
+    room_title_lbl.setProperty("role", "title")
 
     badge_lbl = QLabel(f"Room {room_id}")
-    badge_lbl.setStyleSheet(
-        "color: #60A5FA; background: #1E2E45; border: 1px solid #1D3A5E; "
-        "border-radius: 6px; padding: 3px 8px; font-size: 12px;"
-    )
+    badge_lbl.setObjectName("roomBadge")
 
-    note_lbl = QLabel("\u672a\u4fee\u6539\u7684\u9879\u76ee\u7ee7\u627f\u5168\u5c40\u8bbe\u5b9a")
-    note_lbl.setStyleSheet(
-        "color: #4ADE80; background: #15251A; border: 1px solid #1E3A26; "
-        "border-radius: 6px; padding: 4px 10px; font-size: 12px;"
-    )
+    note_lbl = QLabel(t("settings.room.inherit_note"))
+    note_lbl.setObjectName("inheritBadge")
 
-    close_btn = QPushButton("\u2715")
+    close_btn = QPushButton("×")
     close_btn.setFixedSize(34, 34)
-    close_btn.setToolTip("\u5173\u95ed")
-    close_btn.setStyleSheet("""
-        QPushButton { background: transparent; border: none; color: #64748B; font-size: 16px; border-radius: 8px; }
-        QPushButton:hover { background: #2D2E3A; color: #F87171; }
-    """)
+    close_btn.setCursor(Qt.PointingHandCursor)
+    close_btn.setToolTip(t("common.close"))
+    close_btn.setProperty("variant", "close")
+    from ui.theme import repolish
+    repolish(close_btn)
 
     top_layout.addWidget(icon_lbl)
     top_layout.addWidget(room_title_lbl)
@@ -2460,9 +2347,11 @@ def open_add_channel_overlay(main_window):
     但不用 QDialog 模态弹窗,而是作为普通 widget 嵌到全屏遮罩中央。
     加载完成后调 main_window.add_card 添加卡片,再关掉 overlay。
     """
+    from ui.i18n import t
+
     # 1) 全屏半透明遮罩
     overlay = QWidget(main_window)
-    overlay.setStyleSheet("background: rgba(0,0,0,0.72);")
+    overlay.setObjectName("modalOverlay")
     overlay.resize(main_window.size())
     overlay.move(0, 0)
     overlay.show(); overlay.raise_()
@@ -2474,9 +2363,9 @@ def open_add_channel_overlay(main_window):
     dialog.setFixedSize(420, 260)
 
     # 顶部加一个小标题
-    title = QLabel("添加直播间")
+    title = QLabel(t("add_room.title"))
     title.setFont(QFont("Microsoft YaHei UI", 14, QFont.Bold))
-    title.setStyleSheet("color: #F8FAFC; border: none; background: transparent;")
+    title.setProperty("role", "title")
     dialog.layout().insertWidget(0, title)
 
     # 居中
@@ -2496,9 +2385,11 @@ def open_add_channel_overlay(main_window):
     def _on_accepted():
         info = dialog.result
         if info:
-            main_window.add_card(info)
+            main_window.add_card(info, animate=True)
             main_window.show_notification(
-                f"已添加 {info['uname']}", "添加成功", "success",
+                t("notify.add_ok_body", name=info["uname"]),
+                t("notify.add_ok_title"),
+                "success",
                 merge_key=f"add:{info['room_id']}",
             )
         _close()

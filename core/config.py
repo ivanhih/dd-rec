@@ -11,23 +11,19 @@ VIDEOS_DIR_NAME = "录播文件"      # 用户视频目录(独立于 userdata)
 
 
 def _portable_root() -> str:
-    """获取 portable 根目录(launcher 所在目录或版本化子目录的父目录)
+    """获取程序根目录。
 
-    平坦化后:portable 根 = exe_dir(dd_rec_main.exe 跟 launcher 同目录)
-    兼容老结构(主程序在 dd_rec-{ver}/ 子目录):父目录有 version.ini
-    开发态:返回项目根
+    新结构中 dd_rec.exe、version.ini、ffmpeg/、userdata/ 均位于同一目录。
+    仍兼容旧版主程序位于版本化子目录、version.ini 位于父目录的结构。
     """
     if getattr(sys, "frozen", False):
         exe_dir = os.path.dirname(sys.executable)
-        # 平坦化主路径:version.ini 在主程序同目录
         if os.path.exists(os.path.join(exe_dir, "version.ini")):
             return exe_dir
-        # 兼容老结构(主程序在 dd_rec-{ver}/ 子目录)
         parent = os.path.dirname(exe_dir)
         if os.path.exists(os.path.join(parent, "version.ini")):
             return parent
         return exe_dir
-    # 开发态:项目根
     return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
@@ -56,56 +52,40 @@ def _video_save_dir() -> str:
 
 
 def _is_portable_mode() -> bool:
-    """检测是否为 Portable 模式"""
+    """检测是否为 Portable 模式（兼容新旧目录结构）。"""
     if not getattr(sys, "frozen", False):
         return False
     exe_dir = os.path.dirname(sys.executable)
     parent_dir = os.path.dirname(exe_dir)
-    return os.path.exists(os.path.join(parent_dir, "version.ini"))
+    return any(
+        os.path.exists(os.path.join(base, "version.ini"))
+        for base in (exe_dir, parent_dir)
+    )
 
 
 def _read_version_ini() -> str:
-    """读取 version.ini 获取版本号"""
+    """读取新结构同目录或旧结构父目录中的 version.ini。"""
     if not getattr(sys, "frozen", False):
         return ""
     exe_dir = os.path.dirname(sys.executable)
-    parent_dir = os.path.dirname(exe_dir)
-    version_ini = os.path.join(parent_dir, "version.ini")
-    try:
-        if os.path.exists(version_ini):
-            with open(version_ini, "r", encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if line.startswith("version="):
-                        return line.split("=", 1)[1].strip()
-    except Exception:
-        pass
+    for base in (exe_dir, os.path.dirname(exe_dir)):
+        version_ini = os.path.join(base, "version.ini")
+        try:
+            if os.path.exists(version_ini):
+                with open(version_ini, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if line.startswith("version="):
+                            return line.split("=", 1)[1].strip()
+        except Exception:
+            logging.exception("读取 version.ini 失败: %s", version_ini)
     return ""
 
 
 def _resource_dir() -> str:
-    """代码自带的资源目录（只读）
-
-    Portable 模式（frozen + version.ini 存在）：
-      - 返回 app-{version}/ 目录（版本化目录，包含主程序和资源）
-    非 Portable 模式（frozen）：
-      - 返回 exe 同级目录
-    开发态：
-      - 返回项目根目录"""
+    """代码自带资源目录；打包后资源与唯一主程序位于同一 onedir。"""
     if getattr(sys, "frozen", False):
-        exe_dir = os.path.dirname(sys.executable)
-        parent_dir = os.path.dirname(exe_dir)  # bilirec/ 根目录
-
-        # 检查是否是 Portable 模式
-        if _is_portable_mode():
-            version = _read_version_ini()
-            if version:
-                return os.path.join(parent_dir, f"dd_rec-{version}")
-            # version.ini 不存在或版本为空，使用默认
-            logger.warning("Portable 模式但 version.ini 缺失或为空，使用默认路径")
-
-        # 非 Portable 或无法确定版本，使用 exe 同级目录
-        return exe_dir
+        return os.path.dirname(sys.executable)
     return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
@@ -119,6 +99,20 @@ RESOURCE_DIR = _resource_dir()
 
 CONFIG_FILE = os.path.join(APP_DIR, "config.json")
 DATA_FILE = os.path.join(APP_DIR, "data.json")
+
+# 历史默认（改默认前写死在用户 config 里的值）。仅当仍等于这些旧默认时才迁移。
+LEGACY_STREAM_DEFAULTS = {
+    "stream_codec": "av1",
+    "stream_format": "fmp4",
+}
+# 迁移一次性标记：避免用户升级后主动改回 av1/fmp4 又被再次覆盖
+STREAM_DEFAULTS_MIGRATION_FLAG = "stream_defaults_migrated_v2"
+DEPRECATED_GLOBAL_SETTINGS_KEYS = frozenset({"mirror_chyan_enabled", "mirror_chyan_cdk"})
+
+# ==================== 外观可选项（设置页下拉 / 后续主题与 i18n 共用） ====================
+# 配置里仍存展示字符串，兼容已有 userdata/config.json；内部映射在 Phase 1+ 再做。
+LANGUAGE_OPTIONS = ("简体中文", "繁體中文", "English")
+THEME_OPTIONS = ("深色", "浅色")
 
 # ==================== 默认全局设置 ====================
 DEFAULT_GLOBAL_SETTINGS = {
@@ -147,9 +141,13 @@ DEFAULT_GLOBAL_SETTINGS = {
     "stream_resolution": "原画",
     "stream_fps": "30 fps",
     "stream_bitrate": "30.0 Mb/s",
-    "stream_codec": "av1",
-    "stream_format": "fmp4",
+    "stream_codec": "h264",
+    "stream_format": "flv",
     "stream_url_priority": "",
+    # 找不到目标组合时：compatible=尽量同 codec；strict=宁可不录；best_effort=任意最高质量
+    "stream_fallback_policy": "compatible",
+    # 内部：旧 av1/fmp4 默认是否已迁移（用户勿手改）
+    STREAM_DEFAULTS_MIGRATION_FLAG: False,
 
     # 聊天消息录制
     "chat_record_enabled": True,
@@ -194,10 +192,17 @@ DEFAULT_GLOBAL_SETTINGS = {
 {%- endif -%}
 -{{ ctime | date: '%Y-%m-%d-%H%M%S-%3f', 'local' }}.{{ format }}""",
 
-    # 转换格式
+    # 转换格式（遗留 key，仍可读；新逻辑优先 artifact_*）
     "convert_enabled": True,
-    "convert_delete_source": True,
+    "convert_delete_source": False,
     "convert_format": "mp4",
+
+    # 关闭文件后处理（无损优先）
+    "artifact_profile": "lossless_first",
+    "artifact_strict_decode_validation": True,
+    "artifact_keep_source": True,
+    "webhook_only_verified_artifacts": True,
+    "flv_native_capture": True,
 
     # 直播监控
     "monitor_delay": "自动",
@@ -227,9 +232,7 @@ DEFAULT_GLOBAL_SETTINGS = {
     "prevent_sleep": True,
 
     # 更新通道
-    "mirror_chyan_enabled": False,   # 启用 Mirror 酱作为 GitHub 失败时的 fallback 检查源
-    "mirror_chyan_cdk": "",          # 用户 CDK,明文存于 config.json,UI 有警告
-    "update_channel": "github",      # 用户上次选择的下载通道(github / mirror_chyan)
+    "update_channel": "github",      # 用户上次选择的下载通道(github / cnb)
 }
 
 # ==================== 配置管理 ====================
@@ -241,6 +244,98 @@ CONFIG = {
     "rooms": {}
 }
 
+
+def apply_config_migrations(saved_gs: dict | None, gs: dict) -> list[str]:
+    """对已合并的 global_settings 做一次性兼容迁移。
+
+    规则：
+      1. 仅当 stream_codec/stream_format **同时**仍为历史默认 av1/fmp4 时，迁移到 h264/flv；
+         用户只改了其中一项的，视为明确选择，不覆盖。
+      2. 旧 convert_delete_source=True 且磁盘上还没有 artifact_keep_source 时，
+         映射为 artifact_keep_source=False。
+      3. 迁移幂等：写 STREAM_DEFAULTS_MIGRATION_FLAG，避免用户后来主动改回旧值被再迁一次。
+
+    返回人类可读的迁移说明列表（空 = 无变化）。
+    """
+    notes: list[str] = []
+    saved_gs = saved_gs or {}
+
+    already = bool(gs.get(STREAM_DEFAULTS_MIGRATION_FLAG) or saved_gs.get(STREAM_DEFAULTS_MIGRATION_FLAG))
+    if not already:
+        codec = str(gs.get("stream_codec") or "").strip().lower()
+        fmt = str(gs.get("stream_format") or "").strip().lower()
+        legacy_codec = LEGACY_STREAM_DEFAULTS["stream_codec"].lower()
+        legacy_fmt = LEGACY_STREAM_DEFAULTS["stream_format"].lower()
+        if codec == legacy_codec and fmt == legacy_fmt:
+            gs["stream_codec"] = DEFAULT_GLOBAL_SETTINGS["stream_codec"]
+            gs["stream_format"] = DEFAULT_GLOBAL_SETTINGS["stream_format"]
+            notes.append(
+                f"stream_codec/format: {legacy_codec}/{legacy_fmt} -> "
+                f"{gs['stream_codec']}/{gs['stream_format']}（旧默认值一次性迁移）"
+            )
+        gs[STREAM_DEFAULTS_MIGRATION_FLAG] = True
+
+    # convert_delete_source → artifact_keep_source（仅磁盘缺新 key 时）
+    if "artifact_keep_source" not in saved_gs and "convert_delete_source" in saved_gs:
+        delete_src = bool(saved_gs.get("convert_delete_source"))
+        keep = not delete_src
+        if bool(gs.get("artifact_keep_source", True)) != keep:
+            gs["artifact_keep_source"] = keep
+            notes.append(
+                f"artifact_keep_source={keep}（由旧 convert_delete_source={delete_src} 映射）"
+            )
+        else:
+            gs["artifact_keep_source"] = keep
+
+    return notes
+
+
+def _merge_global_settings(saved_gs: dict | None) -> tuple[dict, list[str], bool]:
+    """DEFAULT ∪ saved → 迁移后的 global_settings、迁移日志、是否需要写回磁盘。"""
+    saved_gs = saved_gs if isinstance(saved_gs, dict) else {}
+    removed_keys = sorted(DEPRECATED_GLOBAL_SETTINGS_KEYS.intersection(saved_gs))
+    effective_saved = {
+        k: v for k, v in saved_gs.items()
+        if k not in DEPRECATED_GLOBAL_SETTINGS_KEYS
+    }
+
+    merged = dict(DEFAULT_GLOBAL_SETTINGS)
+    for k, v in DEFAULT_GLOBAL_SETTINGS.items():
+        if k in effective_saved:
+            merged[k] = effective_saved[k]
+    # 保留用户自定义额外 key，但明确废弃的更新源配置除外。
+    for k, v in effective_saved.items():
+        if k not in merged:
+            merged[k] = v
+
+    notes = apply_config_migrations(effective_saved, merged)
+    if removed_keys:
+        notes.append("移除已停用更新源配置: " + ", ".join(removed_keys))
+
+    channel = str(merged.get("update_channel") or "github").strip().lower()
+    if channel not in {"github", "cnb"}:
+        merged["update_channel"] = "github"
+        notes.append(f"update_channel: {channel or '(empty)'} -> github")
+
+    dirty = bool(notes) or bool(removed_keys) or (
+        not bool(effective_saved.get(STREAM_DEFAULTS_MIGRATION_FLAG))
+        and bool(merged.get(STREAM_DEFAULTS_MIGRATION_FLAG))
+    )
+    return merged, notes, dirty
+
+
+def _log_effective_stream_settings(gs: dict, migration_notes: list[str] | None = None) -> None:
+    codec = gs.get("stream_codec")
+    fmt = gs.get("stream_format")
+    policy = gs.get("stream_fallback_policy")
+    if migration_notes:
+        for n in migration_notes:
+            logging.info(f"⚙️ 配置迁移: {n}")
+    logging.info(
+        f"📺 实际使用直播流: codec={codec}, format={fmt}, fallback={policy}"
+    )
+
+
 if os.path.exists(CONFIG_FILE):
     try:
         with open(CONFIG_FILE, "r", encoding="utf-8") as f:
@@ -249,8 +344,16 @@ if os.path.exists(CONFIG_FILE):
                 CONFIG["global"] = loaded.get("global", CONFIG["global"])
                 CONFIG["rooms"] = loaded.get("rooms", {})
                 saved_gs = loaded.get("global_settings", {})
-                for k, v in DEFAULT_GLOBAL_SETTINGS.items():
-                    CONFIG["global_settings"][k] = saved_gs.get(k, v)
+                merged, notes, dirty = _merge_global_settings(saved_gs)
+                CONFIG["global_settings"] = merged
+                if dirty:
+                    try:
+                        # save_config 在下方定义；启动路径用内联写盘避免前向引用问题
+                        with open(CONFIG_FILE, "w", encoding="utf-8") as wf:
+                            json.dump(CONFIG, wf, ensure_ascii=False, indent=4)
+                    except Exception as e:
+                        logging.warning(f"配置迁移后写回失败: {e}")
+                _log_effective_stream_settings(merged, notes)
     except Exception as e:
         logging.error(f"读取配置失败: {e}")
 
@@ -272,14 +375,14 @@ def reload_config() -> bool:
         CONFIG["rooms"] = loaded.get("rooms", {})
         # 全局变量
         CONFIG["global"] = loaded.get("global", CONFIG["global"])
-        # 全局设置：保留 DEFAULT_GLOBAL_SETTINGS 的所有 key，但用磁盘值覆盖
         saved_gs = loaded.get("global_settings", {})
-        for k, v in DEFAULT_GLOBAL_SETTINGS.items():
-            CONFIG["global_settings"][k] = saved_gs.get(k, v)
-        # 用户新增的 key 也带上
-        for k, v in saved_gs.items():
-            if k not in CONFIG["global_settings"]:
-                CONFIG["global_settings"][k] = v
+        merged, notes, dirty = _merge_global_settings(saved_gs)
+        CONFIG["global_settings"] = merged
+        if dirty:
+            try:
+                save_config()
+            except Exception as e:
+                logging.warning(f"reload 配置迁移后写回失败: {e}")
         return True
     except Exception as e:
         logging.error(f"reload_config 失败: {e}")
@@ -417,6 +520,8 @@ def save_app_data(channels):
 
 # ==================== room per-settings API ====================
 def get_room_setting(room_id, key):
+    if room_id is None:
+        return get_global_setting(key)
     room_id = str(room_id)
     if room_id not in CONFIG["rooms"]:
         return get_global_setting(key)

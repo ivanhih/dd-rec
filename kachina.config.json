@@ -14,7 +14,7 @@
   "appName": "dd_rec",
   "publisher": "ivanhih",
   "regName": "dd_rec",
-  "exeName": "dd_rec_main.exe",
+  "exeName": "dd_rec.exe",
   "uninstallName": "dd_rec.uninst.exe",
   "updaterName": "dd_rec.update.exe",
   "programFilesPath": "dd_rec",

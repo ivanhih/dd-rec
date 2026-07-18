@@ -5,11 +5,9 @@ Portable 更新模块
   1. check_update()           → 调 GitHub API 检查最新 release
   2. download_update(info, cb) → 下载 7z 到 temp/
   3. 用户确认 → launch_kachina_update() spawn DDRec.update.exe → 主程序退出
-  4. kachina update.exe: 关闭主程序 → HDiffPatch → 替换 launcher / dd_rec-{ver}/ → 启动新版
+  4. kachina update.exe: 关闭 dd_rec.exe → HDiffPatch/替换文件 → 启动新版
 
-不再走 pending_update.json 流程：
-  - launcher 已被简化为只启动主程序（不再负责解包）
-  - kachina update.exe 自身会处理 launcher 替换（因为 launcher 已退出，可写）
+主程序只有 dd_rec.exe 一个入口；更新由独立的 dd_rec.update.exe 接管。
 """
 
 import os
@@ -40,14 +38,14 @@ class UpdateInfo:
     size: int
     body: str
     asset_name: str = ""
-    published_at: str = ""   # GitHub release 发布时间 (ISO 8601 UTC),mirror 酱路径可能为空
+    published_at: str = ""   # GitHub release 发布时间 (ISO 8601 UTC)
 
 
 def get_app_dir() -> str:
     """获取应用根目录（主程序所在目录）
 
-    平坦化后:dd_rec_main.exe 直接在 portable 根目录,所以 sys.executable 的父目录
-    就是 app_dir。Launcher 也是 onefile 模式,逻辑一致。
+    单入口结构中 dd_rec.exe 直接位于 portable 根目录，所以 sys.executable 的父目录
+    就是 app_dir。
 
     兼容老版本结构(用 dd_rec-{ver}/ 子目录):如果父目录有 version.ini 就在父目录。
     """
@@ -117,89 +115,22 @@ def _is_newer(remote: str, local: str) -> bool:
 
 # ==================== 检查更新 ====================
 def check_update(max_retries: int = 3) -> Optional[UpdateInfo]:
-    """检查更新(GitHub 优先,失败/无版本回落 mirror 酱)
-
-    优先级:
-      1) GitHub API(主通道,默认行为,用户最信任)
-      2) Mirror 酱 API(fallback,仅在 GitHub 完全失败时顶上)
-
-    返回:
-      UpdateInfo — 有可用更新
-      None       — 已是最新 / 两个源都失败 / 没匹配资产
-    """
+    """通过 GitHub API 检查更新；下载阶段仍可选择 GitHub 或 CNB。"""
     local = get_current_version()
     logger.info(f"当前版本: {local}")
-
-    # 1) GitHub(主通道)
-    github_info = _check_update_github_only(local, max_retries)
-    if github_info is not None:
-        return github_info
-
-    # 2) Mirror 酱(fallback,GitHub 失败时)
-    mirror_info = _try_mirror_chyan(local)
-    if mirror_info is None:
-        return None
-    if mirror_info.raw_code != 0:
-        logger.info(f"mirror 酱 code={mirror_info.raw_code},跳过")
-        return None
-
-    remote_tag = mirror_info.version
-    if not remote_tag or not _is_newer(remote_tag, local):
-        logger.info("mirror 酱:当前已是最新版本")
-        return None
-
-    # 下载 URL 仍拼 GitHub 直链(mirror 酱 url 带时效,kachina 接不了 — 留给未来重构)
-    github_url = _build_github_release_url(remote_tag)
-    if not github_url:
-        logger.warning("mirror 酱:有更新但拼不出 GitHub 直链,跳过")
-        return None
-
-    logger.info(f"mirror 酱 fallback:最新 v{remote_tag} (GitHub 直链下载)")
-    return UpdateInfo(
-        version=remote_tag,
-        download_url=github_url,
-        size=0,  # mirror 酱不返回 size,这里无法预知
-        body=mirror_info.release_note,
-        asset_name="(mirror-chyan-via-github)",
-        published_at="",  # mirror 酱 API 当前未返回此字段
-    )
-
-
-def _try_mirror_chyan(local: str):
-    """调 mirror 酱。None=不可用/未启用/异常,本次跳过。"""
-    try:
-        from core.config import get_global_setting
-        if not get_global_setting("mirror_chyan_enabled"):
-            return None
-        from core.mirror_chyan import check_mirror_chyan
-        cdk = (get_global_setting("mirror_chyan_cdk") or "").strip()
-        return check_mirror_chyan(local, cdk)
-    except Exception as e:
-        logger.warning(f"mirror 酱入口异常: {e}")
-        return None
-
-
-def _build_github_release_url(version: str) -> Optional[str]:
-    """拼 GitHub release 直链(portable.7z,主程序优先找的资产)
-
-    实际资产名可能是 -portable.7z / -portable.zip,这里只兜底给一个
-    最常见的 -portable.7z 模板。如果 release 用别的命名,这里会 404,
-    kachina 安装器会自己处理(它用的是 kachina.config.json 的 source.uri)。
-    """
-    if not version:
-        return None
-    return f"https://github.com/{GITHUB_REPO}/releases/download/v{version}/dd_rec-{version}-portable.7z"
+    return _check_update_github_only(local, max_retries)
 
 
 def _check_update_github_only(local: str, max_retries: int) -> Optional[UpdateInfo]:
     """原 check_update() 逻辑(改名,逻辑零修改)。GitHub API 不可达 = 返回 None。"""
     for attempt in range(max_retries):
         try:
+            from core.http_ssl import urlopen as _ssl_urlopen
             req = urllib.request.Request(
                 GITHUB_API,
                 headers={"User-Agent": "bilirec-updater/1.0"},
             )
-            with urllib.request.urlopen(req, timeout=30) as resp:
+            with _ssl_urlopen(req, timeout=30) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
 
             remote_tag = (data.get("tag_name") or "").lstrip("v")
@@ -282,9 +213,9 @@ def launch_kachina_update(app_dir: str, source_id: Optional[str] = None) -> None
       1. 弹"DD录播机 安装程序"窗口(类似 BetterGI 安装器)
       2. 读 kachina.config.json 的 source(指向 GitHub release Install.exe)
       3. 用户点"更新"按钮 → 下载远端 Install.exe
-      4. 关闭 dd_rec_main.exe(占用检测) + dd_rec.exe(launcher)
-      5. HDiffPatch 增量替换 dd_rec-{version}/ + 替换 launcher.exe
-      6. 启动新版本
+      4. 关闭当前 dd_rec.exe
+      5. HDiffPatch 增量替换程序文件
+      6. 启动新版 dd_rec.exe
 
     调用本函数后必须 os._exit(0) 立即退出主程序,避免双进程冲突。
 

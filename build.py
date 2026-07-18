@@ -6,19 +6,22 @@ dd-rec 打包脚本（Portable 方案）
 流程：
   1. 检查依赖（pyinstaller、ffmpeg）
   2. 清理 dist/build
-  3. PyInstaller 打包 launcher → dist/dd_rec/dd_rec.exe
-  4. PyInstaller 打包主程序 → dist/dd_rec-{VERSION}/dd_rec_main.exe
-  5. 复制 ffmpeg 到根目录
-  6. 创建 version.ini
-  7. 打包成 zip（dd_rec-{VERSION}.zip）
+  3. PyInstaller 打包主程序 → dist/dd_rec_app/dd_rec.exe
+  4. 生成 dd_rec.update.exe
+  5. 平铺主程序并复制 ffmpeg、创建 version.ini
+  6. 生成 kachina metadata / hashed
+  7. 打包成 7z（dd_rec-{VERSION}-portable.7z，失败时回退 zip）
+  8. 生成 Install.exe（正式发布必需）
+  9. 复制 portable 和 installer 到 installer/
 
 产物：
-  dist/dd_rec-{VERSION}.zip  ← 发布到 GitHub Release
+  dist/dd_rec-{VERSION}-portable.7z      ← 发布到 GitHub Release
+  dist/dd_rec.Install.{VERSION}.exe      ← 完整安装器
+  installer/                            ← 发布产物副本，方便手动检查/上传
 
 目录结构:
   dd-rec/
-  ├── dd_rec.exe              # 启动器
-  ├── dd_rec_main.exe         # 主程序(平坦化,跟 launcher 同目录)
+  ├── dd_rec.exe              # 唯一主程序入口
   ├── dd_rec.update.exe       # kachina 自更新器
   ├── version.ini              # 当前版本
   ├── _internal/              # PyInstaller 运行时
@@ -52,7 +55,6 @@ PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 DIST_DIR = os.path.join(PROJECT_ROOT, "dist")
 BUILD_DIR = os.path.join(PROJECT_ROOT, "build")
 INSTALLER_DIR = os.path.join(PROJECT_ROOT, "installer")
-LAUNCHER_SPEC = os.path.join(PROJECT_ROOT, "launcher.spec")
 APP_SPEC = os.path.join(PROJECT_ROOT, "app.spec")
 FFMPEG_BIN = r"C:\ffmpeg\bin"
 FFMPEG_EXES = ("ffmpeg.exe", "ffprobe.exe")
@@ -250,8 +252,8 @@ def run(cmd: list, **kwargs) -> int:
 
 
 def clean() -> None:
-    """清理旧构建产物（失败时跳过）"""
-    print("\n[1/7] 清理旧构建...")
+    """清理旧构建产物，并移除 installer/ 中当前版本的旧发布文件。"""
+    print("\n[1/10] 清理旧构建...")
     for d in (DIST_DIR, BUILD_DIR):
         if os.path.exists(d):
             try:
@@ -267,25 +269,27 @@ def clean() -> None:
                                 os.remove(sub_path)
                             elif os.path.isdir(sub_path):
                                 shutil.rmtree(sub_path)
-                        except:
+                        except Exception:
                             pass
 
-
-def build_launcher() -> None:
-    """PyInstaller 打包启动器（onefile 模式）"""
-    print(f"\n[2/7] PyInstaller 打包启动器...")
-    if isinstance(PYTHON_EXE, str) and " " in PYTHON_EXE and not PYTHON_EXE.startswith("py "):
-        cmd = PYTHON_EXE.split() + ["-m", "PyInstaller", LAUNCHER_SPEC, "--noconfirm"]
-    elif PYTHON_EXE.startswith("py "):
-        cmd = PYTHON_EXE.split() + ["-m", "PyInstaller", LAUNCHER_SPEC, "--noconfirm"]
-    else:
-        cmd = [PYTHON_EXE, "-m", "PyInstaller", LAUNCHER_SPEC, "--noconfirm"]
-    run(cmd, cwd=PROJECT_ROOT)
+    # installer/ 不随 dist 一起删除，但当前版本的旧文件必须先移除。
+    # 否则本轮 pack 失败时，上一轮同版本安装器会被误认为是新产物。
+    release_names = (
+        f"dd_rec-{VERSION}-portable.7z",
+        f"dd_rec-{VERSION}-portable.zip",
+        f"dd_rec.Install.{VERSION}.exe",
+    )
+    if os.path.isdir(INSTALLER_DIR):
+        for name in release_names:
+            old_path = os.path.join(INSTALLER_DIR, name)
+            if os.path.isfile(old_path):
+                os.remove(old_path)
+                print(f"   删除旧发布产物: {old_path}")
 
 
 def build_app() -> None:
     """PyInstaller 打包主程序"""
-    print(f"\n[3/7] PyInstaller 打包主程序...")
+    print(f"\n[2/10] PyInstaller 打包主程序...")
     if isinstance(PYTHON_EXE, str) and " " in PYTHON_EXE and not PYTHON_EXE.startswith("py "):
         cmd = PYTHON_EXE.split() + ["-m", "PyInstaller", APP_SPEC, "--noconfirm"]
     elif PYTHON_EXE.startswith("py "):
@@ -297,7 +301,7 @@ def build_app() -> None:
 
 def assemble_portable_dir() -> None:
     """组装 Portable 目录结构"""
-    print(f"\n[4/7] 组装 Portable 目录...")
+    print(f"\n[4/10] 组装 Portable 目录...")
 
     # 目标根目录
     portable_root = os.path.join(DIST_DIR, "dd-rec")
@@ -322,22 +326,8 @@ def assemble_portable_dir() -> None:
                 except Exception:
                     pass
 
-    # 1. 复制启动器（onefile 模式：单 exe）
-    #    把 dist/dd_rec.exe 复制成 dd-rec/dd_rec.exe（直接在根目录）
-    launcher_src = os.path.join(DIST_DIR, "dd_rec.exe")
-    if os.path.exists(launcher_src):
-        launcher_dst = os.path.join(portable_root, "dd_rec.exe")
-        if os.path.exists(launcher_dst):
-            os.remove(launcher_dst)
-        shutil.copy2(launcher_src, launcher_dst)
-        print(f"   复制启动器: dd_rec.exe")
-    else:
-        print(f"   警告: 找不到启动器 {launcher_src}")
-
-    # 2. 平铺主程序到 portable 根(不再有 dd_rec-{VERSION}/ 子目录)
-    #    原因: kachina update.exe 启动时检查 current_exe().parent() / exe_name,
-    #    找不到就走"装到 Program Files"模式。所以主程序必须跟 update.exe 平铺,
-    #    这样 update.exe 看到 dd_rec_main.exe 就走"就地升级"模式(参考 BetterGI)。
+    # 1. 平铺真正的主程序到 portable 根。dd_rec.exe 是唯一入口，
+    #    不再额外构建或复制 launcher。
     app_src = os.path.join(DIST_DIR, "dd_rec_app")  # PyInstaller onedir 输出
     if os.path.exists(app_src):
         # 把 onedir 里所有条目(文件 + 子目录,主要是 _internal/)复制/合并到 portable 根
@@ -357,8 +347,16 @@ def assemble_portable_dir() -> None:
                 print(f"   警告: 平铺 {entry} 失败: {e}")
         shutil.rmtree(app_src)
         print(f"   平铺主程序到 portable 根({len(os.listdir(portable_root))} 项)")
+        main_exe = os.path.join(portable_root, "dd_rec.exe")
+        if not os.path.isfile(main_exe) or os.path.getsize(main_exe) == 0:
+            raise RuntimeError(f"主程序未正确生成: {main_exe}")
+        for legacy_name in ("dd_rec_main.exe", "launcher.log"):
+            legacy_path = os.path.join(portable_root, legacy_name)
+            if os.path.isfile(legacy_path):
+                os.remove(legacy_path)
+                print(f"   删除旧 launcher 架构残留: {legacy_name}")
     else:
-        print(f"   警告: 找不到主程序 {app_src}")
+        raise RuntimeError(f"找不到主程序构建目录: {app_src}")
 
     # 3. 复制 ffmpeg 到根目录
     ffmpeg_dst = os.path.join(portable_root, "ffmpeg")
@@ -400,9 +398,9 @@ def create_7z() -> str:
 
     文件名: dd_rec-{VERSION}-portable.7z
     内部结构跟原 zip 一致：
-      dd_rec.exe / version.ini / dd_rec.update.exe / dd_rec-{VERSION}/ / ffmpeg/ / temp/
+      dd_rec.exe / version.ini / dd_rec.update.exe / _internal/ / ffmpeg/ / temp/
     """
-    print(f"\n[5/9] 打包成 7z/zip...")
+    print(f"\n[6/10] 打包成 7z/zip...")
     portable_root = os.path.join(DIST_DIR, "dd-rec")
     archive_name = f"dd_rec-{VERSION}-portable"
     archive_path = os.path.join(DIST_DIR, archive_name)
@@ -447,7 +445,7 @@ def build_kachina_update() -> str:
     if not kachina:
         raise RuntimeError("kachina-builder 不可用，请先完成 Phase 0")
 
-    print(f"\n[2.5/9] 生成 kachina update.exe...")
+    print(f"\n[3/10] 生成 kachina update.exe...")
     update_exe = os.path.join(DIST_DIR, "dd_rec.update.exe")
     if os.path.exists(update_exe):
         os.remove(update_exe)
@@ -466,11 +464,11 @@ def build_kachina_metadata(portable_root: str) -> tuple:
 
     kachina 增量更新 (HDiffPatch) 需要的元数据。
     - portable_root: assemble 完之后的 portable 根目录(dist/dd-rec/),
-      必须包含 launcher (dd_rec.exe) + version.ini + 主程序 + _internal + ffmpeg,
-      这样 patch 时这些文件都会被替换(否则 launcher 和 version.ini 永远不更新)
+      必须包含主程序 dd_rec.exe + version.ini + update.exe + _internal + ffmpeg，
+      这样更新元数据会覆盖完整的单入口程序目录
     """
     kachina = find_kachina_builder()
-    print(f"\n[6/9] 生成 kachina metadata + hashed...")
+    print(f"\n[5/10] 生成 kachina metadata + hashed...")
     metadata = os.path.join(DIST_DIR, "metadata.json")
     hashed = os.path.join(DIST_DIR, "hashed")
     if os.path.exists(hashed):
@@ -490,14 +488,14 @@ def build_kachina_metadata(portable_root: str) -> tuple:
     print("  $ " + " ".join(cmd))
     # gen 跑全量 hash + 压缩,几百到几千个文件
     # PyInstaller onedir 通常 1500-3000 个文件,180MB 左右 → 15 分钟保守
-    _run_kachina(cmd, wait_for=metadata, timeout=900)
+    _run_kachina(cmd, wait_for=metadata, timeout=3600)
     return metadata, hashed
 
 
 def build_kachina_installer(metadata: str, hashed: str) -> str:
     """生成完整的 Install.exe — 给想要安装器的用户"""
     kachina = find_kachina_builder()
-    print(f"\n[7/9] 生成 kachina Install.exe...")
+    print(f"\n[7/10] 生成 kachina Install.exe...")
     install_exe = os.path.join(DIST_DIR, f"dd_rec.Install.{VERSION}.exe")
     if os.path.exists(install_exe):
         os.remove(install_exe)
@@ -511,23 +509,49 @@ def build_kachina_installer(metadata: str, hashed: str) -> str:
     if os.path.exists(APP_ICON):
         cmd += ["--icon", APP_ICON]
     print("  $ " + " ".join(cmd))
-    # pack Install.exe 也是写大文件,5 分钟够
-    _run_kachina(cmd, wait_for=install_exe, timeout=300)
+    # pack 需要处理完整 hashed 数据；慢磁盘或杀毒扫描时可能超过 5 分钟。
+    _run_kachina(cmd, wait_for=install_exe, timeout=3600)
+    if not os.path.isfile(install_exe) or os.path.getsize(install_exe) == 0:
+        raise RuntimeError(f"Install.exe 未成功生成: {install_exe}")
     size_mb = os.path.getsize(install_exe) / 1024 / 1024
     print(f"   创建: {os.path.basename(install_exe)} ({size_mb:.1f} MB)")
     return install_exe
 
 
-def copy_to_installer() -> None:
-    """复制到 installer 目录"""
-    print(f"\n[6/7] 复制到 installer 目录...")
+def copy_release_artifacts(
+    archive_path: str,
+    install_exe: str,
+    *optional_paths: Optional[str],
+) -> list[str]:
+    """把本轮正式发布产物原子复制到 installer/。
+
+    portable 和 Install.exe 都是必需产物；任何一个缺失都让打包失败，
+    避免 installer/ 中只出现绿色版，或沿用上一轮的旧安装器。
+    """
+    print(f"\n[10/10] 复制发布产物到 installer/...")
+    required_paths = (archive_path, install_exe)
+    missing = [p for p in required_paths if not p or not os.path.isfile(p)]
+    if missing:
+        raise RuntimeError("缺少正式发布产物: " + ", ".join(missing))
+
     os.makedirs(INSTALLER_DIR, exist_ok=True)
-    zip_name = f"dd_rec-{VERSION}.zip"
-    src = os.path.join(DIST_DIR, zip_name)
-    dst = os.path.join(INSTALLER_DIR, zip_name)
-    if os.path.exists(src):
-        shutil.copy2(src, dst)
+    copied = []
+    for src in (*required_paths, *optional_paths):
+        if not src or not os.path.isfile(src):
+            continue
+        dst = os.path.join(INSTALLER_DIR, os.path.basename(src))
+        tmp_dst = dst + ".tmp"
+        if os.path.exists(tmp_dst):
+            os.remove(tmp_dst)
+        try:
+            shutil.copy2(src, tmp_dst)
+            os.replace(tmp_dst, dst)
+        finally:
+            if os.path.exists(tmp_dst):
+                os.remove(tmp_dst)
+        copied.append(dst)
         print(f"   复制: {dst}")
+    return copied
 
 
 def print_summary(archive_path: str, install_exe: str = "", patch_path: str = "") -> None:
@@ -596,21 +620,25 @@ def main() -> int:
         return 1
 
     clean()
-    build_launcher()
     build_app()
     # update.exe 必须在 metadata 之前生成(metadata 的 -u 参数要它)
-    update_exe = build_kachina_update()
+    build_kachina_update()
     # assemble 必须先于 metadata:metadata 现在用 assemble 完之后的 portable 根作为输入,
-    # 这样 launcher (dd_rec.exe) 和 version.ini 也进 hashed 列表,patch 时会被替换
-    # —— 否则 kachina update.exe 跑完后 version.ini 还是旧版号,下次启动又弹更新
+    # 这样 dd_rec.exe 和 version.ini 都进入 hashed 列表并随更新替换
     assemble_portable_dir()
-    # metadata 输入改成 portable 根(assemble 后),包含 launcher / version.ini / 主程序 / _internal / ffmpeg / update.exe
+    # metadata 输入为 assemble 后的 portable 根，包含主程序/version.ini/_internal/ffmpeg/update.exe
     portable_root = os.path.join(DIST_DIR, "dd-rec")
     metadata, hashed = build_kachina_metadata(portable_root)
-    install_exe = build_kachina_installer(metadata, hashed)
+
+    # portable 和 Install.exe 都是正式发布的必需产物。
+    # 任一步失败都应让 build.py 失败，不能留下“打包完成但没有新 installer”的状态。
     archive_path = create_7z()
-    patch_path = build_hdiff_patch_auto(metadata)  # 可能 None
+    install_exe = build_kachina_installer(metadata, hashed)
+
+    # HDiffPatch is optional; the portable archive and installer remain required.
+    patch_path = build_hdiff_patch_auto(metadata)
     archive_current_patches(metadata, hashed)
+    copy_release_artifacts(archive_path, install_exe, patch_path)
     print_summary(archive_path, install_exe, patch_path)
     return 0
 
@@ -628,7 +656,7 @@ def archive_current_patches(metadata: str, hashed: str) -> None:
     提示:发布到 GitHub Release 之前,记得把 patches/{version}/ 提交到 git。
     """
     target_dir = os.path.join(PROJECT_ROOT, "patches", VERSION)
-    print(f"\n[9/9] 归档 patches/{VERSION}/ (给下个版本做 patch 源)...")
+    print(f"\n[9/10] 归档 patches/{VERSION}/ (给下个版本做 patch 源)...")
     try:
         # 清理旧归档(可能有遗漏的临时文件)
         if os.path.exists(target_dir):
@@ -683,7 +711,7 @@ def build_hdiff_patch_auto(new_metadata: str) -> Optional[str]:
         print(f"   跳过 HDiffPatch: 找不到 patches/{prev_version}/")
         return None
 
-    print(f"\n[8/9] 生成 HDiffPatch ({prev_version} → {VERSION})...")
+    print(f"\n[8/10] 生成 HDiffPatch ({prev_version} → {VERSION})...")
     patch = os.path.join(DIST_DIR, f"dd_rec-{VERSION}-patch-from-{prev_version}.zip")
     cmd = [
         kachina, "diff",

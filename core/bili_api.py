@@ -90,26 +90,147 @@ def get_bili_info(url_or_id, room_id_for_cookie=None, silent=False):
         return None
 
 
+# UI / 配置 codec → B 站 playurl API codec_name
+CODEC_ALIAS = {"h264": "avc", "h265": "hevc", "hevc": "hevc", "avc": "avc", "av1": "av1"}
+
+
+def normalize_codec_name(codec: str) -> str:
+    c = (codec or "").strip().lower()
+    return CODEC_ALIAS.get(c, c)
+
+
+def select_best_stream(
+    available_streams: list,
+    *,
+    cfg_codec: str = "h264",
+    cfg_format: str = "flv",
+    fallback_policy: str = "compatible",
+    priority_param: str = "分辨率",
+    cfg_fps: str = "",
+    cfg_bitrate: str = "",
+    cfg_url_priority: str = "",
+    room_id: str = "",
+) -> dict | None:
+    """从候选流中选择最优项。纯函数，便于单测。
+
+    返回带 match_kind / requested_* 元数据的 stream dict；strict 且无匹配时返回 None。
+    不会在无提示情况下静默回到无关编码：非 exact 匹配都会打 warning/error。
+    """
+    if not available_streams:
+        return None
+
+    streams = list(available_streams)
+    cfg_codec_api = normalize_codec_name(cfg_codec)
+    cfg_format = (cfg_format or "flv").strip().lower()
+    fallback_policy = (fallback_policy or "compatible").strip().lower()
+    rid = room_id or "?"
+
+    if cfg_url_priority:
+        filtered = [s for s in streams if cfg_url_priority in (s.get("url") or "")]
+        if filtered:
+            streams = filtered
+
+    def sort_stream(s):
+        score = 0
+        if priority_param == "编码" and s.get("codec") == cfg_codec_api:
+            score += 10000
+        elif priority_param == "格式" and s.get("format") == cfg_format:
+            score += 10000
+        elif priority_param == "分辨率":
+            score += int(s.get("qn") or 0) * 10
+        elif priority_param == "帧率" and cfg_fps:
+            try:
+                target_fps = float(str(cfg_fps).split()[0])
+                stream_fps = float(s.get("fps") or 0)
+                if abs(stream_fps - target_fps) < 1:
+                    score += 10000
+            except (ValueError, IndexError, TypeError):
+                pass
+        elif priority_param == "码率" and cfg_bitrate:
+            try:
+                parts = str(cfg_bitrate).split()[:2]
+                val = float(parts[0])
+                unit = (parts[1] if len(parts) > 1 else "").lower()
+                if "mb" in unit:
+                    target_kbps = val * 1000
+                elif "kb" in unit:
+                    target_kbps = val
+                else:
+                    target_kbps = val
+                stream_kbps = float(s.get("bitrate") or 0)
+                if target_kbps > 0 and abs(stream_kbps - target_kbps) / target_kbps < 0.2:
+                    score += 10000
+                if target_kbps > 0:
+                    score += max(0, 5000 - int(abs(stream_kbps - target_kbps)))
+            except (ValueError, IndexError, TypeError):
+                pass
+        elif priority_param == "网址" and cfg_url_priority and cfg_url_priority in (s.get("url") or ""):
+            score += 10000
+        # 目标编码优先级远高于 qn
+        if s.get("codec") == cfg_codec_api:
+            score += 100000
+        if s.get("format") == cfg_format:
+            score += 100
+        score += int(s.get("qn") or 0)
+        return score
+
+    streams.sort(key=sort_stream, reverse=True)
+
+    exact = [s for s in streams if s.get("codec") == cfg_codec_api and s.get("format") == cfg_format]
+    same_codec = [s for s in streams if s.get("codec") == cfg_codec_api]
+    if exact:
+        best = exact[0]
+        match_kind = "exact"
+    elif fallback_policy == "strict":
+        logging.error(
+            f"❌ {rid} 无目标流组合 codec={cfg_codec_api} format={cfg_format}（strict），拒绝静默降级"
+        )
+        return None
+    elif same_codec and fallback_policy in ("compatible", "best_effort", ""):
+        best = same_codec[0]
+        match_kind = f"codec_only:{best.get('format')}"
+        logging.warning(
+            f"⚠️ {rid} 无 {cfg_codec_api}+{cfg_format}，compatible 回退到 "
+            f"{best.get('codec')}+{best.get('format')} qn={best.get('qn')}"
+        )
+    elif fallback_policy == "best_effort":
+        best = streams[0]
+        match_kind = f"best_effort:{best.get('codec')}+{best.get('format')}"
+        logging.warning(
+            f"⚠️ {rid} best_effort 选用 {best.get('codec')}+{best.get('format')} qn={best.get('qn')}"
+        )
+    else:
+        # compatible 但没有同编码：明确降级并告警（非静默）
+        best = streams[0]
+        match_kind = f"fallback:{best.get('codec')}+{best.get('format')}"
+        logging.warning(
+            f"⚠️ {rid} 无同编码流，降级 {best.get('codec')}+{best.get('format')} qn={best.get('qn')}"
+        )
+
+    best = dict(best)
+    best["match_kind"] = match_kind
+    best["requested_codec"] = cfg_codec_api
+    best["requested_format"] = cfg_format
+    logging.info(
+        f"👉 {rid} 匹配最优[{match_kind}]: 画质qn[{best.get('qn')}], "
+        f"编码[{best.get('codec')}], 格式[{best.get('format')}]"
+    )
+    return best
+
+
 def get_stream_info(real_room_id):
     # 关键：每次录制/查询都从磁盘 reload 配置 —— 这样用户在 UI 上修改 stream_codec 后
     # 下次录制立即生效，无需重启 bilirec。
     reload_config()
 
-    cfg_codec = get_room_setting(real_room_id, "stream_codec") or get_global_setting("stream_codec") or "av1"
-    cfg_format = get_room_setting(real_room_id, "stream_format") or get_global_setting("stream_format") or "fmp4"
+    cfg_codec = get_room_setting(real_room_id, "stream_codec") or get_global_setting("stream_codec") or "h264"
+    cfg_format = get_room_setting(real_room_id, "stream_format") or get_global_setting("stream_format") or "flv"
+    fallback_policy = (get_global_setting("stream_fallback_policy") or "compatible").strip().lower()
     cfg_url_priority = get_global_setting("stream_url_priority") or ""
     priority_param = get_global_setting("stream_priority_param") or "分辨率"
     cfg_fps = get_global_setting("stream_fps") or ""
     cfg_bitrate = get_global_setting("stream_bitrate") or ""
     allow_audio_only = get_global_setting("allow_audio_only")
-
-    # 关键：B 站 API 的 codec 名称跟我们 UI 用的不一样
-    #   - h264  → "avc"
-    #   - h265  → "hevc"
-    #   - av1   → "av1"
-    # 把 UI 配置的 codec 翻译成 B 站 API 实际用的名字再匹配
-    _codec_alias = {"h264": "avc", "h265": "hevc", "hevc": "hevc", "avc": "avc", "av1": "av1"}
-    cfg_codec_api = _codec_alias.get(cfg_codec.lower(), cfg_codec.lower())
 
     res_map = {"原画": 10000, "超清": 400, "高清": 250, "流畅": 150}
     # 关键：先读房间级覆盖，缺失再回退全局；没有覆盖时按全局走（保持向后兼容）
@@ -124,9 +245,10 @@ def get_stream_info(real_room_id):
 
     try:
         headers = get_headers(real_room_id, monitor=True)
-        
+
         res = requests.get(url, headers=headers, impersonate="chrome110", timeout=10).json()
-        if res.get("code") != 0: return None
+        if res.get("code") != 0:
+            return None
 
         streams = res.get("data", {}).get("playurl_info", {}).get("playurl", {}).get("stream", [])
         available_streams = []
@@ -148,67 +270,20 @@ def get_stream_info(real_room_id):
                             "format": format_obj.get("format_name", ""),
                             "qn": codec_obj.get("current_qn", 0),
                             "fps": str(codec_obj.get("frame_rate", "")),
-                            "bitrate": str(codec_obj.get("bitrate", ""))
+                            "bitrate": str(codec_obj.get("bitrate", "")),
                         })
 
-        if not available_streams: return None
-
-        if cfg_url_priority:
-            filtered = [s for s in available_streams if cfg_url_priority in s['url']]
-            if filtered: available_streams = filtered
-
-        def sort_stream(s):
-            score = 0
-            if priority_param == "编码" and s["codec"] == cfg_codec_api:
-                score += 10000
-            elif priority_param == "格式" and s["format"] == cfg_format:
-                score += 10000
-            elif priority_param == "分辨率":
-                score += s["qn"] * 10
-            elif priority_param == "帧率" and cfg_fps:
-                # cfg_fps 格式如 "60 fps"，取数字部分
-                try:
-                    target_fps = float(cfg_fps.split()[0])
-                    stream_fps = float(s["fps"]) if s["fps"] else 0
-                    if abs(stream_fps - target_fps) < 1:
-                        score += 10000
-                except (ValueError, IndexError):
-                    pass
-            elif priority_param == "码率" and cfg_bitrate:
-                # cfg_bitrate 格式如 "30.0 Mb/s"，转成 kbps 与 API 返回的 kbps 比较
-                try:
-                    val, unit = cfg_bitrate.split()[:2]
-                    val = float(val)
-                    unit = unit.lower()
-                    if "mb" in unit:
-                        target_kbps = val * 1000
-                    elif "kb" in unit:
-                        target_kbps = val
-                    else:
-                        target_kbps = val
-                    stream_kbps = float(s["bitrate"]) if s["bitrate"] else 0
-                    # 误差在 20% 以内就加分
-                    if target_kbps > 0 and abs(stream_kbps - target_kbps) / target_kbps < 0.2:
-                        score += 10000
-                    # 码率越接近目标越高分
-                    if target_kbps > 0:
-                        score += max(0, 5000 - int(abs(stream_kbps - target_kbps)))
-                except (ValueError, IndexError):
-                    pass
-            elif priority_param == "网址" and cfg_url_priority and cfg_url_priority in s["url"]:
-                score += 10000
-            # 关键：把 cfg_codec 编码（用户配置的，比如 h264）的优先级**大幅**提高。
-            # 否则 B 站 API 默认返回 av1 在前，按 +100 加分也排不赢 av1。
-            if s["codec"] == cfg_codec_api:
-                score += 100000  # 大幅超过 qn 维度（qn*10 最多 10000）
-            if s["format"] == cfg_format: score += 100
-            score += s["qn"]
-            return score
-
-        available_streams.sort(key=sort_stream, reverse=True)
-        best = available_streams[0]
-        logging.info(f"👉 {real_room_id} 匹配最优: 画质qn[{best['qn']}], 编码[{best['codec']}], 格式[{best['format']}]")
-        return best
+        return select_best_stream(
+            available_streams,
+            cfg_codec=cfg_codec,
+            cfg_format=cfg_format,
+            fallback_policy=fallback_policy,
+            priority_param=priority_param,
+            cfg_fps=cfg_fps,
+            cfg_bitrate=cfg_bitrate,
+            cfg_url_priority=cfg_url_priority,
+            room_id=str(real_room_id),
+        )
 
     except Exception as e:
         logging.error(f"⚠️ 获取流地址失败: {e}")
