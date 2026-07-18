@@ -21,21 +21,27 @@ def _run_key_path() -> str:
     return r"Software\Microsoft\Windows\CurrentVersion\Run"
 
 
+RUN_VALUE_NAME = "dd_rec"
+LEGACY_RUN_VALUE_NAME = "dd_rec_launcher"
+
+
 def _run_value_name() -> str:
-    """注册表值名（程序唯一标识）"""
-    return "dd_rec_launcher"
+    """注册表值名（程序唯一标识）。"""
+    return RUN_VALUE_NAME
+
+
+def _delete_run_value(winreg, name: str) -> None:
+    try:
+        with winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER, _run_key_path(), 0, winreg.KEY_SET_VALUE
+        ) as key:
+            winreg.DeleteValue(key, name)
+    except FileNotFoundError:
+        pass
 
 
 def set_auto_start(enabled: bool, exe_path: str = None) -> bool:
-    """增删开机自启注册表项。
-
-    Args:
-        enabled: True = 添加，False = 删除
-        exe_path: 启动器 exe 完整路径；不传则用 sys.executable
-
-    Returns:
-        是否设置成功（非 Windows 平台返回 False）
-    """
+    """设置唯一主程序 dd_rec.exe 的开机自启，并迁移旧 launcher 注册表项。"""
     if sys.platform != "win32":
         return False
     if exe_path is None:
@@ -43,23 +49,17 @@ def set_auto_start(enabled: bool, exe_path: str = None) -> bool:
     try:
         import winreg
         if enabled:
-            # 注册表值用引号包住路径（防止路径含空格）
             cmd = f'"{exe_path}"'
             with winreg.OpenKey(
                 winreg.HKEY_CURRENT_USER, _run_key_path(), 0, winreg.KEY_SET_VALUE
             ) as key:
-                winreg.SetValueEx(key, _run_value_name(), 0, winreg.REG_SZ, cmd)
+                winreg.SetValueEx(key, RUN_VALUE_NAME, 0, winreg.REG_SZ, cmd)
+            _delete_run_value(winreg, LEGACY_RUN_VALUE_NAME)
             logger.info(f"开机自启已启用: {cmd}")
         else:
-            try:
-                with winreg.OpenKey(
-                    winreg.HKEY_CURRENT_USER, _run_key_path(), 0, winreg.KEY_SET_VALUE
-                ) as key:
-                    winreg.DeleteValue(key, _run_value_name())
-                logger.info("开机自启已禁用")
-            except FileNotFoundError:
-                # 本来就没启用，幂等
-                pass
+            _delete_run_value(winreg, RUN_VALUE_NAME)
+            _delete_run_value(winreg, LEGACY_RUN_VALUE_NAME)
+            logger.info("开机自启已禁用")
         return True
     except Exception as e:
         logger.error(f"设置开机自启失败: {e}")
@@ -67,7 +67,7 @@ def set_auto_start(enabled: bool, exe_path: str = None) -> bool:
 
 
 def get_auto_start() -> bool:
-    """检查当前是否已启用开机自启（注册表 Run 项）"""
+    """检查新注册表项；旧 launcher 项仍视为已启用并将在下次保存时迁移。"""
     if sys.platform != "win32":
         return False
     try:
@@ -75,8 +75,14 @@ def get_auto_start() -> bool:
         with winreg.OpenKey(
             winreg.HKEY_CURRENT_USER, _run_key_path(), 0, winreg.KEY_READ
         ) as key:
-            value, _ = winreg.QueryValueEx(key, _run_value_name())
-            return bool(value)
+            for name in (RUN_VALUE_NAME, LEGACY_RUN_VALUE_NAME):
+                try:
+                    value, _ = winreg.QueryValueEx(key, name)
+                    if value:
+                        return True
+                except FileNotFoundError:
+                    continue
+        return False
     except (FileNotFoundError, OSError):
         return False
 

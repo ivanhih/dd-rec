@@ -5,7 +5,6 @@ import os, sys, shutil, subprocess, zipfile
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 DIST_DIR = os.path.join(PROJECT_ROOT, "dist")
 BUILD_DIR = os.path.join(PROJECT_ROOT, "build")
-LAUNCHER_SPEC = os.path.join(PROJECT_ROOT, "launcher.spec")
 APP_SPEC = os.path.join(PROJECT_ROOT, "app.spec")
 PYTHON_EXE = r"C:\Users\user\miniconda3\python.exe"
 FFMPEG_BIN = r"C:\ffmpeg\bin"
@@ -19,30 +18,20 @@ def main():
     from version import __version__ as VERSION
 
     # 1. clean
-    print("[1/6] 清理...")
+    print("[1/4] 清理...")
     for d in (DIST_DIR, BUILD_DIR):
         if os.path.exists(d): shutil.rmtree(d)
 
-    # 2. build launcher
-    print("[2/6] 打包启动器...")
-    run([PYTHON_EXE, "-m", "PyInstaller", LAUNCHER_SPEC, "--noconfirm"], cwd=PROJECT_ROOT)
-
-    # 3. build app
-    print("[3/6] 打包主程序...")
+    # 2. build app
+    print("[2/4] 打包主程序...")
     run([PYTHON_EXE, "-m", "PyInstaller", APP_SPEC, "--noconfirm"], cwd=PROJECT_ROOT)
 
-    # 4. assemble portable
-    print("[4/6] 组装 Portable 目录...")
+    # 3. assemble portable
+    print("[3/4] 组装 Portable 目录...")
     portable_root = os.path.join(DIST_DIR, "dd-rec")
     os.makedirs(portable_root, exist_ok=True)
 
-    # launcher
-    launcher_src = os.path.join(DIST_DIR, "dd_rec.exe")
-    if os.path.exists(launcher_src):
-        shutil.copy2(launcher_src, os.path.join(portable_root, "dd_rec.exe"))
-        print("  复制: dd_rec.exe")
-
-    # app (onedir 平铺)
+    # app (onedir 平铺，dd_rec.exe 是唯一入口)
     app_src = os.path.join(DIST_DIR, "dd_rec_app")
     if os.path.exists(app_src):
         for entry in os.listdir(app_src):
@@ -56,6 +45,9 @@ def main():
                 shutil.copy2(src, dst)
         shutil.rmtree(app_src)
         print("  平铺主程序 OK")
+    main_exe = os.path.join(portable_root, "dd_rec.exe")
+    if not os.path.isfile(main_exe):
+        raise RuntimeError(f"主程序未生成: {main_exe}")
 
     # ffmpeg
     ffmpeg_dst = os.path.join(portable_root, "ffmpeg")
@@ -72,8 +64,8 @@ def main():
     # temp/
     os.makedirs(os.path.join(portable_root, "temp"), exist_ok=True)
 
-    # 5. zip
-    print("[5/6] 打包 zip...")
+    # 4. zip
+    print("[4/4] 打包 zip...")
     zip_path = os.path.join(DIST_DIR, f"dd_rec-{VERSION}.zip")
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
         for root, dirs, files in os.walk(portable_root):
@@ -83,7 +75,7 @@ def main():
     mb = os.path.getsize(zip_path) / 1024 / 1024
     print(f"  {os.path.basename(zip_path)} ({mb:.1f} MB)")
 
-    # 6. summary
+    # summary
     print("\n" + "=" * 50)
     print(f"✅ 打包完成! 产物: dist/{os.path.basename(zip_path)} ({mb:.1f} MB)")
     print("=" * 50)

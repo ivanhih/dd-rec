@@ -3,7 +3,7 @@
 
 页面结构（自上而下）:
   1. 顶部 toolbar    — 版本号 + 大小 + 发布时间 + 关闭按钮
-  2. 中间 scrollable — release note (Markdown 渲染) + 通道选择（GitHub / Mirror 酱）
+  2. 中间 scrollable — release note (Markdown 渲染) + 通道选择（GitHub / CNB）
   3. 底部按钮区     — 取消 + 立即更新
 
 kachina 模式下,主程序不下载任何东西:
@@ -19,7 +19,6 @@ from typing import Optional
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton,
-    QInputDialog, QLineEdit,
     QScrollArea, QWidget, QFrame,
     QTextBrowser,
 )
@@ -31,82 +30,76 @@ from core.updater import UpdateInfo, get_local_version
 logger = logging.getLogger(__name__)
 
 
-# ==================== Markdown 渲染 CSS（暗色主题）====================
-_MARKDOWN_CSS = """
-h1, h2, h3, h4 { color: #F8FAFC; margin-top: 14px; margin-bottom: 8px; font-weight: 600; }
-h1 { font-size: 20px; }
-h2 { font-size: 17px; border-bottom: 1px solid #2D2E3A; padding-bottom: 6px; }
-h3 { font-size: 15px; }
-h4 { font-size: 14px; color: #CBD5E1; }
-p { margin: 8px 0; line-height: 1.7; }
-ul, ol { margin: 8px 0; padding-left: 24px; }
-li { margin: 4px 0; line-height: 1.6; }
-code {
-    background-color: #0F1014;
-    color: #F59E0B;
-    padding: 1px 6px;
-    border-radius: 3px;
-    font-family: 'Consolas', 'Cascadia Code', monospace;
-    font-size: 12px;
-}
-pre {
-    background-color: #0F1014;
-    color: #CBD5E1;
-    padding: 12px 14px;
-    border-radius: 6px;
-    border: 1px solid #2D2E3A;
-    font-family: 'Consolas', 'Cascadia Code', monospace;
-    font-size: 12px;
-    line-height: 1.5;
-}
-pre code { background: transparent; padding: 0; color: inherit; }
-a { color: #3B82F6; text-decoration: none; }
-a:hover { text-decoration: underline; }
-blockquote {
-    color: #94A3B8;
-    border-left: 3px solid #3B82F6;
-    padding-left: 14px;
-    margin: 10px 0;
-}
-hr { color: #2D2E3A; background-color: #2D2E3A; border: none; max-height: 1px; margin: 16px 0; }
-table {
-    border-collapse: collapse;
-    margin: 10px 0;
-}
-th, td {
-    border: 1px solid #2D2E3A;
-    padding: 6px 12px;
-    text-align: left;
-}
-th { background-color: #252631; color: #F8FAFC; }
-img { max-width: 100%; border-radius: 6px; }
-strong { color: #F8FAFC; font-weight: 600; }
-em { color: #CBD5E1; }
-"""
+# ==================== Markdown 渲染 CSS ====================
+def _markdown_css(tokens) -> str:
+    return f"""
+    h1, h2, h3, h4 {{ color: {tokens['text_primary']}; margin-top: 14px; margin-bottom: 8px; font-weight: 600; }}
+    h1 {{ font-size: 20px; }}
+    h2 {{ font-size: 17px; border-bottom: 1px solid {tokens['border']}; padding-bottom: 6px; }}
+    h3 {{ font-size: 15px; }}
+    h4 {{ font-size: 14px; color: {tokens['text']}; }}
+    p {{ color: {tokens['text']}; margin: 8px 0; line-height: 1.7; }}
+    ul, ol {{ margin: 8px 0; padding-left: 24px; }}
+    li {{ color: {tokens['text']}; margin: 4px 0; line-height: 1.6; }}
+    code {{
+        background-color: {tokens['surface_code']};
+        color: {tokens['warning']};
+        padding: 1px 6px;
+        border-radius: 3px;
+        font-family: 'Consolas', 'Cascadia Code', monospace;
+        font-size: 12px;
+    }}
+    pre {{
+        background-color: {tokens['surface_code']};
+        color: {tokens['text']};
+        padding: 12px 14px;
+        border-radius: 6px;
+        border: 1px solid {tokens['border']};
+        font-family: 'Consolas', 'Cascadia Code', monospace;
+        font-size: 12px;
+        line-height: 1.5;
+    }}
+    pre code {{ background: transparent; padding: 0; color: inherit; }}
+    a {{ color: {tokens['primary']}; text-decoration: none; }}
+    a:hover {{ text-decoration: underline; }}
+    blockquote {{
+        color: {tokens['text_secondary']};
+        border-left: 3px solid {tokens['primary']};
+        padding-left: 14px;
+        margin: 10px 0;
+    }}
+    hr {{ color: {tokens['border']}; background-color: {tokens['border']}; border: none; max-height: 1px; margin: 16px 0; }}
+    table {{ border-collapse: collapse; margin: 10px 0; }}
+    th, td {{ border: 1px solid {tokens['border']}; padding: 6px 12px; text-align: left; color: {tokens['text']}; }}
+    th {{ background-color: {tokens['surface_hover']}; color: {tokens['text_primary']}; }}
+    img {{ max-width: 100%; border-radius: 6px; }}
+    strong {{ color: {tokens['text_primary']}; font-weight: 600; }}
+    em {{ color: {tokens['text']}; }}
+    """
 
 
 def _render_markdown(text: str) -> str:
-    """渲染 markdown → HTML（带暗色 CSS）。失败时返回纯文本。"""
+    """渲染 markdown → HTML（跟随当前应用主题）。失败时返回纯文本。"""
     if not text or not text.strip():
         return ""
+    from ui.theme import theme_manager
+    tokens = theme_manager().tokens
     try:
         import markdown as md_lib
         html = md_lib.markdown(
             text,
             extensions=["fenced_code", "tables", "nl2br", "sane_lists"],
         )
-        # 用 <style> 包裹的 div 确保 CSS 生效
-        return f'<style>{_MARKDOWN_CSS}</style>{html}'
+        return f'<style>{_markdown_css(tokens)}</style>{html}'
     except Exception as e:
         logger.warning(f"Markdown 渲染失败,降级纯文本: {e}")
-        # 转义 HTML 特殊字符后回填
         escaped = (
             text.replace("&", "&amp;")
                 .replace("<", "&lt;")
                 .replace(">", "&gt;")
                 .replace("\n", "<br>")
         )
-        return f'<div style="color: #CBD5E1; line-height: 1.6;">{escaped}</div>'
+        return f'<div style="color: {tokens["text"]}; line-height: 1.6;">{escaped}</div>'
 
 
 def _format_published_at(iso_str: str) -> str:
@@ -130,23 +123,16 @@ def _make_channel_row(icon: str, title: str, desc: str, source_id: str) -> dict:
     返回 {'frame': QFrame, 'btn': QPushButton, 'source_id': str}
     """
     frame = QFrame()
-    frame.setObjectName(f"channelRow_{source_id}")
-    frame.setStyleSheet(f"""
-        QFrame#channelRow_{source_id} {{
-            background-color: #252631;
-            border: 1px solid #2D2E3A;
-            border-radius: 8px;
-        }}
-        QFrame#channelRow_{source_id}:hover {{ background-color: #2A2B36; }}
-    """)
+    frame.setObjectName("updateChannelRow")
 
     row = QHBoxLayout(frame)
     row.setContentsMargins(16, 12, 16, 12)
     row.setSpacing(14)
 
     icon_label = QLabel(icon)
+    icon_label.setObjectName("updateChannelIcon")
     icon_label.setFont(QFont("Microsoft YaHei UI", 20))
-    icon_label.setStyleSheet("background: transparent; border: none;")
+    icon_label.setStyleSheet("QLabel#updateChannelIcon { background: transparent; border: none; }")
     icon_label.setFixedWidth(32)
     icon_label.setAlignment(Qt.AlignCenter)
 
@@ -154,9 +140,10 @@ def _make_channel_row(icon: str, title: str, desc: str, source_id: str) -> dict:
     text_block.setSpacing(2)
     title_label = QLabel(title)
     title_label.setFont(QFont("Microsoft YaHei UI", 13, QFont.Bold))
-    title_label.setStyleSheet("color: #F8FAFC; background: transparent; border: none;")
+    title_label.setProperty("role", "title")
     desc_label = QLabel(desc)
-    desc_label.setStyleSheet("color: #94A3B8; font-size: 12px; background: transparent; border: none;")
+    desc_label.setProperty("role", "secondary")
+    desc_label.setStyleSheet("font-size: 12px;")
     desc_label.setWordWrap(True)
     text_block.addWidget(title_label)
     text_block.addWidget(desc_label)
@@ -164,44 +151,15 @@ def _make_channel_row(icon: str, title: str, desc: str, source_id: str) -> dict:
     # 单选按钮(配合 QButtonGroup.setExclusive 互斥,这样跨 row 互斥)
     radio_btn = QPushButton("选择")
     radio_btn.setCheckable(True)
+    radio_btn.setProperty("variant", "channelChoice")
     radio_btn.setCursor(Qt.PointingHandCursor)
     radio_btn.setFixedSize(80, 36)
-    radio_btn.setStyleSheet("""
-        QPushButton {
-            background-color: #3D3E4A;
-            color: #CBD5E1;
-            border: 1px solid #2D2E3A;
-            border-radius: 6px;
-            font-size: 12px;
-            font-weight: 500;
-        }
-        QPushButton:hover { background-color: #4D4E5A; color: #F8FAFC; }
-        QPushButton:checked {
-            background-color: #3B82F6;
-            color: white;
-            border: 1px solid #3B82F6;
-        }
-        QPushButton:checked:hover { background-color: #2563EB; }
-    """)
 
     row.addWidget(icon_label)
     row.addLayout(text_block, 1)
     row.addWidget(radio_btn)
 
     return {"frame": frame, "btn": radio_btn, "source_id": source_id}
-
-
-def _prompt_for_cdk(parent) -> Optional[str]:
-    """弹子对话框让用户输入 CDK。返回 None=取消,str=CDK(可能为空)"""
-    cdk, ok = QInputDialog.getText(
-        parent,
-        "输入 Mirror 酱 CDK",
-        "请输入 CDK（明文存储在本地 config.json）:",
-        QLineEdit.EchoMode.Password,
-    )
-    if not ok:
-        return None
-    return cdk.strip() if cdk else ""
 
 
 # 用户可见的下载通道元数据(id 必须跟 kachina.config.json 的 source[].id 对应)
@@ -226,10 +184,10 @@ def show_update_dialog(info: UpdateInfo, parent=None) -> bool:
     Returns: True 表示用户点了立即更新;False 表示取消/关闭
     """
     page = QDialog(parent)
+    page.setObjectName("updateDialog")
     page.setWindowTitle(f"发现新版本 v{info.version}")
     page.resize(720, 600)
     page.setMinimumSize(560, 460)
-    page.setStyleSheet("QDialog { background-color: #1A1B21; }")
 
     root_layout = QVBoxLayout(page)
     root_layout.setSpacing(0)
@@ -237,13 +195,8 @@ def show_update_dialog(info: UpdateInfo, parent=None) -> bool:
 
     # ============= 顶部 toolbar =============
     toolbar = QFrame()
+    toolbar.setObjectName("updateToolbar")
     toolbar.setFixedHeight(78)
-    toolbar.setStyleSheet("""
-        QFrame {
-            background-color: #181920;
-            border-bottom: 1px solid #2D2E3A;
-        }
-    """)
     tb_layout = QHBoxLayout(toolbar)
     tb_layout.setContentsMargins(24, 14, 18, 14)
     tb_layout.setSpacing(12)
@@ -252,7 +205,7 @@ def show_update_dialog(info: UpdateInfo, parent=None) -> bool:
     title_block.setSpacing(3)
     title_label = QLabel(f"发现新版本 v{info.version}")
     title_label.setFont(QFont("Microsoft YaHei UI", 17, QFont.Bold))
-    title_label.setStyleSheet("color: #F8FAFC; background: transparent; border: none;")
+    title_label.setProperty("role", "title")
 
     local_ver = get_local_version() or "未知"
     size_mb = info.size / 1024 / 1024 if info.size else 0
@@ -261,25 +214,15 @@ def show_update_dialog(info: UpdateInfo, parent=None) -> bool:
     if published:
         sub_parts.append(f"发布于 {published}")
     subtitle = QLabel("  ·  ".join(sub_parts))
-    subtitle.setStyleSheet(
-        "color: #94A3B8; font-size: 12px; background: transparent; border: none;"
-    )
+    subtitle.setProperty("role", "secondary")
+    subtitle.setStyleSheet("font-size: 12px;")
     title_block.addWidget(title_label)
     title_block.addWidget(subtitle)
 
-    close_btn = QPushButton("✕")
+    close_btn = QPushButton("×")
     close_btn.setFixedSize(32, 32)
     close_btn.setCursor(Qt.PointingHandCursor)
-    close_btn.setStyleSheet("""
-        QPushButton {
-            background: transparent;
-            color: #94A3B8;
-            border: none;
-            border-radius: 6px;
-            font-size: 15px;
-        }
-        QPushButton:hover { background-color: #2D2E3A; color: #F8FAFC; }
-    """)
+    close_btn.setProperty("variant", "close")
     close_btn.clicked.connect(page.reject)
 
     tb_layout.addLayout(title_block)
@@ -289,66 +232,41 @@ def show_update_dialog(info: UpdateInfo, parent=None) -> bool:
 
     # ============= 中间 scrollable 内容 =============
     scroll = QScrollArea()
+    scroll.setObjectName("updateScroll")
     scroll.setWidgetResizable(True)
     scroll.setFrameShape(QFrame.NoFrame)
-    scroll.setStyleSheet("""
-        QScrollArea { background-color: #1A1B21; border: none; }
-        QScrollBar:vertical {
-            background-color: #1A1B21;
-            width: 10px;
-            margin: 0;
-        }
-        QScrollBar::handle:vertical {
-            background-color: #3D3E4A;
-            border-radius: 5px;
-            min-height: 30px;
-        }
-        QScrollBar::handle:vertical:hover { background-color: #4D4E5A; }
-        QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
-        QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: transparent; }
-    """)
 
     content = QWidget()
-    content.setStyleSheet("background-color: #1A1B21;")
+    content.setObjectName("updateContent")
     content_layout = QVBoxLayout(content)
     content_layout.setContentsMargins(24, 20, 24, 20)
     content_layout.setSpacing(18)
 
     # ----- Release note 卡片 -----
     note_card = QFrame()
-    note_card.setStyleSheet("""
-        QFrame {
-            background-color: #181920;
-            border: 1px solid #2D2E3A;
-            border-radius: 12px;
-        }
-    """)
+    note_card.setObjectName("updateCard")
     note_layout = QVBoxLayout(note_card)
     note_layout.setContentsMargins(22, 18, 22, 18)
     note_layout.setSpacing(12)
 
     note_header = QLabel("📋  更新内容")
     note_header.setFont(QFont("Microsoft YaHei UI", 14, QFont.Bold))
-    note_header.setStyleSheet("color: #F8FAFC; background: transparent; border: none;")
+    note_header.setProperty("role", "title")
     note_layout.addWidget(note_header)
 
     note_browser = QTextBrowser()
+    note_browser.setObjectName("updateNotes")
     note_browser.setOpenExternalLinks(True)
-    note_browser.setStyleSheet("""
-        QTextBrowser {
-            background-color: transparent;
-            color: #CBD5E1;
-            border: none;
-            font-size: 13px;
-            padding: 0;
-        }
-    """)
+    note_browser.setStyleSheet(
+        "QTextBrowser#updateNotes { font-size: 13px; padding: 0; border: none; background: transparent; }"
+    )
     note_browser.setMinimumHeight(160)
 
     raw_body = (info.body or "").strip()
     if not raw_body:
+        from ui.theme import theme_manager
         note_browser.setHtml(
-            '<div style="color: #64748B; padding: 20px 0; text-align: center;">'
+            f'<div style="color: {theme_manager().tokens["text_muted"]}; padding: 20px 0; text-align: center;">'
             "(此版本没有提供更新说明)"
             "</div>"
         )
@@ -363,20 +281,14 @@ def show_update_dialog(info: UpdateInfo, parent=None) -> bool:
     # - frozen 模式下 sys.executable 的临时目录猜不到项目根,解析不稳定
     # - 通道就这两个,加新通道时改这里 + kachina.config.json 两处即可
     channel_card = QFrame()
-    channel_card.setStyleSheet("""
-        QFrame {
-            background-color: #181920;
-            border: 1px solid #2D2E3A;
-            border-radius: 12px;
-        }
-    """)
+    channel_card.setObjectName("updateCard")
     ch_layout = QVBoxLayout(channel_card)
     ch_layout.setContentsMargins(22, 18, 22, 18)
     ch_layout.setSpacing(10)
 
     ch_title = QLabel("🚀  下载通道")
     ch_title.setFont(QFont("Microsoft YaHei UI", 14, QFont.Bold))
-    ch_title.setStyleSheet("color: #F8FAFC; background: transparent; border: none;")
+    ch_title.setProperty("role", "title")
     ch_layout.addWidget(ch_title)
 
     # 默认勾选 = 上次用户选择(持久化在 config.update_channel),否则 github
@@ -415,9 +327,8 @@ def show_update_dialog(info: UpdateInfo, parent=None) -> bool:
         "💡  选择通道后点「立即更新」,安装器会自动用对应通道下载,\n"
         "    不会再让你在安装器里选一次。"
     )
-    channel_hint.setStyleSheet(
-        "color: #64748B; font-size: 11px; background: transparent; border: none; line-height: 1.5;"
-    )
+    channel_hint.setProperty("role", "muted")
+    channel_hint.setStyleSheet("font-size: 11px; line-height: 1.5;")
     channel_hint.setWordWrap(True)
     ch_layout.addWidget(channel_hint)
 
@@ -428,13 +339,8 @@ def show_update_dialog(info: UpdateInfo, parent=None) -> bool:
 
     # ============= 底部按钮区 =============
     bottom = QFrame()
+    bottom.setObjectName("updateBottom")
     bottom.setFixedHeight(72)
-    bottom.setStyleSheet("""
-        QFrame {
-            background-color: #181920;
-            border-top: 1px solid #2D2E3A;
-        }
-    """)
     bottom_layout = QHBoxLayout(bottom)
     bottom_layout.setContentsMargins(24, 16, 24, 16)
     bottom_layout.setSpacing(12)
@@ -443,36 +349,15 @@ def show_update_dialog(info: UpdateInfo, parent=None) -> bool:
     cancel_btn.setFixedHeight(40)
     cancel_btn.setMinimumWidth(110)
     cancel_btn.setCursor(Qt.PointingHandCursor)
-    cancel_btn.setStyleSheet("""
-        QPushButton {
-            background-color: #252631;
-            color: #94A3B8;
-            border: none;
-            border-radius: 8px;
-            font-size: 14px;
-            font-weight: 500;
-        }
-        QPushButton:hover { background-color: #2D2E3A; color: #E2E8F0; }
-    """)
+    cancel_btn.setProperty("variant", "secondary")
     cancel_btn.clicked.connect(page.reject)
 
     update_btn = QPushButton("立即更新")
     update_btn.setFixedHeight(40)
     update_btn.setMinimumWidth(140)
     update_btn.setCursor(Qt.PointingHandCursor)
-    update_btn.setDefault(True)  # Enter 触发
-    update_btn.setStyleSheet("""
-        QPushButton {
-            background-color: #3B82F6;
-            color: white;
-            border: none;
-            border-radius: 8px;
-            font-size: 14px;
-            font-weight: 600;
-        }
-        QPushButton:hover { background-color: #2563EB; }
-        QPushButton:disabled { background-color: #1F2937; color: #64748B; }
-    """)
+    update_btn.setDefault(True)
+    update_btn.setProperty("variant", "primary")
 
     bottom_layout.addWidget(cancel_btn)
     bottom_layout.addStretch()

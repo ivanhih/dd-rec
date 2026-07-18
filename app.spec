@@ -3,8 +3,8 @@
 """
 dd-rec 主程序 PyInstaller 打包配置（Portable 方案）
 
-产物：dist\dd_rec-{VERSION}\dd_rec_main.exe + *.dll
-输出到 dd_rec-{VERSION}/ 目录，配合 launcher 使用
+产物：dist/dd_rec_app/dd_rec.exe + _internal/
+build.py 会平铺到 dist/dd-rec/，dd_rec.exe 是唯一程序入口
 
 注意：ffmpeg 不打包进 app/，因为根目录已有 ffmpeg/
 """
@@ -14,7 +14,7 @@ import os
 block_cipher = None
 
 _binaries = []
-_datas = []  # 不再包含 ffmpeg（根目录已有）
+_datas = [('assets/icon.ico', 'assets')]  # 运行时窗口/托盘图标
 
 a = Analysis(
     ['main.py'],
@@ -35,6 +35,15 @@ a = Analysis(
         'core.portable_updater',
         'core.config',
         'core.recorder',
+        'core.media_pipeline',
+        'core.stream_source',
+        'core.ffmpeg_tools',
+        'core.flv',
+        'core.flv.parser',
+        'core.flv.session',
+        'core.flv.writer',
+        'core.flv.timestamps',
+        'core.flv.types',
         'version',
         'markdown',
         'markdown.extensions.fenced_code',
@@ -67,7 +76,7 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,
-    name='dd_rec_main',
+    name='dd_rec',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -75,6 +84,7 @@ exe = EXE(
     upx_exclude=[],
     runtime_tmpdir=None,
     console=False,
+    icon='assets/icon.ico',
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,

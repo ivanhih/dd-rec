@@ -92,3 +92,8 @@ build_nuitka.py
 # ==================== Windows 临时 ====================
 Thumbs.db
 desktop.ini
+
+# Local nested clone / large kachina patch blobs (not source)
+dd-rec.git/
+patches/1.0.[2-9]/
+patches/1.0.1/hashed/
