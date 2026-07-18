@@ -4,9 +4,9 @@
 Portable 流程：
   1. check_update()            → 调 GitHub API 拉最新 release，比版本号
   2. 用户点"立即更新" → spawn DDRec.update.exe → 主程序退出
-  3. kachina update.exe 自己下载/HDiffPatch/替换 launcher 自身
+  3. kachina update.exe 自己下载/HDiffPatch/替换主程序文件
 
-不再走 launcher 自更新 / pending_update.json / 主程序下载的流程。
+主程序只有 dd_rec.exe 一个入口，不再经过 launcher。
 """
 
 import os
@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 def _detect_portable_mode() -> bool:
     """检测是否为 Portable 模式
 
-    平坦化后:version.ini 和 dd_rec_main.exe 在 portable 根(同目录)
+    单入口结构:version.ini 和 dd_rec.exe 在 portable 根(同目录)
     老版本结构(用 dd_rec-{ver}/ 子目录)升级上来的用户:兼容,允许父目录
     """
     if not getattr(sys, "frozen", False):
@@ -78,7 +78,7 @@ def get_current_version() -> str:
 def check_update(max_retries: int = 3) -> Optional[UpdateInfo]:
     """检查更新（Portable 模式）"""
     if not IS_PORTABLE:
-        logger.warning("非 Portable 模式，check_update 不支持")
+        logger.debug("非 Portable 模式，跳过 check_update")
         return None
     return _portable_check_update(max_retries)
 
@@ -104,11 +104,12 @@ def is_newer_version(new_version: str, current_version: str) -> bool:
 def download_file(url: str, dest_path: str) -> bool:
     """兼容旧名"""
     try:
+        from core.http_ssl import urlopen as _ssl_urlopen
         req = urllib.request.Request(
             url,
             headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
         )
-        with urllib.request.urlopen(req, timeout=120) as resp:
+        with _ssl_urlopen(req, timeout=120) as resp:
             with open(dest_path, "wb") as f:
                 f.write(resp.read())
         return True

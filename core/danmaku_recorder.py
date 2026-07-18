@@ -71,6 +71,7 @@ class DanmakuRecorder:
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._sock = None
+        self._sock_lock = threading.Lock()
         self._start_ts = time.time()
         self._fmt = "xml"
         self._sessdata = ""
@@ -122,13 +123,9 @@ class DanmakuRecorder:
         self._cookie_str = "; ".join(f"{k}={v}" for k, v in self._cookies.items())
 
     def stop(self):
+        # 只置位停止标记；recv 侧 settimeout(1.0) 会自行退出。
+        # 禁止从其他线程 shutdown/close SSL socket（Windows OpenSSL 会 access violation）。
         self._stop_event.set()
-        # 关闭 socket 唤醒阻塞的 recv
-        if self._sock is not None:
-            try:
-                self._sock.close()
-            except Exception:
-                pass
         if self._thread:
             self._thread.join(timeout=8)
         self._finalize()
@@ -497,18 +494,19 @@ class DanmakuRecorder:
 
     def _connect_once(self, ws_url: str, token: str):
         """建立一次连接：握手 → 鉴权 → 接收消息（阻塞直到断开）"""
-        import ssl as _ssl
+        from core.http_ssl import get_insecure_context
 
         host = ws_url.replace("wss://", "").replace("ws://", "")
         host = host.split("/")[0].split(":")[0]
 
-        ctx = _ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = _ssl.CERT_NONE
+        # Reuse process-level insecure context. create_default_context() on
+        # every connect races under multi-room startup on Windows OpenSSL.
+        ctx = get_insecure_context()
 
         raw = socket.create_connection((host, 443), timeout=10)
         sock = ctx.wrap_socket(raw, server_hostname=host)
-        self._sock = sock
+        with self._sock_lock:
+            self._sock = sock
 
         try:
             # 1. WebSocket 握手
@@ -534,37 +532,34 @@ class DanmakuRecorder:
             sock.send(self._ws_encode(self._make_auth_bytes(token)))
             logging.info(f"💬 {self.room_id} 弹幕连接成功")
 
-            # 3. 启动心跳线程
-            hb_stop = threading.Event()
-            threading.Thread(
-                target=self._heartbeat_loop, args=(sock, hb_stop),
-                daemon=True, name=f"danmaku-hb-{self.room_id}").start()
-
-            try:
-                self._recv_loop(sock, rest)
-            finally:
-                hb_stop.set()
+            # 3. 单线程收包 + 心跳（绝不另开线程碰 SSL socket）
+            self._recv_loop(sock, rest)
         finally:
+            with self._sock_lock:
+                if self._sock is sock:
+                    self._sock = None
             try:
                 sock.close()
             except Exception:
                 pass
-            self._sock = None
-
-    def _heartbeat_loop(self, sock, hb_stop: threading.Event):
-        hb = self._ws_encode(self._make_heartbeat_bytes())
-        while not hb_stop.is_set() and not self._stop_event.is_set():
-            try:
-                sock.send(hb)
-            except Exception:
-                break
-            hb_stop.wait(self._HEARTBEAT_INTERVAL)
 
     def _recv_loop(self, sock, initial: bytes = b""):
-        """读取 WebSocket 帧，拆出业务 payload 交给 _decode_frames"""
+        """读取 WebSocket 帧；同一线程内周期性发送心跳，避免 SSL 并发。"""
         buf = initial
-        sock.settimeout(self._HEARTBEAT_INTERVAL * 2)
+        # 短超时：既能被 stop/shutdown 打断，也能定期发心跳
+        sock.settimeout(1.0)
+        next_hb = time.time() + self._HEARTBEAT_INTERVAL
+        hb = self._ws_encode(self._make_heartbeat_bytes())
+
         while not self._stop_event.is_set():
+            now = time.time()
+            if now >= next_hb:
+                try:
+                    sock.send(hb)
+                except Exception:
+                    break
+                next_hb = now + self._HEARTBEAT_INTERVAL
+
             while True:
                 frame, consumed = self._ws_decode(buf)
                 if frame is None:
@@ -579,15 +574,19 @@ class DanmakuRecorder:
             try:
                 chunk = sock.recv(65536)
             except socket.timeout:
-                logging.debug(f"💬 {self.room_id} recv 超时，继续等待")
                 continue
             except OSError as e:
-                logging.warning(f"💬 {self.room_id} recv OSError: {e}")
+                # stop 时主动 close/shutdown socket 唤醒 recv，是预期行为
+                logging.debug(f"💬 {self.room_id} recv OSError: {e}")
                 break
             if not chunk:
                 logging.warning(f"💬 {self.room_id} 服务器关闭连接（recv 返回空）")
                 break
             buf += chunk
+
+    def _heartbeat_loop(self, sock, hb_stop: threading.Event):
+        # 兼容旧调用点；新路径不再使用独立心跳线程
+        return
 
     @staticmethod
     def _ws_decode(buf: bytes):
