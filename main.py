@@ -1221,20 +1221,23 @@ class MainWindow(QMainWindow):
         thread = QThread()
         recorder.moveToThread(thread)
 
-        # 状态信号连到卡片
+        # 必须 QueuedConnection：lambda 没有 QObject 接收端亲和性，
+        # Auto/Direct 会让 worker 线程直接进 card.update_status → repolish，
+        # 长时间录制后在 Windows 上触发 access violation。
         recorder.status_updated.connect(
-            lambda m, l, r, t, d, sp, sz, p, a:
-            card.update_status(m, l, r, t, d, sp, sz, p, a)
+            card.update_status,
+            Qt.QueuedConnection,
         )
-        recorder.cut_completed.connect(self.on_cut_completed)
-        recorder.cut_failed.connect(self.on_cut_failed)
+        recorder.cut_completed.connect(self.on_cut_completed, Qt.QueuedConnection)
+        recorder.cut_failed.connect(self.on_cut_failed, Qt.QueuedConnection)
 
         thread.started.connect(recorder.run)
         recorder.finished.connect(recorder.deleteLater)
         recorder.finished.connect(thread.quit)
         thread.finished.connect(
             lambda rid=room_id, rec=recorder, worker_thread=thread:
-            self._on_recorder_thread_finished(rid, rec, worker_thread)
+            self._on_recorder_thread_finished(rid, rec, worker_thread),
+            Qt.QueuedConnection,
         )
         thread.finished.connect(thread.deleteLater)
 
