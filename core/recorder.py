@@ -11,22 +11,27 @@ import re
 import json
 import urllib.request
 import uuid
+from collections import deque
 from typing import Optional
+from urllib.parse import urlparse
 from PySide6.QtCore import QObject, Signal, QThread
 
 from core.config import (
     get_global_setting, get_room_setting, get_room_config, get_effective_format,
     get_effective_save_dir, VIDEO_SAVE_DIR, RESOURCE_DIR
 )
-from core.bili_api import get_bili_info, get_stream_info
+from core.bili_api import build_endpoint_identity, get_bili_info, get_stream_info
 from core.utils import format_size, render_path_template
 from core.danmaku_recorder import DanmakuRecorder
 from core.ffmpeg_tools import FFMPEG_CMD as _FFMPEG_FROM_TOOLS, hidden_subprocess_kwargs
 from core.media_pipeline import ArtifactResult, ArtifactStatus, get_default_pipeline
 from core.flv.session import FlvCaptureSession, CaptureEvent
+from core.flv.health import FlvHealthConfig, FlvMediaHealth
 from core.stream_source import StreamSource
 from core.ffmpeg_flv_source import FfmpegFlvSource
 from core.http_ssl import urlopen as _ssl_urlopen
+from core.disk_guard import check_disk, format_gb, should_block_recording
+from core.recording_history import append_recording
 
 
 def _get_ffmpeg_path():
@@ -141,6 +146,66 @@ def _build_save_path(room_id, uname, title, now_dt):
 
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
     return save_path
+
+
+# URL -> {fail_count, last_error, last_log_at, suppressed}
+_webhook_fail_state: dict = {}
+_webhook_fail_lock = threading.Lock()
+
+
+def _log_webhook_failure(url: str, err: Exception, payload: dict) -> None:
+    """Collapse repeated webhook failures so a dead endpoint cannot flood bilirec.log."""
+    verbose = bool(get_global_setting("webhook_log_verbose"))
+    try:
+        interval = float(get_global_setting("webhook_fail_log_interval_sec") or 300)
+    except (TypeError, ValueError):
+        interval = 300.0
+    interval = max(30.0, interval)
+    now = time.time()
+    err_s = str(err)
+    if verbose:
+        logging.warning(
+            f"Webhook fail {url}: {err_s} | payload_keys={list(payload.keys())}"
+        )
+        return
+
+    with _webhook_fail_lock:
+        st = _webhook_fail_state.get(url) or {
+            "fail_count": 0,
+            "last_error": "",
+            "last_log_at": 0.0,
+            "suppressed": 0,
+        }
+        st["fail_count"] = int(st.get("fail_count") or 0) + 1
+        st["last_error"] = err_s
+        should_log = (
+            st["fail_count"] == 1
+            or (now - float(st.get("last_log_at") or 0.0)) >= interval
+        )
+        if should_log:
+            suppressed = int(st.get("suppressed") or 0)
+            extra = f" | suppressed_since_last_log={suppressed}" if suppressed else ""
+            logging.warning(
+                f"[webhook] fail {url}: {err_s} | count={st['fail_count']}{extra} "
+                f"| EventType={payload.get('EventType') or payload.get('event')}"
+            )
+            st["last_log_at"] = now
+            st["suppressed"] = 0
+        else:
+            st["suppressed"] = int(st.get("suppressed") or 0) + 1
+        _webhook_fail_state[url] = st
+
+
+def _log_webhook_success(url: str, status: int, payload: dict, body_preview: str) -> None:
+    with _webhook_fail_lock:
+        prev = _webhook_fail_state.pop(url, None)
+    recovered = ""
+    if prev and int(prev.get("fail_count") or 0) > 0:
+        recovered = f" | recovered_after_fails={prev['fail_count']}"
+    logging.info(
+        f"Webhook OK {url} -> {status} | EventType={payload.get('EventType') or payload.get('event')} "
+        f"| resp={body_preview!r}{recovered}"
+    )
 
 
 def _send_webhooks(event: str, room_id: str, uname: str, title: str, extra: dict = None):
@@ -266,9 +331,9 @@ def _send_webhooks(event: str, room_id: str, uname: str, title: str, extra: dict
                 )
                 with _ssl_urlopen(req, timeout=10) as resp:
                     body_preview = resp.read(200).decode("utf-8", errors="replace")
-                    logging.info(f"Webhook OK {url} -> {resp.status} | EventType={payload.get('EventType') or payload.get('event')} | resp={body_preview!r}")
+                    _log_webhook_success(url, resp.status, payload, body_preview)
             except Exception as e:
-                logging.warning(f"Webhook fail {url}: {e} | payload_keys={list(payload.keys())}")
+                _log_webhook_failure(url, e, payload)
 
     threading.Thread(target=_fire, daemon=True).start()
 
@@ -487,6 +552,8 @@ class BiliRecorder(QObject):
     status_updated = Signal(str, str, str, str, str, str, str, str, str)  # m,l,r,title,duration,speed,size,parent,area
     cut_completed = Signal(str, str)  # room_id, file_name
     cut_failed = Signal(str, str)  # room_id, error
+    # native FLV segment health: room_id, health(healthy|degraded|failed|""), detail
+    segment_health_updated = Signal(str, str, str)
     finished = Signal()
 
     def __init__(self, room_info, parent=None):
@@ -505,6 +572,7 @@ class BiliRecorder(QObject):
         self._async_stop_requested = False
         self._async_stop_reset_time = True
         self._finished_emitted = False
+        self.exit_reason = "running"  # running | requested_stop | disabled | error
         self.current_ffmpeg = None
         self.stream_url = None
         self.current_save_path = None
@@ -559,20 +627,61 @@ class BiliRecorder(QObject):
         self._pipeline.register_result_handler(
             self.room_id, self._on_artifact_result, self._handler_token
         )
+        # 磁盘守卫 / 心跳
+        self._last_disk_check_at = 0.0
+        self._last_heartbeat_at = 0.0
+        self._disk_blocked = False
+        self._reconnects = 0
+        self._last_segment_health = ""
+        self._last_capture_issue = ""
+        # 原生 FLV CDN 故障切换：候选 / 隔离 / 健康状态机 / source 事件
+        self._cdn_candidates: list = []
+        self._cdn_index = 0
+        self._current_endpoint_id = ""
+        self._endpoint_quarantine: dict = {}
+        self._locked_codec = ""
+        self._locked_format = ""
+        self._locked_qn = ""
+        self._flv_health: Optional[FlvMediaHealth] = None
+        self._last_flv_health_decision = None
+        self._source_events: deque = deque()
+        self._source_events_lock = threading.Lock()
+        self._native_state_lock = threading.RLock()
+        self._source_transition = False
+        self._cdn_failovers = 0
+        self._health_ui_last_emit = 0.0
+        self._health_ui_last_state = ""
+        self._suppress_segment_healthy = False
+        self._native_outage_active = False
+        self._native_recovery_pending = False
+        self._native_outage_attempts = 0
+        self._native_retry_at = 0.0
+        self._native_recovery_deadline = 0.0
+        self._native_outage_started_at = 0.0
+        self._native_disconnect_boundary_closed = False
+        self._native_recovery_reason = ""
+        self._native_recovery_from_endpoint = ""
+        self._native_recovery_candidate_endpoint = ""
 
     @property
     def is_recording(self):
-        if self._capture_mode in ("flv", "flv_bridge"):
+        # Native FLV keeps the logical session alive across cooperative source swaps
+        # even while the HTTP reader is briefly stopped.
+        if self._capture_mode == "flv":
+            return self._flv_session is not None
+        if self._capture_mode == "flv_bridge":
             return self._stream_source is not None and self._stream_source.is_running
         return self.current_ffmpeg is not None and self.current_ffmpeg.poll() is None
 
     def request_stop(self, reset_time: bool = True):
         """同步停止入口；仅应在后台线程或 recorder 自身线程中调用。"""
+        self.exit_reason = "requested_stop"
         self.is_monitoring = False
         self.stop_recording(reset_time=reset_time)
 
     def request_stop_async(self, reset_time: bool = True):
         """只设置停止标记，让 run() 在 recorder 线程内完成可能阻塞的收尾。"""
+        self.exit_reason = "requested_stop"
         self._async_stop_requested = True
         self._async_stop_reset_time = reset_time
         self.is_monitoring = False
@@ -615,27 +724,41 @@ class BiliRecorder(QObject):
         except RuntimeError:
             logging.warning(f"[recorder {self.room_id}] finished emit 时对象已销毁")
 
+    def _artifact_condition(self):
+        artifact_cv = getattr(self, "_artifact_cv", None)
+        if artifact_cv is None:
+            artifact_cv = threading.Condition(self._artifact_lock)
+            self._artifact_cv = artifact_cv
+        return artifact_cv
+
     def _on_artifact_result(self, result: ArtifactResult, token: Optional[str] = None):
         """media-pipeline 线程入口：只入队，绝不 emit。"""
         if token is not None and token != getattr(self, "_handler_token", None):
             logging.info(f"⏭️ 丢弃过期产物回调 room={self.room_id}")
             return
 
-        with self._artifact_cv:
+        artifact_cv = getattr(self, "_artifact_cv", None)
+        if artifact_cv is None:
+            artifact_cv = threading.Condition(self._artifact_lock)
+            self._artifact_cv = artifact_cv
+        direct_handle = not hasattr(self, "_artifact_results")
+        with artifact_cv:
             self._pending_artifacts = max(0, self._pending_artifacts - 1)
             if getattr(self, "_finished_emitted", False):
                 logging.info(
                     f"📦 finished 后产物丢弃: status={result.status} "
                     f"src={os.path.basename(result.source_path or '')}"
                 )
-            else:
+            elif not direct_handle:
                 # 收尾等待期也要入队，由 _emit_finished_once 在 recorder 线程 drain
                 self._artifact_results.append(result)
-            self._artifact_cv.notify_all()
+            artifact_cv.notify_all()
+        if direct_handle and not getattr(self, "_finished_emitted", False):
+            BiliRecorder._handle_artifact_result(self, result)
 
     def _drain_artifact_results(self):
         """recorder 线程调用：处理已完成产物并安全 emit。"""
-        with self._artifact_cv:
+        with self._artifact_condition():
             pending = list(self._artifact_results)
             self._artifact_results.clear()
         for result in pending:
@@ -671,6 +794,22 @@ class BiliRecorder(QObject):
             emitted.add(path_key)
             logging.info(f"✅ 产物就绪: {os.path.basename(result.final_path)}")
             try:
+                append_recording({
+                    "room_id": result.room_id or self.room_id,
+                    "uname": self.uname,
+                    "title": self.current_title or "",
+                    "path": result.final_path,
+                    "source_path": result.source_path or "",
+                    "size": int(result.size or 0),
+                    "duration": float(result.duration or 0.0),
+                    "health": result.health or self._last_segment_health or "",
+                    "status": str(getattr(result.status, "value", result.status) or "success"),
+                    "close_reason": result.close_reason or "",
+                    "session_id": result.session_id or self.current_session_id,
+                })
+            except Exception:
+                logging.debug("append recording history failed", exc_info=True)
+            try:
                 _send_webhooks(
                     "recording_split",
                     result.room_id or self.room_id,
@@ -694,6 +833,22 @@ class BiliRecorder(QObject):
                 f"🟥 产物失败/警告: status={result.status} src={os.path.basename(result.source_path)} "
                 f"err={result.error or result.warnings}"
             )
+            try:
+                append_recording({
+                    "room_id": result.room_id or self.room_id,
+                    "uname": self.uname,
+                    "title": self.current_title or "",
+                    "path": result.final_path or result.source_path or "",
+                    "source_path": result.source_path or "",
+                    "size": int(result.size or 0),
+                    "duration": float(result.duration or 0.0),
+                    "health": result.health or "failed",
+                    "status": str(getattr(result.status, "value", result.status) or "failed"),
+                    "close_reason": result.error or ",".join(result.warnings or []) or "artifact_failed",
+                    "session_id": result.session_id or self.current_session_id,
+                })
+            except Exception:
+                logging.debug("append failed recording history failed", exc_info=True)
             try:
                 self.cut_failed.emit(
                     self.room_id,
@@ -720,7 +875,8 @@ class BiliRecorder(QObject):
             preferred = base[: -len(".capture")] + ".mp4"
         elif ext.lower() != ".mp4":
             preferred = base + ".mp4"
-        with self._artifact_cv:
+        artifact_cv = self._artifact_condition()
+        with artifact_cv:
             self._pending_artifacts += 1
         try:
             self._pipeline.submit_closed_part(
@@ -760,16 +916,604 @@ class BiliRecorder(QObject):
         return f"{base}.capture.flv"
 
     def _capture_path_factory(self, base_save_path: str):
-        base, _ = os.path.splitext(base_save_path)
+        initial_capture_path = self._capture_path_for_save(base_save_path)
 
         def factory(index: int) -> str:
             if index <= 1:
-                return self._capture_path_for_save(base_save_path)
+                return initial_capture_path
+            save_path = _build_save_path(
+                self.room_id,
+                self.uname,
+                self.current_title,
+                datetime.datetime.now(),
+            )
+            capture_path = self._capture_path_for_save(save_path)
+            if not os.path.exists(capture_path):
+                return capture_path
+            base, _ = os.path.splitext(save_path)
             return f"{base}.p{index:03d}.capture.flv"
 
         return factory
 
-    def _start_flv_capture(self, save_path: str, stream_url: str, *, bridge: bool = False):
+    def _native_health_config(self) -> FlvHealthConfig:
+        enabled = get_room_setting(self.room_id, "flv_cdn_failover_enabled")
+        return FlvHealthConfig.from_mapping({
+            "enabled": True if enabled is None else enabled,
+            "startup_grace_s": get_room_setting(
+                self.room_id, "flv_cdn_failover_startup_grace_sec"
+            ),
+            "lag_threshold_s": get_room_setting(self.room_id, "flv_cdn_failover_lag_sec"),
+            "sustain_s": get_room_setting(self.room_id, "flv_cdn_failover_sustain_sec"),
+            "recovery_lag_s": get_room_setting(
+                self.room_id, "flv_cdn_failover_recovery_lag_sec"
+            ),
+            "cooldown_s": get_room_setting(self.room_id, "flv_cdn_failover_cooldown_sec"),
+        })
+
+    def _endpoint_quarantine_seconds(self) -> float:
+        try:
+            value = float(
+                get_room_setting(self.room_id, "flv_cdn_endpoint_quarantine_sec") or 300
+            )
+        except (TypeError, ValueError):
+            value = 300.0
+        return max(0.0, min(3600.0, value))
+
+    def _native_outage_restart_seconds(self) -> float:
+        try:
+            value = float(
+                get_room_setting(self.room_id, "flv_cdn_outage_restart_sec") or 300
+            )
+        except (TypeError, ValueError):
+            value = 300.0
+        return max(30.0, min(3600.0, value))
+
+    def _native_outage_retry_delay(self) -> float:
+        attempts = max(1, int(getattr(self, "_native_outage_attempts", 1) or 1))
+        return min(120.0, 15.0 * (2 ** min(attempts - 1, 3)))
+
+    def _native_state_guard(self):
+        lock = getattr(self, "_native_state_lock", None)
+        if lock is None:
+            lock = threading.RLock()
+            self._native_state_lock = lock
+        return lock
+
+    def _schedule_native_outage_retry(self, now: float):
+        self._native_outage_active = True
+        self._native_recovery_pending = False
+        self._native_recovery_deadline = 0.0
+        self._native_outage_attempts = max(
+            1, int(getattr(self, "_native_outage_attempts", 0) or 0)
+        )
+        if not getattr(self, "_native_outage_started_at", 0.0):
+            self._native_outage_started_at = float(now)
+        self._native_retry_at = float(now) + self._native_outage_retry_delay()
+
+    def _install_native_cdn_bundle(self, stream_info: dict):
+        candidates = [
+            dict(candidate)
+            for candidate in (stream_info.get("cdn_candidates") or [])
+            if isinstance(candidate, dict)
+            and candidate.get("url")
+            and candidate.get("endpoint_id")
+        ]
+        if not candidates and stream_info.get("url"):
+            parsed = urlparse(stream_info["url"])
+            candidates = [{
+                "url": stream_info["url"],
+                "host": f"{parsed.scheme}://{parsed.netloc}",
+                "endpoint_id": build_endpoint_identity(
+                    f"{parsed.scheme}://{parsed.netloc}", parsed.path
+                ),
+            }]
+        self._cdn_candidates = candidates
+        self._cdn_index = 0
+        self._current_endpoint_id = candidates[0].get("endpoint_id", "") if candidates else ""
+        self._locked_codec = str(stream_info.get("codec") or "").lower()
+        self._locked_format = str(stream_info.get("format") or "").lower()
+        self._locked_qn = str(stream_info.get("qn") or "")
+        self._cdn_failovers = 0
+        self._flv_health = FlvMediaHealth(self._native_health_config())
+        self._last_flv_health_decision = None
+        self._native_outage_active = False
+        self._native_recovery_pending = False
+        self._native_outage_attempts = 0
+        self._native_retry_at = 0.0
+        self._native_recovery_deadline = 0.0
+        self._native_outage_started_at = 0.0
+        self._native_disconnect_boundary_closed = False
+        self._native_recovery_reason = ""
+        self._native_recovery_from_endpoint = ""
+        self._native_recovery_candidate_endpoint = ""
+        with self._source_events_lock:
+            self._source_events.clear()
+
+    def _enqueue_source_event(self, source_generation: int, reason: str):
+        with self._source_events_lock:
+            self._source_events.append((int(source_generation), str(reason or "disconnect")))
+
+    def _drain_source_events(self) -> list:
+        with self._source_events_lock:
+            events = list(self._source_events)
+            self._source_events.clear()
+        return events
+
+    def _create_native_source(
+        self,
+        stream_url: str,
+        session: FlvCaptureSession,
+        source_generation: int,
+    ) -> StreamSource:
+        def on_data(chunk: bytes):
+            if source_generation != getattr(self, "_source_gen", -1):
+                return
+            if self._flv_session is not session:
+                return
+            session.feed(chunk, source_generation=source_generation)
+
+        def on_disconnected(reason: str):
+            self._enqueue_source_event(source_generation, reason)
+
+        return StreamSource(
+            stream_url,
+            on_data=on_data,
+            on_disconnected=on_disconnected,
+            headers={
+                "User-Agent": "Mozilla/5.0",
+                "Referer": "https://live.bilibili.com/",
+            },
+        )
+
+    @staticmethod
+    def _candidate_host(candidate: Optional[dict]) -> str:
+        if not candidate:
+            return "unknown"
+        try:
+            return urlparse(candidate.get("url") or "").hostname or "unknown"
+        except Exception:
+            return "unknown"
+
+    def _refresh_native_candidates(self) -> bool:
+        refreshed = get_stream_info(self.room_id)
+        if not refreshed:
+            return False
+        refreshed_codec = str(refreshed.get("codec") or "").lower()
+        refreshed_format = str(refreshed.get("format") or "").lower()
+        refreshed_qn = str(refreshed.get("qn") or "")
+        if (refreshed_codec, refreshed_format) != (
+            self._locked_codec,
+            self._locked_format,
+        ):
+            logging.warning(
+                f"[cdn] room={self.room_id} rejected refreshed stream spec "
+                f"codec={refreshed_codec} format={refreshed_format} qn={refreshed_qn}"
+            )
+            return False
+        candidates = [
+            dict(candidate)
+            for candidate in (refreshed.get("cdn_candidates") or [])
+            if isinstance(candidate, dict)
+            and candidate.get("url")
+            and candidate.get("endpoint_id")
+        ]
+        if not candidates:
+            return False
+        if refreshed_qn != self._locked_qn:
+            logging.warning(
+                f"[cdn] room={self.room_id} accepting refreshed quality "
+                f"qn={self._locked_qn or 'unknown'}->{refreshed_qn or 'unknown'}"
+            )
+            self._locked_qn = refreshed_qn
+        self._cdn_candidates = candidates
+        for index, candidate in enumerate(candidates):
+            if candidate.get("endpoint_id") == self._current_endpoint_id:
+                self._cdn_index = index
+                break
+        return True
+
+    def _next_native_candidate(
+        self,
+        now: float,
+        attempted: set,
+        *,
+        allow_refresh: bool,
+        allow_current: bool = False,
+        allow_quarantined: bool = False,
+    ) -> tuple[Optional[dict], bool]:
+        self._endpoint_quarantine = {
+            endpoint: until
+            for endpoint, until in self._endpoint_quarantine.items()
+            if float(until) > now
+        }
+        def eligible_candidates(include_current: bool):
+            for index, candidate in enumerate(self._cdn_candidates):
+                endpoint = str(candidate.get("endpoint_id") or "")
+                if (
+                    not endpoint
+                    or endpoint in attempted
+                    or (not include_current and endpoint == self._current_endpoint_id)
+                    or (
+                        not allow_quarantined
+                        and float(self._endpoint_quarantine.get(endpoint, 0.0)) > now
+                    )
+                ):
+                    continue
+                yield index, candidate
+
+        for index, candidate in eligible_candidates(include_current=False):
+            item = dict(candidate)
+            item["_index"] = index
+            return item, allow_refresh
+        if allow_current:
+            for index, candidate in eligible_candidates(include_current=True):
+                if candidate.get("endpoint_id") != self._current_endpoint_id:
+                    continue
+                item = dict(candidate)
+                item["_index"] = index
+                return item, allow_refresh
+        if allow_refresh and self._refresh_native_candidates():
+            return self._next_native_candidate(
+                now,
+                attempted,
+                allow_refresh=False,
+                allow_current=allow_current,
+                allow_quarantined=allow_quarantined,
+            )
+        return None, False
+
+    def _replace_native_source(
+        self,
+        reason: str,
+        now: Optional[float] = None,
+        *,
+        allow_current: bool = False,
+        allow_quarantined: bool = False,
+        allow_refresh: bool = True,
+        reset_session: bool = True,
+    ) -> bool:
+        if self._capture_mode != "flv" or self._flv_session is None or self._source_transition:
+            return False
+        now = time.monotonic() if now is None else float(now)
+        attempted: set = set()
+        candidate, refresh_available = self._next_native_candidate(
+            now,
+            attempted,
+            allow_refresh=allow_refresh,
+            allow_current=allow_current,
+            allow_quarantined=allow_quarantined,
+        )
+        if candidate is None and reason == "cdn_failover_slow" and not allow_quarantined:
+            candidate, refresh_available = self._next_native_candidate(
+                now,
+                attempted,
+                allow_refresh=False,
+                allow_current=False,
+                allow_quarantined=True,
+            )
+            if candidate is not None:
+                candidate["_quarantine_override"] = True
+                logging.warning(
+                    f"[cdn] room={self.room_id} overriding endpoint quarantine "
+                    f"for stalled stream host={self._candidate_host(candidate)}"
+                )
+        if candidate is None:
+            logging.warning(f"[cdn] room={self.room_id} same-spec candidates exhausted")
+            return False
+
+        recovery_allow_quarantined = allow_quarantined or bool(
+            candidate.get("_quarantine_override")
+        )
+        self._source_transition = True
+        session = self._flv_session
+        old_source = self._stream_source
+        old_endpoint = self._current_endpoint_id
+        reset_done = False
+        try:
+            self._source_gen = getattr(self, "_source_gen", 0) + 1
+            self._stream_source = None
+            if old_endpoint:
+                self._endpoint_quarantine[old_endpoint] = (
+                    now + self._endpoint_quarantine_seconds()
+                )
+
+            while candidate is not None:
+                endpoint = str(candidate.get("endpoint_id") or "")
+                attempted.add(endpoint)
+                source_generation = self._source_gen
+                if not reset_done:
+                    self._suppress_segment_healthy = True
+                    if reset_session:
+                        session.reset_for_reconnect(
+                            reason or "cdn_failover", source_generation=source_generation
+                        )
+                        self._native_disconnect_boundary_closed = True
+                    else:
+                        session.set_active_source_generation(source_generation)
+                    reset_done = True
+                    if old_source is not None:
+                        old_source.stop(wait=0)
+                else:
+                    session.set_active_source_generation(source_generation)
+
+                source = self._create_native_source(
+                    candidate["url"], session, source_generation
+                )
+                self._stream_source = source
+                self.stream_url = candidate["url"]
+                self._current_endpoint_id = endpoint
+                self._cdn_index = int(candidate.get("_index", 0))
+                self._native_recovery_candidate_endpoint = endpoint
+                self._suppress_segment_healthy = True
+                try:
+                    source.start()
+                except Exception as exc:
+                    if self._stream_source is source:
+                        self._stream_source = None
+                    try:
+                        source.stop(wait=0)
+                    except Exception:
+                        pass
+                    self._endpoint_quarantine[endpoint] = (
+                        now + self._endpoint_quarantine_seconds()
+                    )
+                    logging.warning(
+                        f"[cdn] room={self.room_id} source start failed "
+                        f"host={self._candidate_host(candidate)} error={type(exc).__name__}"
+                    )
+                    self._source_gen += 1
+                    candidate, refresh_available = self._next_native_candidate(
+                        now,
+                        attempted,
+                        allow_refresh=refresh_available,
+                        allow_current=allow_current,
+                        allow_quarantined=recovery_allow_quarantined,
+                    )
+                    continue
+
+                logging.warning(
+                    f"[cdn] room={self.room_id} recovery attempt launched reason={reason} "
+                    f"host={self._candidate_host(candidate)} "
+                    f"candidate={self._cdn_index + 1}/{len(self._cdn_candidates)} "
+                    f"quarantine_override={bool(candidate.get('_quarantine_override'))}"
+                )
+                return True
+            return False
+        finally:
+            self._source_transition = False
+
+    def _publish_flv_health(self, decision, now: float):
+        state = str(decision.state or "")
+        display = "degraded" if state in ("degraded", "failover_pending") else "healthy"
+        if state in ("startup", "disabled"):
+            return
+        if self._suppress_segment_healthy and display == "healthy":
+            return
+        if (
+            state == self._health_ui_last_state
+            and now - float(self._health_ui_last_emit or 0.0) < 30.0
+        ):
+            return
+        self._health_ui_last_state = state
+        self._health_ui_last_emit = now
+        self._last_segment_health = display
+        self._last_capture_issue = decision.detail if display == "degraded" else ""
+        try:
+            self.segment_health_updated.emit(
+                self.room_id, display, str(decision.detail or state)[:160]
+            )
+        except Exception:
+            pass
+
+    def _poll_native_flv(self, now: Optional[float] = None):
+        if self._capture_mode != "flv" or self._flv_session is None:
+            return
+        use_live_clock = now is None
+        now = time.monotonic() if use_live_clock else float(now)
+
+        def transition_now() -> float:
+            return time.monotonic() if use_live_clock else now
+
+        active_generation = getattr(self, "_source_gen", 0)
+        current_events = [
+            reason
+            for generation, reason in self._drain_source_events()
+            if generation == active_generation
+        ]
+        if current_events:
+            reason = current_events[0]
+            logging.warning(
+                f"[cdn] room={self.room_id} source disconnected reason={reason}"
+            )
+            with self._native_state_guard():
+                outage_active = bool(getattr(self, "_native_outage_active", False))
+                recovery_pending = bool(getattr(self, "_native_recovery_pending", False))
+            if outage_active or recovery_pending:
+                endpoint = str(getattr(self, "_current_endpoint_id", "") or "")
+                if endpoint:
+                    self._endpoint_quarantine[endpoint] = (
+                        now + self._endpoint_quarantine_seconds()
+                    )
+                source = getattr(self, "_stream_source", None)
+                self._stream_source = None
+                self._source_gen = active_generation + 1
+                self._flv_session.set_active_source_generation(self._source_gen)
+                if source is not None:
+                    source.stop(wait=0)
+                self._native_outage_attempts = max(
+                    1, int(getattr(self, "_native_outage_attempts", 0) or 0)
+                )
+                self._schedule_native_outage_retry(now)
+                logging.warning(
+                    f"[cdn] room={self.room_id} all candidates unavailable; "
+                    f"retry in {max(0, int(self._native_retry_at - now))}s"
+                )
+                return
+
+            self._native_outage_active = True
+            self._native_recovery_pending = True
+            self._native_recovery_deadline = now + 15.0
+            self._native_outage_started_at = now
+            self._native_recovery_reason = "cdn_failover_disconnect"
+            self._native_recovery_from_endpoint = str(
+                getattr(self, "_current_endpoint_id", "") or ""
+            )
+            succeeded = self._replace_native_source("cdn_failover_disconnect", now)
+            completed_at = transition_now()
+            with self._native_state_guard():
+                still_pending = bool(self._native_outage_active and self._native_recovery_pending)
+                if succeeded and still_pending:
+                    self._native_disconnect_boundary_closed = True
+                    self._native_recovery_deadline = completed_at + 15.0
+            if not succeeded:
+                self._native_recovery_pending = False
+                if not getattr(self, "_native_disconnect_boundary_closed", False):
+                    self._source_gen = getattr(self, "_source_gen", 0) + 1
+                    self._flv_session.reset_for_reconnect(
+                        "cdn_outage", source_generation=self._source_gen
+                    )
+                    self._native_disconnect_boundary_closed = True
+                endpoint = str(getattr(self, "_current_endpoint_id", "") or "")
+                if endpoint:
+                    self._endpoint_quarantine[endpoint] = (
+                        now + self._endpoint_quarantine_seconds()
+                    )
+                retry_base = transition_now()
+                self._native_outage_attempts = 1
+                self._schedule_native_outage_retry(retry_base)
+                logging.warning(
+                    f"[cdn] room={self.room_id} candidates exhausted; "
+                    f"keeping logical session and retrying in "
+                    f"{max(0, int(self._native_retry_at - retry_base))}s"
+                )
+            return
+
+        if getattr(self, "_native_outage_active", False):
+            outage_started_at = float(
+                getattr(self, "_native_outage_started_at", 0.0) or 0.0
+            )
+            if (
+                outage_started_at
+                and now - outage_started_at >= self._native_outage_restart_seconds()
+            ):
+                logging.error(
+                    f"[cdn] room={self.room_id} outage persisted "
+                    f"{int(now - outage_started_at)}s; restarting capture"
+                )
+                self.stop_recording(reset_time=False)
+                return
+            if getattr(self, "_native_recovery_pending", False):
+                deadline = float(getattr(self, "_native_recovery_deadline", 0.0) or 0.0)
+                if deadline and now >= deadline:
+                    next_generation = None
+                    with self._native_state_guard():
+                        generation = int(getattr(self, "_source_gen", 0) or 0)
+                        source = getattr(self, "_stream_source", None)
+                        if (
+                            getattr(self, "_native_outage_active", False)
+                            and getattr(self, "_native_recovery_pending", False)
+                        ):
+                            next_generation = generation + 1
+                            self._source_gen = next_generation
+                            self._stream_source = None
+                            endpoint = str(getattr(self, "_current_endpoint_id", "") or "")
+                            if endpoint:
+                                self._endpoint_quarantine[endpoint] = (
+                                    now + self._endpoint_quarantine_seconds()
+                                )
+                            self._native_outage_attempts = max(
+                                1, int(getattr(self, "_native_outage_attempts", 0) or 0)
+                            )
+                            self._schedule_native_outage_retry(now)
+                        else:
+                            source = None
+                    if next_generation is not None:
+                        self._flv_session.set_active_source_generation(next_generation)
+                    if source is not None:
+                        source.stop(wait=0)
+                return
+            if now < float(getattr(self, "_native_retry_at", 0.0) or 0.0):
+                return
+            self._native_outage_attempts = max(
+                1, int(getattr(self, "_native_outage_attempts", 0) or 0) + 1
+            )
+            self._refresh_native_candidates()
+            self._native_recovery_pending = True
+            self._native_recovery_deadline = now + 15.0
+            self._native_recovery_reason = "cdn_outage_retry"
+            self._native_recovery_from_endpoint = str(
+                getattr(self, "_current_endpoint_id", "") or ""
+            )
+            succeeded = self._replace_native_source(
+                "cdn_outage_retry",
+                now,
+                allow_current=True,
+                allow_quarantined=True,
+                allow_refresh=False,
+            )
+            completed_at = transition_now()
+            if succeeded:
+                with self._native_state_guard():
+                    if self._native_outage_active and self._native_recovery_pending:
+                        self._native_recovery_deadline = completed_at + 15.0
+            else:
+                self._native_recovery_pending = False
+                self._schedule_native_outage_retry(completed_at)
+            return
+
+        if self._flv_health is None:
+            return
+        decision = self._flv_health.observe(now, self._flv_session.progress_snapshot())
+        self._last_flv_health_decision = decision
+        self._publish_flv_health(decision, now)
+        if decision.should_failover:
+            detail = (
+                f"lag_ms={int(decision.lag_ms)} generation={int(decision.transport_generation)} "
+                f"endpoint={self._current_endpoint_id or 'unknown'}"
+            )
+            try:
+                self._flv_session.note_transport_issue("media_stall", decision.lag_ms, detail)
+            except Exception:
+                logging.debug("record media stall issue failed", exc_info=True)
+            self._native_outage_active = True
+            self._native_recovery_pending = True
+            self._native_recovery_deadline = now + 15.0
+            self._native_outage_started_at = now
+            self._native_recovery_reason = "cdn_failover_slow"
+            self._native_recovery_from_endpoint = str(
+                getattr(self, "_current_endpoint_id", "") or ""
+            )
+            launched = self._replace_native_source("cdn_failover_slow", now)
+            completed_at = transition_now()
+            if launched:
+                with self._native_state_guard():
+                    if self._native_outage_active and self._native_recovery_pending:
+                        self._native_disconnect_boundary_closed = True
+                        self._native_recovery_deadline = completed_at + 15.0
+            else:
+                self._native_recovery_pending = False
+                source = getattr(self, "_stream_source", None)
+                self._stream_source = None
+                self._source_gen = getattr(self, "_source_gen", 0) + 1
+                self._flv_session.set_active_source_generation(self._source_gen)
+                if source is not None:
+                    source.stop(wait=0)
+                if not self._native_disconnect_boundary_closed:
+                    self._flv_session.reset_for_reconnect(
+                        "cdn_outage", source_generation=self._source_gen
+                    )
+                    self._native_disconnect_boundary_closed = True
+                self._native_outage_attempts = 1
+                self._schedule_native_outage_retry(completed_at)
+
+    def _start_flv_capture(
+        self,
+        save_path: str,
+        stream_url: str,
+        *,
+        bridge: bool = False,
+        stream_info: Optional[dict] = None,
+    ):
         """启动原生 FLV 管线。"""
         # 重连/重启：先关闭旧源与旧段（submit=True 让上一段进入 pipeline）
         old_mode = self._capture_mode
@@ -788,30 +1532,26 @@ class BiliRecorder(QObject):
         self._capture_mode = "flv_bridge" if bridge else "flv"
         self._source_gen = getattr(self, "_source_gen", 0) + 1
         source_gen = self._source_gen
-
-        def on_data(chunk: bytes):
-            # 旧 source 线程的迟到数据直接丢弃，避免写到已切换的 session
-            if source_gen != getattr(self, "_source_gen", -1):
-                return
-            if self._flv_session is not session:
-                return
-            session.feed(chunk)
-
-        def on_disc(reason: str):
-            if source_gen != getattr(self, "_source_gen", -1):
-                return
-            source_name = "FFmpeg-to-FLV bridge" if bridge else "FLV"
-            logging.warning(f"Room {self.room_id} {source_name} source disconnected: {reason}")
-            # 断开时关当前段并重置会话状态，避免重连后追加到旧文件
-            try:
-                if self._flv_session is session:
-                    session.reset_for_reconnect(reason or "disconnect")
-            except Exception as e:
-                logging.debug(f"reset_for_reconnect failed: {e}")
-            # 由 run loop 检测 is_recording 变化后处理重启
+        session.set_active_source_generation(source_gen)
 
         headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://live.bilibili.com/"}
         if bridge:
+            def on_data(chunk: bytes):
+                if source_gen != getattr(self, "_source_gen", -1):
+                    return
+                if self._flv_session is not session:
+                    return
+                session.feed(chunk, source_generation=source_gen)
+
+            def on_disc(reason: str):
+                if source_gen != getattr(self, "_source_gen", -1):
+                    return
+                logging.warning(
+                    f"Room {self.room_id} FFmpeg-to-FLV bridge source disconnected: {reason}"
+                )
+                self._reconnects = int(getattr(self, "_reconnects", 0) or 0) + 1
+                self._enqueue_source_event(source_gen, reason)
+
             src = FfmpegFlvSource(
                 stream_url,
                 on_data=on_data,
@@ -822,7 +1562,16 @@ class BiliRecorder(QObject):
                 ffmpeg_cmd=FFMPEG_CMD,
             )
         else:
-            src = StreamSource(stream_url, on_data=on_data, on_disconnected=on_disc, headers=headers)
+            if stream_info:
+                self._install_native_cdn_bundle(stream_info)
+            elif not self._cdn_candidates:
+                self._install_native_cdn_bundle({
+                    "url": stream_url,
+                    "codec": "h264",
+                    "format": "flv",
+                    "qn": "",
+                })
+            src = self._create_native_source(stream_url, session, source_gen)
         try:
             src.start()
             if bridge:
@@ -855,16 +1604,235 @@ class BiliRecorder(QObject):
             if path:
                 self.current_save_path = path
                 self.current_part_start_time = time.time()
-                logging.info(f"🎬 FLV 分段打开: {os.path.basename(path)}")
+                video_config = "present" if payload.get("video_config_present") else "missing"
+                audio_config = "present" if payload.get("audio_config_present") else "missing"
+                sample_rate = payload.get("audio_sample_rate") or "unknown"
+                config_size = payload.get("audio_config_size") or 0
+                logging.info(
+                    f"🎬 FLV 分段打开: {os.path.basename(path)} "
+                    f"video_config={video_config} audio_config={audio_config} "
+                    f"sample_rate={sample_rate} "
+                    f"config_size={config_size}"
+                )
         elif event == CaptureEvent.SEGMENT_CLOSED:
             path = payload.get("path") or ""
             health = payload.get("health") or ""
             reason = payload.get("close_reason") or ""
+            if health:
+                suppress_healthy = (
+                    str(reason).startswith("cdn_failover_")
+                    or (self._suppress_segment_healthy and str(health) == "healthy")
+                )
+                if not suppress_healthy:
+                    self._last_segment_health = str(health)
+                    try:
+                        self.segment_health_updated.emit(
+                            self.room_id,
+                            str(health),
+                            str(reason or self._last_capture_issue or health)[:160],
+                        )
+                    except Exception:
+                        pass
             logging.info(f"💾 FLV 分段关闭: {os.path.basename(path)} health={health} reason={reason}")
             if path and os.path.exists(path):
                 self._submit_closed_source(path, close_reason=reason, health=health)
         elif event == CaptureEvent.ISSUE:
+            detail = ""
+            if isinstance(payload, dict):
+                detail = str(payload.get("detail") or payload.get("kind") or payload)[:120]
+                self._last_capture_issue = detail
+                # issue 时若还没有 failed，先标 degraded 给 UI
+                if (self._last_segment_health or "healthy") == "healthy":
+                    self._last_segment_health = "degraded"
+                try:
+                    self.segment_health_updated.emit(
+                        self.room_id,
+                        self._last_segment_health or "degraded",
+                        detail or "issue",
+                    )
+                except Exception:
+                    pass
             logging.warning(f"⚠️ FLV issue: {payload}")
+        elif event == CaptureEvent.WAITING_KEYFRAME:
+            if "has_video_seq" in payload or "has_audio_seq" in payload:
+                missing = []
+                if not payload.get("has_video_seq"):
+                    missing.append("AVC sequence header")
+                if not payload.get("has_audio_seq"):
+                    missing.append("AAC sequence header")
+                logging.info(f"⏳ FLV 等待媒体初始化: missing={','.join(missing) or 'keyframe'}")
+            else:
+                logging.info(
+                    f"⏳ FLV 等待下一个关键帧: reason={payload.get('reason') or 'rotation'}"
+                )
+        elif event == CaptureEvent.AUDIO_CONFIG_READY:
+            logging.info(
+                "🎵 FLV AAC 配置晚到并已写入: "
+                f"sample_rate={payload.get('audio_sample_rate') or 'unknown'} "
+                f"config_size={payload.get('audio_config_size') or 0}"
+            )
+        elif event == CaptureEvent.RECOVERED:
+            recovered_generation = payload.get("source_generation")
+            recovered_at = time.monotonic()
+            with self._native_state_guard():
+                if (
+                    recovered_generation is None
+                    or int(recovered_generation) != int(getattr(self, "_source_gen", -1))
+                ):
+                    return
+                was_recovery_pending = bool(
+                    getattr(self, "_native_outage_active", False)
+                    or getattr(self, "_native_recovery_pending", False)
+                )
+                reason = str(getattr(self, "_native_recovery_reason", "") or "")
+                from_endpoint = str(
+                    getattr(self, "_native_recovery_from_endpoint", "") or ""
+                )
+                to_endpoint = str(
+                    getattr(self, "_native_recovery_candidate_endpoint", "")
+                    or getattr(self, "_current_endpoint_id", "")
+                    or ""
+                )
+                started_at = float(getattr(self, "_native_outage_started_at", 0.0) or 0.0)
+                self._suppress_segment_healthy = False
+                self._native_outage_active = False
+                self._native_recovery_pending = False
+                self._native_outage_attempts = 0
+                self._native_retry_at = 0.0
+                self._native_recovery_deadline = 0.0
+                self._native_outage_started_at = 0.0
+                self._native_disconnect_boundary_closed = False
+                self._native_recovery_reason = ""
+                self._native_recovery_from_endpoint = ""
+                self._native_recovery_candidate_endpoint = ""
+                self._last_segment_health = "healthy"
+                self._last_capture_issue = ""
+            if was_recovery_pending:
+                self._cdn_failovers = int(getattr(self, "_cdn_failovers", 0) or 0) + 1
+                self._reconnects = int(getattr(self, "_reconnects", 0) or 0) + 1
+                flv_health = getattr(self, "_flv_health", None)
+                if flv_health is not None:
+                    flv_health.complete_failover(recovered_at, True)
+                recovery_ms = max(0, int(round((recovered_at - started_at) * 1000.0))) if started_at else 0
+                logging.warning(
+                    f"[cdn] room={self.room_id} recovered reason={reason or 'cdn_recovery'} "
+                    f"from={from_endpoint or 'unknown'} to={to_endpoint or 'unknown'} "
+                    f"recovery_ms={recovery_ms}"
+                )
+            try:
+                self.segment_health_updated.emit(self.room_id, "healthy", "stream recovered")
+            except Exception:
+                pass
+
+    def _recording_save_root(self) -> str:
+        """Directory used for disk free-space checks."""
+        try:
+            if self.current_save_path:
+                return os.path.dirname(os.path.abspath(self.current_save_path)) or "."
+            return (
+                get_room_setting(self.room_id, "save_dir")
+                or get_global_setting("save_dir")
+                or VIDEO_SAVE_DIR
+            )
+        except Exception:
+            return VIDEO_SAVE_DIR
+
+    def _disk_min_free_gb(self) -> float:
+        try:
+            return max(0.0, float(get_global_setting("disk_min_free_gb") or 5.0))
+        except (TypeError, ValueError):
+            return 5.0
+
+    def _disk_check_interval(self) -> float:
+        try:
+            return max(15.0, float(get_global_setting("disk_check_interval_sec") or 60))
+        except (TypeError, ValueError):
+            return 60.0
+
+    def _heartbeat_interval(self) -> float:
+        try:
+            return max(60.0, float(get_global_setting("heartbeat_interval_sec") or 300))
+        except (TypeError, ValueError):
+            return 300.0
+
+    def _check_disk_guard(self, *, force: bool = False, starting: bool = False) -> bool:
+        """Return True if recording is allowed. On low disk, stop current capture safely."""
+        now = time.time()
+        if not force and (now - float(self._last_disk_check_at or 0.0)) < self._disk_check_interval():
+            return not self._disk_blocked
+        self._last_disk_check_at = now
+        root = self._recording_save_root()
+        blocked, status = should_block_recording(root, min_free_gb=self._disk_min_free_gb())
+        if not blocked:
+            if self._disk_blocked and status is not None:
+                logging.info(
+                    f"[disk] room={self.room_id} free={format_gb(status.free_bytes)} "
+                    f"threshold={self._disk_min_free_gb():.1f}GB recovered path={status.path}"
+                )
+            self._disk_blocked = False
+            return True
+
+        self._disk_blocked = True
+        free_s = format_gb(status.free_bytes) if status else "?"
+        path_s = status.path if status else root
+        logging.error(
+            f"[disk] room={self.room_id} low free space free={free_s} "
+            f"threshold={self._disk_min_free_gb():.1f}GB path={path_s}"
+        )
+        if self.is_recording:
+            try:
+                self.stop_recording(reset_time=False)
+            except Exception:
+                logging.exception(f"[disk] stop_recording failed room={self.room_id}")
+        self.status_updated.emit(
+            "⚠️ 监控中",
+            "📡 直播中" if not starting else "📡 直播中",
+            "💾 磁盘空间不足",
+            self.current_title,
+            "",
+            "",
+            "",
+            self.current_parent_area,
+            self.current_area,
+        )
+        return False
+
+    def _maybe_log_heartbeat(self, duration_str: str = "", size_str: str = "", speed_str: str = ""):
+        now = time.time()
+        if (now - float(self._last_heartbeat_at or 0.0)) < self._heartbeat_interval():
+            return
+        self._last_heartbeat_at = now
+        try:
+            status = check_disk(self._recording_save_root(), min_free_gb=self._disk_min_free_gb())
+            free_s = format_gb(status.free_bytes)
+        except Exception:
+            free_s = "?"
+        mode = self._capture_mode or "none"
+        health = self._last_segment_health or "-"
+        issue = self._last_capture_issue or "-"
+        media_detail = ""
+        if mode == "flv" and self._flv_session is not None:
+            try:
+                snapshot = self._flv_session.progress_snapshot()
+                decision = getattr(self, "_last_flv_health_decision", None)
+                lag_ms = int(decision.lag_ms) if decision is not None else 0
+                cooldown = 0
+                if self._flv_health is not None:
+                    cooldown = max(
+                        0, int(getattr(self._flv_health, "_cooldown_until", 0.0) - time.monotonic())
+                    )
+                media_detail = (
+                    f" media_ms={snapshot.media_progress_ms} gen={snapshot.transport_generation} "
+                    f"lag_ms={lag_ms} cdn={self._cdn_index + 1}/{len(self._cdn_candidates)} "
+                    f"failovers={self._cdn_failovers} cooldown_s={cooldown}"
+                )
+            except Exception:
+                media_detail = ""
+        logging.info(
+            f"[heartbeat] room={self.room_id} mode={mode} dur={duration_str or '-'} "
+            f"size={size_str or '-'} speed={speed_str or '-'} reconnects={self._reconnects} "
+            f"free_disk={free_s} health={health} issue={issue}{media_detail}"
+        )
 
     def _stop_flv_capture(self, submit: bool = True):
         # 递增 generation，让旧 source 线程回调失效
@@ -886,6 +1854,22 @@ class BiliRecorder(QObject):
                 pass
         if self._capture_mode in ("flv", "flv_bridge"):
             self._capture_mode = "none"
+        self._flv_health = None
+        self._last_flv_health_decision = None
+        self._source_transition = False
+        self._suppress_segment_healthy = False
+        self._native_outage_active = False
+        self._native_recovery_pending = False
+        self._native_outage_attempts = 0
+        self._native_retry_at = 0.0
+        self._native_recovery_deadline = 0.0
+        self._native_outage_started_at = 0.0
+        self._native_disconnect_boundary_closed = False
+        source_events_lock = getattr(self, "_source_events_lock", None)
+        source_events = getattr(self, "_source_events", None)
+        if source_events_lock is not None and source_events is not None:
+            with source_events_lock:
+                source_events.clear()
 
     def _request_ffmpeg_stop(self, process) -> bool:
         """Tell ffmpeg to stop reading input and start writing its trailer immediately.
@@ -1382,6 +2366,7 @@ class BiliRecorder(QObject):
     def run(self):
         try:
             if not get_room_setting(self.room_id, "stream_record_enabled"):
+                self.exit_reason = "disabled"
                 self.status_updated.emit("⚙️ 已停用", "📡 未开播", "⏳ 闲置中",
                                         self.current_title, "", "", "",
                                         self.current_parent_area, self.current_area)
@@ -1390,6 +2375,7 @@ class BiliRecorder(QObject):
             try:
                 self._run_loop()
             except Exception as e:
+                self.exit_reason = "error"
                 logging.exception(f"❌ {self.room_id} run() 主循环异常: {e}")
                 self.status_updated.emit("❌ 出错了", "💥 主循环崩溃", str(e)[:30],
                                         self.current_title, "", "", "",
@@ -1469,7 +2455,11 @@ class BiliRecorder(QObject):
                     if getattr(self, "last_auto_switch_check", 0) == 0:
                         self.last_auto_switch_check = now_time
 
-                    if get_room_setting(self.room_id, "auto_switch_stream") and (now_time - self.last_auto_switch_check > 180):
+                    if (
+                        self._capture_mode != "flv"
+                        and get_room_setting(self.room_id, "auto_switch_stream")
+                        and (now_time - self.last_auto_switch_check > 180)
+                    ):
                         new_info = get_stream_info(self.room_id)
                         if new_info and getattr(self, "current_stream_base_url", None):
                             if new_info["base_url"] != self.current_stream_base_url:
@@ -1526,6 +2516,20 @@ class BiliRecorder(QObject):
 
                         self.last_api_check_time = now_time
 
+                # Native FLV owns its source transitions in this recorder loop.
+                if self._capture_mode == "flv":
+                    self._poll_native_flv()
+                    if not self.is_recording:
+                        time.sleep(2)
+                        continue
+
+                # 磁盘不足时安全停录，避免写坏文件
+                if not self._check_disk_guard():
+                    time.sleep(5)
+                    continue
+
+                self._maybe_log_heartbeat(duration_str, size_str, speed_str)
+
                 # 检测流不连续：ffmpeg / FLV 源意外退出。
                 # 调 stop_recording(reset_time=False)：保留 current_save_path / current_session_id
                 # 给后续防抖路径（或 API 翻回 1 重启路径）使用。
@@ -1533,9 +2537,9 @@ class BiliRecorder(QObject):
                 if self._capture_mode == "ffmpeg" and self.current_ffmpeg and self.current_ffmpeg.poll() is not None:
                     capture_dead = True
                     logging.warning(f"⚠️ {self.room_id} ffmpeg 进程已退出（可能 B 站流断开）")
-                elif self._capture_mode in ("flv", "flv_bridge") and self._stream_source and not self._stream_source.is_running:
+                elif self._capture_mode == "flv_bridge" and self._stream_source and not self._stream_source.is_running:
                     capture_dead = True
-                    logging.warning(f"⚠️ {self.room_id} FLV 源已断开")
+                    logging.warning(f"⚠️ {self.room_id} FLV bridge 源已断开")
                 if capture_dead:
                     # 关键：用 reset_time=False 保留 part 信息；始终关闭当前 artifact 边界
                     self.stop_recording(reset_time=False)
@@ -1617,6 +2621,11 @@ class BiliRecorder(QObject):
 
                 stream_info = get_stream_info(self.room_id)
                 if stream_info:
+                    # 开录前检查磁盘；不足则不启 capture
+                    if not self._check_disk_guard(force=True, starting=True):
+                        time.sleep(_parse_monitor_seconds("monitor_interval", 20, self.room_id))
+                        continue
+
                     self.stream_url = stream_info["url"]
                     self.current_stream_base_url = stream_info["base_url"]
                     self._last_codec = stream_info.get("codec", "")  # 记录当前编码
@@ -1631,7 +2640,12 @@ class BiliRecorder(QObject):
                         f"match={stream_info.get('match_kind')}"
                     )
                     if self._use_native_flv(stream_info):
-                        self._start_flv_capture(save_path, self.stream_url, bridge=False)
+                        self._start_flv_capture(
+                            save_path,
+                            self.stream_url,
+                            bridge=False,
+                            stream_info=stream_info,
+                        )
                         self.current_ffmpeg = None
                     elif self._use_ffmpeg_flv_bridge(stream_info):
                         try:

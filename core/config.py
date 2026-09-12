@@ -4,6 +4,7 @@ import re
 import sys
 import json
 import logging
+import uuid
 
 PACK_ID = "dd_rec"
 USERDATA_DIR_NAME = "userdata"   # 独立目录名,不跟录播文件混
@@ -162,6 +163,9 @@ DEFAULT_GLOBAL_SETTINGS = {
     # 自动化
     "webhooks": "",
     "webhook_format": "blrec",
+    # webhook 失败日志：false=同 URL 连续失败合并/限频；true=每次失败都 warning
+    "webhook_log_verbose": False,
+    "webhook_fail_log_interval_sec": 300,
 
     # 解析
     "advanced_parsing": False,
@@ -203,6 +207,15 @@ DEFAULT_GLOBAL_SETTINGS = {
     "artifact_keep_source": True,
     "webhook_only_verified_artifacts": True,
     "flv_native_capture": True,
+    # 原生 FLV CDN 慢流切换（后端默认；首版不暴露 UI）
+    "flv_cdn_failover_enabled": True,
+    "flv_cdn_failover_startup_grace_sec": 45,
+    "flv_cdn_failover_lag_sec": 30,
+    "flv_cdn_failover_sustain_sec": 20,
+    "flv_cdn_failover_recovery_lag_sec": 15,
+    "flv_cdn_failover_cooldown_sec": 60,
+    "flv_cdn_endpoint_quarantine_sec": 300,
+    "flv_cdn_outage_restart_sec": 300,
 
     # 直播监控
     "monitor_delay": "自动",
@@ -230,6 +243,19 @@ DEFAULT_GLOBAL_SETTINGS = {
     # 系统
     "auto_start": True,
     "prevent_sleep": True,
+
+    # 磁盘守卫 / 挂机心跳 / 单房间自愈（UI 后续接入；先有默认值保证老配置可 load）
+    "disk_min_free_gb": 5.0,
+    # History page soft warning; effective value is always max(warn, min_free, min_free*3 floor at 15)
+    "disk_warn_free_gb": 15.0,
+    "disk_check_interval_sec": 60,
+    "heartbeat_interval_sec": 300,
+    "recorder_auto_heal": True,
+    "recorder_auto_heal_max_restarts": 3,
+    "recorder_auto_heal_window_sec": 600,
+
+    # 用户自定义标签库：[{id, name, color}, ...]；房间绑定见 rooms[id].tag_ids
+    "tag_library": [],
 
     # 更新通道
     "update_channel": "github",      # 用户上次选择的下载通道(github / cnb)
@@ -409,6 +435,106 @@ def set_global_setting(key, value):
     save_config()
 
 
+_TAG_COLOR_RE = re.compile(r"^#[0-9A-Fa-f]{6}$")
+DEFAULT_TAG_COLOR = "#3B82F6"
+
+
+def _normalize_tag_name(name) -> str:
+    # 单行、去首尾空白，限制长度避免卡片布局被撑爆
+    return " ".join(str(name or "").split())[:20]
+
+
+def _normalize_tag_color(color) -> str:
+    value = str(color or "").strip()
+    return value.upper() if _TAG_COLOR_RE.fullmatch(value) else DEFAULT_TAG_COLOR
+
+
+def get_tag_library() -> list[dict]:
+    """Return a normalized copy of the user-defined tag library."""
+    raw = get_global_setting("tag_library")
+    if not isinstance(raw, list):
+        return []
+    out = []
+    seen_ids = set()
+    seen_names = set()
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        tag_id = str(item.get("id") or "").strip()
+        name = _normalize_tag_name(item.get("name"))
+        name_key = name.casefold()
+        if not tag_id or not name or tag_id in seen_ids or name_key in seen_names:
+            continue
+        seen_ids.add(tag_id)
+        seen_names.add(name_key)
+        out.append({"id": tag_id, "name": name, "color": _normalize_tag_color(item.get("color"))})
+    return out
+
+
+def get_tag(tag_id: str) -> dict | None:
+    wanted = str(tag_id or "")
+    return next((tag for tag in get_tag_library() if tag["id"] == wanted), None)
+
+
+def upsert_tag(name: str, color: str = DEFAULT_TAG_COLOR, tag_id: str | None = None) -> dict:
+    """Create or update a tag. Names are unique case-insensitively."""
+    clean_name = _normalize_tag_name(name)
+    if not clean_name:
+        raise ValueError("标签名称不能为空")
+    clean_color = _normalize_tag_color(color)
+    tags = get_tag_library()
+    current_id = str(tag_id or "").strip()
+    for tag in tags:
+        if tag["name"].casefold() == clean_name.casefold() and tag["id"] != current_id:
+            raise ValueError("标签名称已存在")
+    if current_id:
+        for tag in tags:
+            if tag["id"] == current_id:
+                tag.update(name=clean_name, color=clean_color)
+                set_global_setting("tag_library", tags)
+                return dict(tag)
+        raise KeyError(current_id)
+    created = {"id": f"tag_{uuid.uuid4().hex[:12]}", "name": clean_name, "color": clean_color}
+    tags.append(created)
+    set_global_setting("tag_library", tags)
+    return dict(created)
+
+
+def delete_tag(tag_id: str) -> bool:
+    """Delete from library and remove all room bindings."""
+    tag_id = str(tag_id or "")
+    tags = get_tag_library()
+    kept = [tag for tag in tags if tag["id"] != tag_id]
+    if len(kept) == len(tags):
+        return False
+    CONFIG["global_settings"]["tag_library"] = kept
+    for room in CONFIG.get("rooms", {}).values():
+        if not isinstance(room, dict):
+            continue
+        room["tag_ids"] = [tid for tid in room.get("tag_ids", []) if str(tid) != tag_id]
+    save_config()
+    return True
+
+
+def set_room_tag_ids(room_id, tag_ids) -> list[str]:
+    valid = {tag["id"] for tag in get_tag_library()}
+    clean = []
+    for tag_id in tag_ids or []:
+        tag_id = str(tag_id)
+        if tag_id in valid and tag_id not in clean:
+            clean.append(tag_id)
+    room = get_room_config(room_id)
+    room["tag_ids"] = clean
+    save_config()
+    return list(clean)
+
+
+def get_room_tags(room_id) -> list[dict]:
+    room = get_room_config(room_id)
+    by_id = {tag["id"]: tag for tag in get_tag_library()}
+    return [dict(by_id[tag_id]) for tag_id in room.get("tag_ids", []) if tag_id in by_id]
+
+
 def get_room_config(room_id):
     room_id = str(room_id)
     if room_id not in CONFIG["rooms"]:
@@ -416,10 +542,16 @@ def get_room_config(room_id):
             "sessdata": "",
             "format": "",
             "quality": 10000,
-            "custom_dir": ""
+            "custom_dir": "",
+            "tag_ids": [],
         }
         save_config()
-    return CONFIG["rooms"][room_id]
+        return CONFIG["rooms"][room_id]
+    room = CONFIG["rooms"][room_id]
+    # 老房间缺 tag_ids 时补默认，不强制立刻写盘（下次 save 会带上）
+    if "tag_ids" not in room or not isinstance(room.get("tag_ids"), list):
+        room["tag_ids"] = []
+    return room
 
 
 def get_effective_format(room_id):

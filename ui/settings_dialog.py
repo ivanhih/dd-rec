@@ -5,10 +5,11 @@ import logging
 from PySide6.QtWidgets import (
     QApplication, QDialog, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
     QComboBox, QPushButton, QCheckBox, QScrollArea, QFrame,
-    QFormLayout, QTabWidget, QWidget, QTextEdit, QFileDialog
+    QFormLayout, QTabWidget, QWidget, QTextEdit, QFileDialog,
+    QColorDialog, QInputDialog, QMessageBox
 )
 from PySide6.QtCore import QObject, QRunnable, QSignalBlocker, QThreadPool, Qt, QTimer, Signal, Slot
-from PySide6.QtGui import QFont
+from PySide6.QtGui import QFont, QColor
 
 from core.config import (
     DEFAULT_GLOBAL_SETTINGS,
@@ -17,13 +18,70 @@ from core.config import (
     get_global_setting,
     get_room_config,
     get_room_setting,
+    get_tag_library,
+    get_room_tags,
+    upsert_tag,
+    delete_tag,
+    set_room_tag_ids,
     has_room_override,
     save_config,
     set_global_setting,
     set_room_setting,
 )
 from ui.room_card import ToggleSwitch
-from ui.theme import enable_surface
+from ui.theme import enable_surface, repolish
+
+
+# setting key -> local help section id (core.help_docs.HELP_TOC)
+SETTING_HELP_LINKS = {
+    # paths
+    "save_dir": "paths",
+    "path_template": "paths",
+    "custom_dir": "paths",
+    # webhooks / notify
+    "webhooks": "webhook",
+    "webhook_format": "webhook",
+    "webhook_log_verbose": "webhook",
+    "webhook_fail_log_interval_sec": "webhook",
+    "notify_enabled": "webhook",
+    "notify_url": "webhook",
+    "notify_title_template": "webhook",
+    "notify_body_template": "webhook",
+    # recording / convert / split / stream
+    "stream_record_enabled": "record",
+    "stream_codec": "record",
+    "stream_format": "record",
+    "stream_resolution": "record",
+    "stream_fps": "record",
+    "stream_bitrate": "record",
+    "stream_fallback_policy": "record",
+    "auto_switch_stream": "record",
+    "allow_audio_only": "record",
+    "flv_native_capture": "record",
+    "convert_enabled": "record",
+    "convert_delete_source": "record",
+    "convert_format": "record",
+    "artifact_keep_source": "record",
+    "split_by_duration": "record",
+    "split_by_size": "record",
+    "split_on_codec_change": "record",
+    "split_on_stream_discontinuity": "record",
+    "split_on_title_change": "record",
+    "split_on_category_change": "record",
+    "chat_record_enabled": "config",
+    "chat_credential": "config",
+    "chat_format": "config",
+    "sessdata": "config",
+    # hang / diagnostics
+    "disk_min_free_gb": "troubleshoot",
+    "disk_check_interval_sec": "troubleshoot",
+    "heartbeat_interval_sec": "troubleshoot",
+    "recorder_auto_heal": "troubleshoot",
+    "recorder_auto_heal_max_restarts": "troubleshoot",
+    "recorder_auto_heal_window_sec": "troubleshoot",
+    # tags / ui
+    "tag_library": "ui",
+}
 
 
 SETTING_COMBO_OPTIONS = {
@@ -665,7 +723,14 @@ class GlobalSettingsOldStyleReplicaPage(QWidget):
         self._page_badge = badge
         self._bind_i18n(badge, "settings.badge")
 
+        help_btn = self._compact_button(QPushButton(), height=34, min_width=96)
+        help_btn.setProperty("variant", "secondary")
+        self._bind_i18n(help_btn, "help.open")
+        help_btn.clicked.connect(self._open_help_overlay)
+        self._page_help_btn = help_btn
+
         header.addLayout(header_left, 1)
+        header.addWidget(help_btn, 0, Qt.AlignRight | Qt.AlignVCenter)
         header.addWidget(badge, 0, Qt.AlignRight | Qt.AlignVCenter)
         root.addLayout(header)
         root.addSpacing(14)
@@ -688,6 +753,7 @@ class GlobalSettingsOldStyleReplicaPage(QWidget):
         left_col.addWidget(self._build_chat_record_card())
         left_col.addWidget(self._build_schedule_card())
         left_col.addWidget(self._build_automation_card())
+        left_col.addWidget(self._build_tag_manager_card())
         left_col.addStretch()
 
         right_col = QVBoxLayout()
@@ -713,9 +779,160 @@ class GlobalSettingsOldStyleReplicaPage(QWidget):
         # 非默认语言启动时，外观卡/页头按当前语言显示
         self.retranslate_ui()
 
+    def _build_tag_manager_card(self):
+        from ui.i18n import t
+
+        card = QFrame()
+        card.setObjectName("settingsCard")
+        enable_surface(card)
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(18, 18, 18, 18)
+        layout.setSpacing(12)
+
+        header = QHBoxLayout()
+        accent = QFrame()
+        accent.setFixedWidth(4)
+        accent.setStyleSheet("background-color:#8B5CF6; border-radius:2px; border:none;")
+        title = QLabel(t("settings.tags.title"))
+        title.setProperty("role", "title")
+        add_btn = self._compact_button(QPushButton(t("settings.tags.add")), height=30, min_width=72)
+        add_btn.setProperty("variant", "primary")
+        add_btn.clicked.connect(self._add_tag)
+        header.addWidget(accent)
+        header.addWidget(title)
+        header.addStretch()
+        header.addWidget(add_btn)
+        layout.addLayout(header)
+
+        desc = QLabel(t("settings.tags.desc"))
+        desc.setProperty("role", "itemDesc")
+        desc.setWordWrap(True)
+        layout.addWidget(desc)
+
+        self._tag_manager_rows = QVBoxLayout()
+        self._tag_manager_rows.setSpacing(8)
+        layout.addLayout(self._tag_manager_rows)
+        self._refresh_tag_manager_rows()
+        return card
+
+    @staticmethod
+    def _clear_layout(layout):
+        while layout.count():
+            item = layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+            child = item.layout()
+            if child is not None:
+                GlobalSettingsOldStyleReplicaPage._clear_layout(child)
+
+    def _refresh_tag_manager_rows(self):
+        if not hasattr(self, "_tag_manager_rows"):
+            return
+        from ui.i18n import t
+        self._clear_layout(self._tag_manager_rows)
+        tags = get_tag_library()
+        if not tags:
+            empty = QLabel(t("settings.tags.empty"))
+            empty.setProperty("role", "muted")
+            self._tag_manager_rows.addWidget(empty)
+            return
+        for tag in tags:
+            row = QWidget()
+            h = QHBoxLayout(row)
+            h.setContentsMargins(0, 0, 0, 0)
+            h.setSpacing(8)
+            dot = QLabel("●")
+            dot.setStyleSheet(f"color:{tag['color']}; font-size:18px;")
+            name = QLabel(tag["name"])
+            name.setProperty("role", "itemTitle")
+            color = QLabel(tag["color"])
+            color.setProperty("role", "muted")
+            color.setStyleSheet("font-size:11px;")
+            edit_btn = self._compact_button(QPushButton(t("settings.action.edit")), height=28, min_width=54)
+            edit_btn.setProperty("variant", "secondary")
+            delete_btn = self._compact_button(QPushButton(t("settings.tags.delete")), height=28, min_width=54)
+            delete_btn.setProperty("variant", "danger")
+            edit_btn.clicked.connect(lambda checked=False, item=dict(tag): self._edit_tag(item))
+            delete_btn.clicked.connect(lambda checked=False, item=dict(tag): self._delete_tag(item))
+            h.addWidget(dot)
+            h.addWidget(name)
+            h.addWidget(color)
+            h.addStretch()
+            h.addWidget(edit_btn)
+            h.addWidget(delete_btn)
+            self._tag_manager_rows.addWidget(row)
+
+    def _prompt_tag(self, existing=None):
+        from ui.i18n import t
+        existing = existing or {}
+        name, ok = QInputDialog.getText(
+            self,
+            t("settings.tags.edit_title") if existing else t("settings.tags.add_title"),
+            t("settings.tags.name"),
+            text=existing.get("name", ""),
+        )
+        if not ok:
+            return None
+        name = name.strip()
+        if not name:
+            QMessageBox.warning(self, t("common.error"), t("settings.tags.name_required"))
+            return None
+        initial = QColor(existing.get("color", "#3B82F6"))
+        color = QColorDialog.getColor(initial, self, t("settings.tags.color"))
+        if not color.isValid():
+            return None
+        return name, color.name().upper()
+
+    def _add_tag(self):
+        values = self._prompt_tag()
+        if not values:
+            return
+        try:
+            upsert_tag(values[0], values[1])
+        except ValueError as exc:
+            QMessageBox.warning(self, __import__("ui.i18n", fromlist=["t"]).t("common.error"), str(exc))
+            return
+        self._refresh_tag_manager_rows()
+        self.saved.emit("tag_library")
+
+    def _edit_tag(self, tag):
+        values = self._prompt_tag(tag)
+        if not values:
+            return
+        try:
+            upsert_tag(values[0], values[1], tag["id"])
+        except (ValueError, KeyError) as exc:
+            QMessageBox.warning(self, __import__("ui.i18n", fromlist=["t"]).t("common.error"), str(exc))
+            return
+        self._refresh_tag_manager_rows()
+        self.saved.emit("tag_library")
+
+    def _delete_tag(self, tag):
+        from ui.i18n import t
+        answer = QMessageBox.question(
+            self,
+            t("settings.tags.delete_title"),
+            t("settings.tags.delete_confirm", name=tag["name"]),
+        )
+        if answer != QMessageBox.Yes:
+            return
+        delete_tag(tag["id"])
+        self._refresh_tag_manager_rows()
+        self.saved.emit("tag_library")
+
     # 通知模板默认值
     # Template defaults are now in config.py
     # Template defaults are now in config.py
+
+    def _open_help_overlay(self, section_id=None):
+        """Open in-app local help; section_id selects a wiki chapter."""
+        win = self.window()
+        try:
+            from ui.help_dialog import open_help_overlay
+            open_help_overlay(win if win is not None else self, section_id=section_id)
+        except Exception as exc:
+            logging.exception("打开使用说明失败: %s", exc)
 
     def _bind_i18n(self, widget, key, kind="text", prefix=""):
         """登记可热更文案；立即按当前语言填充。"""
@@ -774,11 +991,11 @@ class GlobalSettingsOldStyleReplicaPage(QWidget):
         line.setObjectName("settingDivider")
         return line
 
-    def _setting_item(self, title_key, desc_key, control, reset_widget=None):
+    def _setting_item(self, title_key, desc_key, control, reset_widget=None, *, help_key=None, help_section=None):
         wrapper = QWidget()
         layout = QHBoxLayout(wrapper)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(16)
+        layout.setSpacing(10)
 
         text_col = QVBoxLayout()
         text_col.setContentsMargins(0, 0, 0, 0)
@@ -799,7 +1016,22 @@ class GlobalSettingsOldStyleReplicaPage(QWidget):
         layout.addWidget(control, 0, Qt.AlignRight | Qt.AlignVCenter)
         if reset_widget:
             layout.addWidget(reset_widget, 0, Qt.AlignRight | Qt.AlignVCenter)
+
+        section = help_section or SETTING_HELP_LINKS.get(help_key or "")
+        if section:
+            layout.addWidget(self._help_button(section), 0, Qt.AlignRight | Qt.AlignVCenter)
         return wrapper
+
+    def _help_button(self, section_id: str):
+        from ui.i18n import t
+        btn = self._compact_button(QPushButton("?"), height=28, min_width=28)
+        btn.setProperty("variant", "secondary")
+        btn.setProperty("settingsCompact", True)
+        btn.setToolTip(t("help.setting_tip"))
+        btn.setCursor(Qt.PointingHandCursor)
+        repolish(btn)
+        btn.clicked.connect(lambda checked=False, sid=section_id: self._open_help_overlay(sid))
+        return btn
 
     def _reset_button(self, key, default_value):
         """生成两阶段确认重置按钮（点重置 -> 显示确认重置 -> 点确认才执行）"""
@@ -859,7 +1091,7 @@ class GlobalSettingsOldStyleReplicaPage(QWidget):
             widget.blockSignals(False)
 
     def _bind_line_edit(self, widget, key):
-        widget.editingFinished.connect(lambda k=key, w=widget: self._save_setting(k, w.text()))
+        widget.editingFinished.connect(lambda k=key, w=widget: self._save_setting(k, self._coerce_setting_value(k, w.text())))
         self._controls[key] = widget
         return widget
 
@@ -874,6 +1106,37 @@ class GlobalSettingsOldStyleReplicaPage(QWidget):
         )
         self._controls[key] = widget
         return widget
+
+    @staticmethod
+    def _coerce_setting_value(key, raw):
+        """Normalize numeric hang/diagnostics settings typed in line edits."""
+        text = "" if raw is None else str(raw).strip()
+        defaults = DEFAULT_GLOBAL_SETTINGS
+        float_keys = {
+            "disk_min_free_gb": (0.0, 100000.0),
+            "disk_check_interval_sec": (15.0, 86400.0),
+            "heartbeat_interval_sec": (60.0, 86400.0),
+            "webhook_fail_log_interval_sec": (30.0, 86400.0),
+            "recorder_auto_heal_window_sec": (60.0, 86400.0),
+        }
+        int_keys = {
+            "recorder_auto_heal_max_restarts": (1, 100),
+        }
+        if key in float_keys:
+            lo, hi = float_keys[key]
+            try:
+                value = float(text)
+            except (TypeError, ValueError):
+                return defaults.get(key)
+            return max(lo, min(hi, value))
+        if key in int_keys:
+            lo, hi = int_keys[key]
+            try:
+                value = int(float(text))
+            except (TypeError, ValueError):
+                return defaults.get(key)
+            return max(lo, min(hi, value))
+        return text
 
     def _line_edit(self, key, hint="", width=180):
         widget = QLineEdit()
@@ -1245,22 +1508,27 @@ class GlobalSettingsOldStyleReplicaPage(QWidget):
         size_row.addWidget(confirm_btn)
 
         return self._setting_card("settings.group.file_split", "#EB5757", [
-            self._setting_item("settings.split.size", "settings.split.size_desc", size_wrapper),
+            self._setting_item("settings.split.size", "settings.split.size_desc", size_wrapper, help_key="split_by_size"),
             self._setting_item("settings.split.duration", "settings.split.duration_desc",
                 self._build_duration_input(),
-                self._reset_button("split_by_duration", DEFAULT_GLOBAL_SETTINGS["split_by_duration"])),
+                self._reset_button("split_by_duration", DEFAULT_GLOBAL_SETTINGS["split_by_duration"]),
+                help_key="split_by_duration"),
             self._setting_item("settings.split.codec", "settings.split.codec_desc",
                 self._check("split_on_codec_change"),
-                self._reset_button("split_on_codec_change", DEFAULT_GLOBAL_SETTINGS["split_on_codec_change"])),
+                self._reset_button("split_on_codec_change", DEFAULT_GLOBAL_SETTINGS["split_on_codec_change"]),
+                help_key="split_on_codec_change"),
             self._setting_item("settings.split.discontinuity", "settings.split.discontinuity_desc",
                 self._check("split_on_stream_discontinuity"),
-                self._reset_button("split_on_stream_discontinuity", DEFAULT_GLOBAL_SETTINGS["split_on_stream_discontinuity"])),
+                self._reset_button("split_on_stream_discontinuity", DEFAULT_GLOBAL_SETTINGS["split_on_stream_discontinuity"]),
+                help_key="split_on_stream_discontinuity"),
             self._setting_item("settings.split.title", "settings.split.title_desc",
                 self._check("split_on_title_change"),
-                self._reset_button("split_on_title_change", DEFAULT_GLOBAL_SETTINGS["split_on_title_change"])),
+                self._reset_button("split_on_title_change", DEFAULT_GLOBAL_SETTINGS["split_on_title_change"]),
+                help_key="split_on_title_change"),
             self._setting_item("settings.split.category", "settings.split.category_desc",
                 self._check("split_on_category_change"),
-                self._reset_button("split_on_category_change", DEFAULT_GLOBAL_SETTINGS["split_on_category_change"])),
+                self._reset_button("split_on_category_change", DEFAULT_GLOBAL_SETTINGS["split_on_category_change"]),
+                help_key="split_on_category_change"),
         ])
 
     def _build_network_card(self):
@@ -1297,43 +1565,56 @@ class GlobalSettingsOldStyleReplicaPage(QWidget):
         return self._setting_card("settings.group.stream", "#2D9CDB", [
             self._setting_item("settings.stream.enabled", "settings.stream.enabled_desc",
                 self._check("stream_record_enabled"),
-                self._reset_button("stream_record_enabled", DEFAULT_GLOBAL_SETTINGS["stream_record_enabled"])),
+                self._reset_button("stream_record_enabled", DEFAULT_GLOBAL_SETTINGS["stream_record_enabled"]),
+                help_key="stream_record_enabled"),
             self._setting_item("settings.stream.audio_only", "settings.stream.audio_only_desc",
                 self._check("allow_audio_only"),
-                self._reset_button("allow_audio_only", DEFAULT_GLOBAL_SETTINGS["allow_audio_only"])),
+                self._reset_button("allow_audio_only", DEFAULT_GLOBAL_SETTINGS["allow_audio_only"]),
+                help_key="allow_audio_only"),
             self._setting_item("settings.stream.auto_switch", "settings.stream.auto_switch_desc",
                 self._check("auto_switch_stream"),
-                self._reset_button("auto_switch_stream", DEFAULT_GLOBAL_SETTINGS["auto_switch_stream"])),
+                self._reset_button("auto_switch_stream", DEFAULT_GLOBAL_SETTINGS["auto_switch_stream"]),
+                help_key="auto_switch_stream"),
             self._setting_item("settings.stream.priority", "settings.stream.priority_desc",
                 self._combo("stream_priority_param", width=120),
-                self._reset_button("stream_priority_param", DEFAULT_GLOBAL_SETTINGS["stream_priority_param"])),
+                self._reset_button("stream_priority_param", DEFAULT_GLOBAL_SETTINGS["stream_priority_param"]),
+                help_section="record"),
             self._setting_item("settings.stream.resolution", "settings.stream.resolution_desc",
                 self._combo("stream_resolution", width=110),
-                self._reset_button("stream_resolution", DEFAULT_GLOBAL_SETTINGS["stream_resolution"])),
+                self._reset_button("stream_resolution", DEFAULT_GLOBAL_SETTINGS["stream_resolution"]),
+                help_key="stream_resolution"),
             self._setting_item("settings.stream.fps", "settings.stream.fps_desc",
                 self._combo("stream_fps", width=110),
-                self._reset_button("stream_fps", DEFAULT_GLOBAL_SETTINGS["stream_fps"])),
+                self._reset_button("stream_fps", DEFAULT_GLOBAL_SETTINGS["stream_fps"]),
+                help_key="stream_fps"),
             self._setting_item("settings.stream.bitrate", "settings.stream.bitrate_desc",
                 self._line_edit("stream_bitrate", "30.0 Mb/s", 120),
-                self._reset_button("stream_bitrate", DEFAULT_GLOBAL_SETTINGS["stream_bitrate"])),
+                self._reset_button("stream_bitrate", DEFAULT_GLOBAL_SETTINGS["stream_bitrate"]),
+                help_key="stream_bitrate"),
             self._setting_item("settings.stream.codec", "settings.stream.codec_desc",
                 self._combo("stream_codec", width=100),
-                self._reset_button("stream_codec", DEFAULT_GLOBAL_SETTINGS["stream_codec"])),
+                self._reset_button("stream_codec", DEFAULT_GLOBAL_SETTINGS["stream_codec"]),
+                help_key="stream_codec"),
             self._setting_item("settings.stream.format", "settings.stream.format_desc",
                 self._combo("stream_format", width=100),
-                self._reset_button("stream_format", DEFAULT_GLOBAL_SETTINGS["stream_format"])),
+                self._reset_button("stream_format", DEFAULT_GLOBAL_SETTINGS["stream_format"]),
+                help_key="stream_format"),
             self._setting_item("settings.stream.fallback", "settings.stream.fallback_desc",
                 self._combo("stream_fallback_policy", width=140),
-                self._reset_button("stream_fallback_policy", DEFAULT_GLOBAL_SETTINGS.get("stream_fallback_policy", "compatible"))),
+                self._reset_button("stream_fallback_policy", DEFAULT_GLOBAL_SETTINGS.get("stream_fallback_policy", "compatible")),
+                help_key="stream_fallback_policy"),
             self._setting_item("settings.stream.native_flv", "settings.stream.native_flv_desc",
                 self._check("flv_native_capture"),
-                self._reset_button("flv_native_capture", DEFAULT_GLOBAL_SETTINGS.get("flv_native_capture", True))),
+                self._reset_button("flv_native_capture", DEFAULT_GLOBAL_SETTINGS.get("flv_native_capture", True)),
+                help_key="flv_native_capture"),
             self._setting_item("settings.stream.keep_source", "settings.stream.keep_source_desc",
                 self._check("artifact_keep_source"),
-                self._reset_button("artifact_keep_source", DEFAULT_GLOBAL_SETTINGS.get("artifact_keep_source", True))),
+                self._reset_button("artifact_keep_source", DEFAULT_GLOBAL_SETTINGS.get("artifact_keep_source", True)),
+                help_key="artifact_keep_source"),
             self._setting_item("settings.stream.webhook_verified", "settings.stream.webhook_verified_desc",
                 self._check("webhook_only_verified_artifacts"),
-                self._reset_button("webhook_only_verified_artifacts", DEFAULT_GLOBAL_SETTINGS.get("webhook_only_verified_artifacts", True))),
+                self._reset_button("webhook_only_verified_artifacts", DEFAULT_GLOBAL_SETTINGS.get("webhook_only_verified_artifacts", True)),
+                help_section="webhook"),
         ])
 
     def _build_chat_record_card(self):
@@ -1368,13 +1649,16 @@ class GlobalSettingsOldStyleReplicaPage(QWidget):
         return self._setting_card("settings.group.chat", "#BB6BD9", [
             self._setting_item("settings.chat.enabled", "settings.chat.enabled_desc",
                 self._check("chat_record_enabled"),
-                self._reset_button("chat_record_enabled", DEFAULT_GLOBAL_SETTINGS["chat_record_enabled"])),
+                self._reset_button("chat_record_enabled", DEFAULT_GLOBAL_SETTINGS["chat_record_enabled"]),
+                help_key="chat_record_enabled"),
             self._setting_item("settings.chat.credential", "settings.chat.credential_desc",
                 cred_widget,
-                cred_reset),
+                cred_reset,
+                help_key="chat_credential"),
             self._setting_item("settings.chat.format", "settings.chat.format_desc",
                 self._combo("chat_format", width=120),
-                self._reset_button("chat_format", DEFAULT_GLOBAL_SETTINGS["chat_format"])),
+                self._reset_button("chat_format", DEFAULT_GLOBAL_SETTINGS["chat_format"]),
+                help_key="chat_format"),
         ])
 
     @staticmethod
@@ -1589,7 +1873,16 @@ class GlobalSettingsOldStyleReplicaPage(QWidget):
         return self._setting_card("settings.group.automation", "#56CCF2", [
             self._setting_item("settings.automation.webhooks", "settings.automation.webhooks_desc",
                 self._line_edit("webhooks", "https://...", 220),
-                self._reset_button("webhooks", DEFAULT_GLOBAL_SETTINGS["webhooks"])),
+                self._reset_button("webhooks", DEFAULT_GLOBAL_SETTINGS["webhooks"]),
+                help_key="webhooks"),
+            self._setting_item("settings.automation.webhook_log_verbose", "settings.automation.webhook_log_verbose_desc",
+                self._check("webhook_log_verbose"),
+                self._reset_button("webhook_log_verbose", DEFAULT_GLOBAL_SETTINGS["webhook_log_verbose"]),
+                help_key="webhook_log_verbose"),
+            self._setting_item("settings.automation.webhook_fail_log_interval", "settings.automation.webhook_fail_log_interval_desc",
+                self._line_edit("webhook_fail_log_interval_sec", "300", 100),
+                self._reset_button("webhook_fail_log_interval_sec", DEFAULT_GLOBAL_SETTINGS["webhook_fail_log_interval_sec"]),
+                help_key="webhook_fail_log_interval_sec"),
         ])
 
     def _build_file_location_card(self):
@@ -1597,23 +1890,28 @@ class GlobalSettingsOldStyleReplicaPage(QWidget):
         return self._setting_card("settings.group.location", "#F2C94C", [
             self._setting_item("settings.location.dir", "settings.location.dir_desc",
                 self._directory_field("save_dir", VIDEO_SAVE_DIR, 220),
-                self._reset_button("save_dir", VIDEO_SAVE_DIR)),
+                self._reset_button("save_dir", VIDEO_SAVE_DIR),
+                help_key="save_dir"),
             self._setting_item("settings.location.template", "settings.location.template_desc",
                 self._template_editor_button("path_template"),
-                self._reset_button("path_template", DEFAULT_GLOBAL_SETTINGS["path_template"])),
+                self._reset_button("path_template", DEFAULT_GLOBAL_SETTINGS["path_template"]),
+                help_key="path_template"),
         ])
 
     def _build_convert_card(self):
         return self._setting_card("settings.group.convert", "#EB5757", [
             self._setting_item("settings.convert.enabled", "settings.convert.enabled_desc",
                 self._check("convert_enabled"),
-                self._reset_button("convert_enabled", DEFAULT_GLOBAL_SETTINGS["convert_enabled"])),
+                self._reset_button("convert_enabled", DEFAULT_GLOBAL_SETTINGS["convert_enabled"]),
+                help_key="convert_enabled"),
             self._setting_item("settings.convert.delete_source", "settings.convert.delete_source_desc",
                 self._check("convert_delete_source"),
-                self._reset_button("convert_delete_source", DEFAULT_GLOBAL_SETTINGS["convert_delete_source"])),
+                self._reset_button("convert_delete_source", DEFAULT_GLOBAL_SETTINGS["convert_delete_source"]),
+                help_key="convert_delete_source"),
             self._setting_item("settings.convert.format", "settings.convert.format_desc",
                 self._combo("convert_format", width=100),
-                self._reset_button("convert_format", DEFAULT_GLOBAL_SETTINGS["convert_format"])),
+                self._reset_button("convert_format", DEFAULT_GLOBAL_SETTINGS["convert_format"]),
+                help_key="convert_format"),
         ])
 
     def _build_monitor_card(self):
@@ -1805,6 +2103,30 @@ class GlobalSettingsOldStyleReplicaPage(QWidget):
             self._setting_item("settings.system.prevent_sleep", "settings.system.prevent_sleep_desc",
                 self._check("prevent_sleep"),
                 self._reset_button("prevent_sleep", DEFAULT_GLOBAL_SETTINGS["prevent_sleep"])),
+            self._setting_item("settings.system.disk_min_free", "settings.system.disk_min_free_desc",
+                self._line_edit("disk_min_free_gb", "5.0", 100),
+                self._reset_button("disk_min_free_gb", DEFAULT_GLOBAL_SETTINGS["disk_min_free_gb"]),
+                help_key="disk_min_free_gb"),
+            self._setting_item("settings.system.disk_check_interval", "settings.system.disk_check_interval_desc",
+                self._line_edit("disk_check_interval_sec", "60", 100),
+                self._reset_button("disk_check_interval_sec", DEFAULT_GLOBAL_SETTINGS["disk_check_interval_sec"]),
+                help_key="disk_check_interval_sec"),
+            self._setting_item("settings.system.heartbeat_interval", "settings.system.heartbeat_interval_desc",
+                self._line_edit("heartbeat_interval_sec", "300", 100),
+                self._reset_button("heartbeat_interval_sec", DEFAULT_GLOBAL_SETTINGS["heartbeat_interval_sec"]),
+                help_key="heartbeat_interval_sec"),
+            self._setting_item("settings.system.auto_heal", "settings.system.auto_heal_desc",
+                self._check("recorder_auto_heal"),
+                self._reset_button("recorder_auto_heal", DEFAULT_GLOBAL_SETTINGS["recorder_auto_heal"]),
+                help_key="recorder_auto_heal"),
+            self._setting_item("settings.system.auto_heal_max", "settings.system.auto_heal_max_desc",
+                self._line_edit("recorder_auto_heal_max_restarts", "3", 100),
+                self._reset_button("recorder_auto_heal_max_restarts", DEFAULT_GLOBAL_SETTINGS["recorder_auto_heal_max_restarts"]),
+                help_key="recorder_auto_heal_max_restarts"),
+            self._setting_item("settings.system.auto_heal_window", "settings.system.auto_heal_window_desc",
+                self._line_edit("recorder_auto_heal_window_sec", "600", 100),
+                self._reset_button("recorder_auto_heal_window_sec", DEFAULT_GLOBAL_SETTINGS["recorder_auto_heal_window_sec"]),
+                help_key="recorder_auto_heal_window_sec"),
         ])
 
     def _save_setting(self, key, value):
@@ -2026,6 +2348,7 @@ class RoomSettingsPage(GlobalSettingsOldStyleReplicaPage):
         right_col = QVBoxLayout()
         right_col.setSpacing(18)
         right_col.addWidget(self._build_cookie_card())
+        right_col.addWidget(self._build_room_tags_card())
         right_col.addWidget(self._build_file_location_card())
         right_col.addWidget(self._build_convert_card())
         right_col.addWidget(self._build_monitor_card())
@@ -2221,6 +2544,68 @@ class RoomSettingsPage(GlobalSettingsOldStyleReplicaPage):
         )
 
     # ------------------------------------------------------------------
+    # Room tag binding (room-only)
+    # ------------------------------------------------------------------
+    def _build_room_tags_card(self):
+        from ui.i18n import t
+        wrapper = QWidget()
+        layout = QVBoxLayout(wrapper)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(8)
+        self._room_tag_checks = {}
+        self._room_tag_list_layout = QVBoxLayout()
+        self._room_tag_list_layout.setSpacing(8)
+        layout.addLayout(self._room_tag_list_layout)
+        self._populate_room_tag_checks()
+
+        add_btn = self._compact_button(QPushButton(t("settings.tags.create_bind")), height=30, min_width=110)
+        add_btn.setProperty("variant", "secondary")
+        add_btn.clicked.connect(self._create_and_bind_tag)
+        layout.addWidget(add_btn, 0, Qt.AlignLeft)
+        return self._setting_card("settings.tags.room_title", "#8B5CF6", [
+            self._setting_item("settings.tags.room_item", "settings.tags.room_desc", wrapper, help_section="ui")
+        ])
+
+    def _populate_room_tag_checks(self):
+        from ui.i18n import t
+        self._clear_layout(self._room_tag_list_layout)
+        self._room_tag_checks = {}
+        bound = {tag["id"] for tag in get_room_tags(self.room_id)}
+        tags = get_tag_library()
+        if not tags:
+            empty = QLabel(t("settings.tags.empty_room"))
+            empty.setProperty("role", "muted")
+            empty.setWordWrap(True)
+            self._room_tag_list_layout.addWidget(empty)
+            return
+        for tag in tags:
+            cb = QCheckBox(tag["name"])
+            cb.setChecked(tag["id"] in bound)
+            cb.setStyleSheet(f"color:{tag['color']}; font-weight:600;")
+            cb.toggled.connect(self._save_room_tags)
+            self._room_tag_checks[tag["id"]] = cb
+            self._room_tag_list_layout.addWidget(cb)
+
+    def _create_and_bind_tag(self):
+        values = self._prompt_tag()
+        if not values:
+            return
+        try:
+            tag = upsert_tag(values[0], values[1])
+            current = [item["id"] for item in get_room_tags(self.room_id)]
+            set_room_tag_ids(self.room_id, current + [tag["id"]])
+        except ValueError as exc:
+            QMessageBox.warning(self, __import__("ui.i18n", fromlist=["t"]).t("common.error"), str(exc))
+            return
+        self._populate_room_tag_checks()
+        self.saved.emit("tag_library")
+
+    def _save_room_tags(self, *_args):
+        selected = [tag_id for tag_id, cb in getattr(self, "_room_tag_checks", {}).items() if cb.isChecked()]
+        set_room_tag_ids(self.room_id, selected)
+        self.saved.emit("tag_ids")
+
+    # ------------------------------------------------------------------
     # Cookie card (new, room-only)
     # ------------------------------------------------------------------
     def _build_cookie_card(self):
@@ -2251,6 +2636,7 @@ class RoomSettingsPage(GlobalSettingsOldStyleReplicaPage):
                 "SESSDATA",
                 "settings.room.cookie_desc",
                 cred_widget,
+                help_key="sessdata",
             ),
         ])
 
@@ -2330,6 +2716,14 @@ def open_room_settings_overlay(room_id, uname, main_window):
     outer.addWidget(page, 1)
 
     def _close():
+        # Room tag choices save immediately; refresh the card before destroying overlay.
+        card = getattr(main_window, "cards", {}).get(str(room_id))
+        if card is not None and hasattr(card, "refresh_custom_tags"):
+            card.refresh_custom_tags()
+        if hasattr(main_window, "_setup_filter_menu"):
+            main_window._setup_filter_menu()
+        if hasattr(main_window, "request_rearrange_cards"):
+            main_window.request_rearrange_cards(0)
         overlay.hide(); overlay.deleteLater()
         panel.hide(); panel.deleteLater()
 

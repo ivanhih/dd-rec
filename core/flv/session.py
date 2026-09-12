@@ -24,6 +24,7 @@ class CaptureEvent(str, Enum):
     ISSUE = "issue"
     WAITING_KEYFRAME = "waiting_keyframe"
     RECOVERED = "recovered"
+    AUDIO_CONFIG_READY = "audio_config_ready"
 
 
 @dataclass
@@ -41,9 +42,20 @@ class SegmentInfo:
     last_media_ts_out: int = 0
     duration_ms: int = 0
     started_with_keyframe: bool = False
+    video_config_present: bool = False
+    audio_config_present: bool = False
+    audio_sample_rate: Optional[int] = None
+    audio_config_size: int = 0
 
     def to_dict(self) -> dict:
         return asdict(self)
+
+
+@dataclass(frozen=True)
+class FlvProgressSnapshot:
+    transport_generation: int
+    media_progress_ms: int
+    has_media: bool
 
 
 class FlvCaptureSession:
@@ -81,42 +93,107 @@ class FlvCaptureSession:
         self._total_bytes_in = 0
         self._last_video_ts = -1
         self._last_audio_ts = -1
+        self._last_waiting_signature: Optional[tuple[bool, bool]] = None
         # Cuts are committed only at the next video keyframe. The active writer
         # stays open until then so no GOP data is dropped or recorded twice.
         self._pending_cut_reason: Optional[str] = None
         self._pending_next_path: Optional[str] = None
 
+        # Transport-generation media progress (survives ordinary segment cuts).
+        self._transport_generation = 0
+        self._active_source_generation: Optional[int] = None
+        self._progress_committed_ms = 0
+        self._progress_epoch_ms = 0
+        self._progress_has_media = False
+
     # ---- public API ----
     def start(self):
         with self._lock:
             self._active = True
-            self._reset_stream_state(close_reason="")
+            if self._transport_generation <= 0:
+                self._transport_generation = 1
+            self._reset_transport_progress()
+            self._reset_stream_state(close_reason="", commit_epoch=False)
 
-    def reset_for_reconnect(self, reason: str = "reconnect"):
-        """HTTP 重连后完整重置：关当前段、清 parser/ts/headers，重新等待 AVC/AAC 与 IDR。"""
+    def reset_for_reconnect(
+        self,
+        reason: str = "reconnect",
+        *,
+        source_generation: Optional[int] = None,
+    ):
+        """HTTP 重连/源替换：关当前段、清 parser/ts/headers，开启新 transport generation。"""
         with self._lock:
             self._close_writer(reason or "reconnect")
-            self._reset_stream_state(close_reason=reason)
+            self._transport_generation = max(1, int(self._transport_generation or 0) + 1)
+            self._reset_transport_progress()
+            if source_generation is not None:
+                self._active_source_generation = int(source_generation)
+            self._reset_stream_state(close_reason=reason, commit_epoch=False)
             self._active = True
 
-    def _reset_stream_state(self, close_reason: str = ""):
+    def set_active_source_generation(self, source_generation: Optional[int]):
+        with self._lock:
+            self._active_source_generation = (
+                None if source_generation is None else int(source_generation)
+            )
+
+    def progress_snapshot(self) -> FlvProgressSnapshot:
+        with self._lock:
+            return FlvProgressSnapshot(
+                transport_generation=int(self._transport_generation or 0),
+                media_progress_ms=self._media_progress_ms_unlocked(),
+                has_media=bool(self._progress_has_media),
+            )
+
+    def _media_progress_ms_unlocked(self) -> int:
+        return max(0, int(self._progress_committed_ms) + int(self._progress_epoch_ms))
+
+    def _reset_transport_progress(self):
+        self._progress_committed_ms = 0
+        self._progress_epoch_ms = 0
+        self._progress_has_media = False
+
+    def _commit_epoch_progress(self):
+        self._progress_committed_ms = self._media_progress_ms_unlocked()
+        self._progress_epoch_ms = 0
+
+    def _reset_timestamp_epoch(self, *, commit: bool = True):
+        if commit:
+            self._commit_epoch_progress()
+        self._ts.reset()
+        self._progress_epoch_ms = 0
+
+    def _note_media_progress(self, out_ts: int):
+        self._progress_epoch_ms = max(int(self._progress_epoch_ms), max(0, int(out_ts)))
+        self._progress_has_media = True
+
+    def _reset_stream_state(self, close_reason: str = "", *, commit_epoch: bool = True):
         self._parser.reset()
         self._headers = StreamHeaders()
         self._waiting_keyframe = True
-        self._ts.reset()
+        self._reset_timestamp_epoch(commit=commit_epoch)
         self._last_video_ts = -1
         self._last_audio_ts = -1
+        self._last_waiting_signature = None
         self._stream_header = None
         self._pending_cut_reason = None
         self._pending_next_path = None
         if close_reason:
             logger.debug(f"flv session state reset: {close_reason}")
 
-    def feed(self, data: bytes):
+    def feed(self, data: bytes, source_generation: Optional[int] = None):
         if not data:
             return
         with self._lock:
             if not self._active:
+                return
+            if (
+                self._active_source_generation is not None
+                and (
+                    source_generation is None
+                    or int(source_generation) != int(self._active_source_generation)
+                )
+            ):
                 return
             self._total_bytes_in += len(data)
             try:
@@ -128,9 +205,9 @@ class FlvCaptureSession:
                 return
             if header is not None:
                 self._stream_header = header
-                # 新 FLV header 出现：视为新流，等待关键帧
+                # 新 FLV header 出现：同一 transport 内新 timestamp epoch，累计进度不回退
                 self._waiting_keyframe = True
-                self._ts.reset()
+                self._reset_timestamp_epoch(commit=True)
             for tag in tags:
                 self._handle_tag(tag)
 
@@ -152,6 +229,15 @@ class FlvCaptureSession:
                 CaptureEvent.WAITING_KEYFRAME,
                 {"reason": self._pending_cut_reason, "path": self.current_path or ""},
             )
+            return True
+
+    def note_transport_issue(self, kind: str, timestamp_ms: int = 0, detail: str = "") -> bool:
+        with self._lock:
+            if self._current is None:
+                return False
+            if any(issue.get("kind") == kind for issue in self._current.issues):
+                return False
+            self._note_issue(kind, timestamp_ms, detail)
             return True
 
     def close(self, reason: str = "stop") -> List[SegmentInfo]:
@@ -205,16 +291,40 @@ class FlvCaptureSession:
                 self._note_issue("video_config_change", tag.timestamp)
                 self._force_cut("video_config_change")
                 self._waiting_keyframe = True
-                self._ts.reset()
+                self._reset_timestamp_epoch(commit=True)
             self._headers.video_seq = tag
             return
         if tag.is_aac_sequence_header():
-            if self._headers.audio_seq is not None and self._headers.audio_seq.data != tag.data:
+            if tag.aac_audio_specific_config() is None:
+                self._note_issue(
+                    "invalid_audio_config",
+                    tag.timestamp,
+                    "invalid or truncated AudioSpecificConfig",
+                )
+                return
+            previous_audio_seq = self._headers.audio_seq
+            if previous_audio_seq is not None and previous_audio_seq.data != tag.data:
                 self._note_issue("audio_config_change", tag.timestamp)
                 self._force_cut("audio_config_change")
                 self._waiting_keyframe = True
-                self._ts.reset()
+                self._reset_timestamp_epoch(commit=True)
             self._headers.audio_seq = tag
+            # 可选音频模式可能已先创建纯视频分段。首个 AAC 配置头晚到时
+            # 立即写入，确保后续 AAC raw 之前已有 AudioSpecificConfig。
+            if previous_audio_seq is None and self._writer is not None:
+                self._writer.write_tag(tag, timestamp=0)
+                if self._current is not None:
+                    self._current.audio_config_present = True
+                    self._current.audio_sample_rate = tag.aac_sample_rate()
+                    self._current.audio_config_size = len(tag.aac_audio_specific_config() or b"")
+                    self._emit(
+                        CaptureEvent.AUDIO_CONFIG_READY,
+                        {
+                            "path": self._current.path,
+                            "audio_sample_rate": self._current.audio_sample_rate,
+                            "audio_config_size": self._current.audio_config_size,
+                        },
+                    )
             return
 
         # 简单完整性：空 data
@@ -228,14 +338,14 @@ class FlvCaptureSession:
                 self._note_issue("video_ts_backward", tag.timestamp)
                 self._force_cut("timestamp_discontinuity")
                 self._waiting_keyframe = True
-                self._ts.reset()
+                self._reset_timestamp_epoch(commit=True)
             self._last_video_ts = tag.timestamp
         elif tag.is_audio():
             if self._last_audio_ts >= 0 and tag.timestamp + 1000 < self._last_audio_ts:
                 self._note_issue("audio_ts_backward", tag.timestamp)
                 self._force_cut("timestamp_discontinuity")
                 self._waiting_keyframe = True
-                self._ts.reset()
+                self._reset_timestamp_epoch(commit=True)
             self._last_audio_ts = tag.timestamp
 
         # 等关键帧开新段
@@ -251,24 +361,47 @@ class FlvCaptureSession:
                 return
             if not self._headers.has_required(self.require_video, self.require_audio):
                 # 缺 sequence header 时继续等（但仍需 keyframe 再检查）
-                self._emit(
-                    CaptureEvent.WAITING_KEYFRAME,
-                    {"has_video_seq": self._headers.video_seq is not None,
-                     "has_audio_seq": self._headers.audio_seq is not None},
+                has_video_seq = self._headers.video_seq is not None
+                has_audio_seq = (
+                    self._headers.audio_seq is not None
+                    and self._headers.audio_seq.aac_audio_specific_config() is not None
                 )
+                waiting_signature = (has_video_seq, has_audio_seq)
+                if waiting_signature != self._last_waiting_signature:
+                    self._last_waiting_signature = waiting_signature
+                    self._emit(
+                        CaptureEvent.WAITING_KEYFRAME,
+                        {
+                            "has_video_seq": has_video_seq,
+                            "has_audio_seq": has_audio_seq,
+                        },
+                    )
                 # 若只要视频且已有 video_seq，可开
                 if self.require_video and self._headers.video_seq is None:
                     return
                 if self.require_audio and self._headers.audio_seq is None:
-                    # 允许先开视频，音频 header 稍后写入（部分流 header 晚到）
-                    pass
+                    # AAC raw 依赖 AudioSpecificConfig。配置头晚到时继续等下一
+                    # 个关键帧，避免生成缺少 extradata、采样率只能被猜测的文件。
+                    return
             self._open_writer()
             self._write_bootstrap()
             self._waiting_keyframe = False
-            self._emit(CaptureEvent.RECOVERED, {"path": self._current.path if self._current else ""})
+            self._last_waiting_signature = None
+            self._emit(
+                CaptureEvent.RECOVERED,
+                {
+                    "path": self._current.path if self._current else "",
+                    "source_generation": self._active_source_generation,
+                },
+            )
             # fall through 写该 keyframe
 
         if self._writer is None:
+            return
+
+        # 可选音频模式下，在首个有效 AAC 配置头到达前丢弃 raw 音频；
+        # 否则输出会包含无法可靠解释采样率的 AAC 帧。
+        if tag.is_audio() and self._headers.audio_seq is None:
             return
 
         out_ts, disc = self._ts.correct(tag.timestamp)
@@ -276,7 +409,7 @@ class FlvCaptureSession:
             self._note_issue("timestamp_discontinuity", tag.timestamp)
             self._force_cut("timestamp_discontinuity")
             self._waiting_keyframe = True
-            self._ts.reset()
+            self._reset_timestamp_epoch(commit=True)
             # 若当前是关键帧，立即作为新段起点
             if tag.is_video_keyframe_nalu():
                 self._handle_tag(tag)
@@ -291,7 +424,11 @@ class FlvCaptureSession:
             self._current.last_media_ts_out = out_ts
             self._current.tag_count += 1
             self._current.bytes_written = self._writer.bytes_written
-            self._current.duration_ms = max(0, out_ts - self._current.first_media_ts_out)
+            self._current.duration_ms = max(
+                int(self._current.duration_ms or 0),
+                max(0, out_ts - self._current.first_media_ts_out),
+            )
+        self._note_media_progress(out_ts)
 
         # 时长/大小限制：在关键帧处切
     def _limit_reason_at_keyframe(self, tag: FlvTag) -> Optional[str]:
@@ -312,7 +449,7 @@ class FlvCaptureSession:
         self._close_writer(reason)
         self._pending_cut_reason = None
         self._waiting_keyframe = True
-        self._ts.reset()
+        self._reset_timestamp_epoch(commit=True)
 
     def _open_writer(self):
         if self._writer is not None:
@@ -330,9 +467,34 @@ class FlvCaptureSession:
             path=path,
             index=self._segment_index,
             opened_at=time.time(),
+            video_config_present=self._headers.video_seq is not None,
+            audio_config_present=(
+                self._headers.audio_seq is not None
+                and self._headers.audio_seq.aac_audio_specific_config() is not None
+            ),
+            audio_sample_rate=(
+                self._headers.audio_seq.aac_sample_rate()
+                if self._headers.audio_seq is not None
+                else None
+            ),
+            audio_config_size=(
+                len(self._headers.audio_seq.aac_audio_specific_config() or b"")
+                if self._headers.audio_seq is not None
+                else 0
+            ),
         )
-        self._ts.reset()
-        self._emit(CaptureEvent.SEGMENT_OPENED, {"path": path, "index": self._segment_index})
+        self._reset_timestamp_epoch(commit=True)
+        self._emit(
+            CaptureEvent.SEGMENT_OPENED,
+            {
+                "path": path,
+                "index": self._segment_index,
+                "video_config_present": self._current.video_config_present,
+                "audio_config_present": self._current.audio_config_present,
+                "audio_sample_rate": self._current.audio_sample_rate,
+                "audio_config_size": self._current.audio_config_size,
+            },
+        )
 
     def _write_bootstrap(self):
         """新段：script + video/audio sequence header，时间戳 0。"""

@@ -44,6 +44,59 @@ FLV_HEADER_SIZE = 9
 FLV_PREV_TAG_SIZE_SIZE = 4
 FLV_TAG_HEADER_SIZE = 11
 
+AAC_SAMPLE_RATES = (
+    96000,
+    88200,
+    64000,
+    48000,
+    44100,
+    32000,
+    24000,
+    22050,
+    16000,
+    12000,
+    11025,
+    8000,
+    7350,
+)
+
+
+def _aac_sample_rate_from_config(config: bytes) -> Optional[int]:
+    """Parse the sampling frequency from a supported AudioSpecificConfig."""
+    if len(config) < 2:
+        return None
+    bits = int.from_bytes(config, "big")
+    bit_count = len(config) * 8
+
+    def read_bits(offset: int, length: int) -> Optional[int]:
+        if offset + length > bit_count:
+            return None
+        shift = bit_count - offset - length
+        return (bits >> shift) & ((1 << length) - 1)
+
+    audio_object_type = read_bits(0, 5)
+    # 0 is reserved. Escape object type 31 needs a different field layout and
+    # is deliberately rejected until that layout is supported end-to-end.
+    if audio_object_type in (None, 0, 31):
+        return None
+
+    frequency_index = read_bits(5, 4)
+    if frequency_index is None:
+        return None
+    if frequency_index < len(AAC_SAMPLE_RATES):
+        # A complete basic ASC also contains the four-bit channel config.
+        return AAC_SAMPLE_RATES[frequency_index] if bit_count >= 13 else None
+    if frequency_index != 15:
+        return None
+
+    # samplingFrequencyIndex=15 carries an explicit 24-bit frequency followed
+    # by channelConfiguration. Reject truncated or zero-frequency forms.
+    explicit_rate = read_bits(9, 24)
+    channel_config = read_bits(33, 4)
+    if explicit_rate is None or explicit_rate <= 0 or channel_config is None:
+        return None
+    return explicit_rate
+
 
 @dataclass
 class FlvHeader:
@@ -133,6 +186,20 @@ class FlvTag:
     def is_aac_sequence_header(self) -> bool:
         return self.aac_packet_type() == AACPacketType.SEQUENCE_HEADER
 
+    def aac_audio_specific_config(self) -> Optional[bytes]:
+        """返回可解析的 AAC AudioSpecificConfig；畸形配置返回 None。"""
+        if not self.is_aac_sequence_header() or len(self.data) < 4:
+            return None
+        config = self.data[2:]
+        if _aac_sample_rate_from_config(config) is None:
+            return None
+        return config
+
+    def aac_sample_rate(self) -> Optional[int]:
+        if not self.is_aac_sequence_header() or len(self.data) < 4:
+            return None
+        return _aac_sample_rate_from_config(self.data[2:])
+
 
 @dataclass
 class StreamHeaders:
@@ -144,7 +211,10 @@ class StreamHeaders:
     def has_required(self, need_video: bool = True, need_audio: bool = True) -> bool:
         if need_video and self.video_seq is None:
             return False
-        if need_audio and self.audio_seq is None:
+        if need_audio and (
+            self.audio_seq is None
+            or self.audio_seq.aac_audio_specific_config() is None
+        ):
             return False
         return True
 

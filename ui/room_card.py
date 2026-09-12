@@ -12,7 +12,10 @@ import threading
 import weakref
 import requests
 
-from core.config import get_global_setting, get_effective_save_dir, VIDEO_SAVE_DIR, get_room_config
+from core.config import (
+    get_global_setting, get_effective_save_dir, VIDEO_SAVE_DIR,
+    get_room_config, get_room_tags,
+)
 
 
 _AVATAR_CACHE = {}
@@ -383,9 +386,18 @@ class RoomCard(QFrame):
         self.lbl_room_id = QLabel(self.room_id)
         self.lbl_room_id.setProperty("role", "link")
         self.lbl_room_id.setStyleSheet("font-size: 13px; font-weight: 500;")
-        
+
+        # 用户自定义标签显示在卡片右上角；最多 3 个，剩余折叠为 +N
+        self.custom_tag_container = QWidget()
+        self.custom_tag_layout = QHBoxLayout(self.custom_tag_container)
+        self.custom_tag_layout.setContentsMargins(0, 0, 0, 0)
+        self.custom_tag_layout.setSpacing(5)
+        self._custom_tag_widgets = []
+        self.refresh_custom_tags()
+
         uname_layout.addWidget(self.lbl_uname)
         uname_layout.addStretch()
+        uname_layout.addWidget(self.custom_tag_container)
         uname_layout.addWidget(self.lbl_room_id)
 
         from ui.i18n import t
@@ -463,11 +475,20 @@ class RoomCard(QFrame):
         self.lbl_size.setProperty("role", "secondary")
         self.lbl_size.setStyleSheet("font-size: 13px;")
 
+        # 分段健康（native FLV 有值；其它模式隐藏）
+        self._health_code = ""
+        self._health_detail = ""
+        self.lbl_health = QLabel("")
+        self.lbl_health.setProperty("statusTone", "neutral")
+        self.lbl_health.setStyleSheet("font-size: 12px; font-weight: 600;")
+        self.lbl_health.hide()
+
         stats_layout.addWidget(self.lbl_duration)
         stats_layout.addWidget(self.lbl_speed)
         stats_layout.addWidget(self.lbl_size)
+        stats_layout.addWidget(self.lbl_health)
         stats_layout.addStretch()
-        
+
         main_layout.addLayout(stats_layout)
 
         # ==================== 按钮行 ====================
@@ -524,6 +545,59 @@ class RoomCard(QFrame):
 
         from ui.i18n import language_manager
         language_manager().changed.connect(self.retranslate_ui)
+
+    @staticmethod
+    def _tag_text_color(background: str) -> str:
+        try:
+            c = QColor(background)
+            # Relative luminance approximation; dark text on bright custom colors.
+            luminance = (0.299 * c.red()) + (0.587 * c.green()) + (0.114 * c.blue())
+            return "#111827" if luminance >= 165 else "#FFFFFF"
+        except Exception:
+            return "#FFFFFF"
+
+    def refresh_custom_tags(self):
+        """Reload room bindings and rebuild top-right colored tag chips."""
+        if not hasattr(self, "custom_tag_layout"):
+            return
+        while self.custom_tag_layout.count():
+            item = self.custom_tag_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        self._custom_tag_widgets = []
+        tags = get_room_tags(self.room_id)
+        self.room_info["tags"] = [dict(tag) for tag in tags]
+        all_names = [tag["name"] for tag in tags]
+        tooltip = "、".join(all_names)
+        for tag in tags[:3]:
+            label = QLabel(tag["name"] if len(tag["name"]) <= 7 else tag["name"][:6] + "…")
+            label.setObjectName("customRoomTag")
+            label.setToolTip(tooltip)
+            label.setAlignment(Qt.AlignCenter)
+            label.setStyleSheet(
+                f"background-color:{tag['color']};"
+                f"color:{self._tag_text_color(tag['color'])};"
+                "border:none; border-radius:7px; padding:2px 7px;"
+                "font-size:11px; font-weight:600;"
+            )
+            self.custom_tag_layout.addWidget(label)
+            self._custom_tag_widgets.append(label)
+        if len(tags) > 3:
+            overflow = QLabel(f"+{len(tags) - 3}")
+            overflow.setObjectName("customRoomTagOverflow")
+            overflow.setToolTip(tooltip)
+            overflow.setAlignment(Qt.AlignCenter)
+            overflow.setStyleSheet(
+                "border-radius:7px; padding:2px 6px; font-size:11px; font-weight:600;"
+            )
+            overflow.setProperty("role", "muted")
+            self.custom_tag_layout.addWidget(overflow)
+            self._custom_tag_widgets.append(overflow)
+        self.custom_tag_container.setVisible(bool(tags))
+
+    def custom_tags(self):
+        return list(self.room_info.get("tags") or [])
 
     def _create_tag(self, text, color):
         label = QLabel(text)
@@ -722,7 +796,33 @@ class RoomCard(QFrame):
         if not (self.room_info.get("title") or "").strip():
             self.lbl_title.setText(t("card.no_title"))
         self._render_status_labels()
+        self._render_health_label()
         self._refresh_cut_button_state()
+
+    def _render_health_label(self):
+        from ui.i18n import t
+        from ui.theme import repolish
+
+        code = (self._health_code or "").strip().lower()
+        if code not in ("healthy", "degraded", "failed"):
+            self.lbl_health.hide()
+            self.lbl_health.setText("")
+            self.lbl_health.setToolTip("")
+            return
+        key = f"card.health.{code}"
+        tone = {"healthy": "success", "degraded": "warning", "failed": "danger"}.get(code, "neutral")
+        self.lbl_health.setText(t(key))
+        self.lbl_health.setProperty("statusTone", tone)
+        detail = (self._health_detail or code).strip()
+        self.lbl_health.setToolTip(t("card.health.tip", detail=detail) if detail else "")
+        repolish(self.lbl_health)
+        self.lbl_health.show()
+
+    def update_health(self, health: str, detail: str = ""):
+        """Update FLV segment health chip. Pass empty health to hide."""
+        self._health_code = (health or "").strip().lower()
+        self._health_detail = (detail or "").strip()
+        self._render_health_label()
 
     def update_status(self, m: str, l: str, r: str, title: str,
                       duration="00:00:00", speed="0 B/s", size="0 B",
@@ -746,6 +846,7 @@ class RoomCard(QFrame):
             self._live_code = "off"
             self._rec_code = "idle"
             self._render_status_labels()
+            self.update_health("")
             self.lbl_title.setText(title or self.lbl_title.text())
             # 监控关闭时清零并隐藏录制统计信息
             if self._stats_visible:
@@ -812,6 +913,7 @@ class RoomCard(QFrame):
             self._live_code = "off"
             self._rec_code = "idle"
             self._render_status_labels()
+            self.update_health("")
         else:
             self._monitor_code = "active"
             self._render_status_labels()

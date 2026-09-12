@@ -15,6 +15,7 @@ from enum import Enum
 from typing import Callable, List, Optional
 
 from core.ffmpeg_tools import FFMPEG_CMD, FFPROBE_CMD, hidden_subprocess_kwargs
+from core.media_validation import AudioIntegrityReport, assess_aac_integrity
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +54,39 @@ class ArtifactResult:
         d = asdict(self)
         d["status"] = self.status.value
         return d
+
+
+def write_artifact_sidecar(result: ArtifactResult, path: str) -> None:
+    if not path:
+        return
+    try:
+        with open(path + ".artifact.json", "w", encoding="utf-8") as handle:
+            json.dump(result.to_dict(), handle, ensure_ascii=False, indent=2)
+    except Exception:
+        logger.debug("failed to write artifact sidecar", exc_info=True)
+
+
+def _safe_unlink(path: str) -> None:
+    try:
+        if path and os.path.exists(path):
+            os.remove(path)
+    except OSError:
+        pass
+
+
+def publish_staged_artifact(staged: str, final: str) -> tuple[bool, str]:
+    try:
+        os.makedirs(os.path.dirname(final) or ".", exist_ok=True)
+        os.replace(staged, final)
+        return True, ""
+    except OSError as exc:
+        return False, str(exc)
+
+
+def make_staging_path(final: str) -> str:
+    """Return a short sibling path so long recording titles do not grow again."""
+    directory = os.path.dirname(final) or "."
+    return os.path.join(directory, f".ddrec-{uuid.uuid4().hex[:12]}.validating.mp4")
 
 
 def _run(cmd: list[str], timeout: int = 3600) -> tuple[int, str, str]:
@@ -102,6 +136,44 @@ def probe_file(path: str) -> dict:
         "audio_start": float((a or {}).get("start_time") or 0),
         "raw": data,
     }
+
+
+def probe_audio_frames(path: str, sample_seconds: float = 10.0) -> tuple[list[dict], str]:
+    """Read a bounded set of decoded audio-frame timestamps for clock validation."""
+    code, out, err = _run(
+        [
+            FFPROBE_CMD,
+            "-v",
+            "error",
+            "-read_intervals",
+            f"%+{max(1.0, float(sample_seconds)):.3f}",
+            "-select_streams",
+            "a:0",
+            "-show_frames",
+            "-show_entries",
+            "frame=pts_time,best_effort_timestamp_time,nb_samples",
+            "-of",
+            "json",
+            path,
+        ],
+        timeout=120,
+    )
+    if code != 0:
+        return [], err.strip() or f"exit {code}"
+    try:
+        data = json.loads(out)
+    except json.JSONDecodeError as exc:
+        return [], str(exc)
+    return list(data.get("frames") or []), ""
+
+
+def inspect_audio_integrity(path: str, probe_result: dict) -> tuple[AudioIntegrityReport, str]:
+    streams = (probe_result.get("raw") or {}).get("streams") or []
+    audio = next((stream for stream in streams if stream.get("codec_type") == "audio"), {})
+    if str(audio.get("codec_name") or "").lower() != "aac":
+        return AudioIntegrityReport(), ""
+    frames, error = probe_audio_frames(path)
+    return assess_aac_integrity(audio, frames), error
 
 
 def strict_decode(path: str) -> tuple[bool, str]:
@@ -389,32 +461,91 @@ class MediaPipeline:
         if os.path.normcase(os.path.abspath(final)) == os.path.normcase(os.path.abspath(src)):
             final = src + ".deliver.mp4"
 
-        ok, err = remux_copy(src, final)
+        staged = make_staging_path(final)
+        ok, err = remux_copy(src, staged)
         if not ok:
+            _safe_unlink(staged)
             result.error = f"remux_failed:{err[:500]}"
             result.status = ArtifactStatus.FAILED
+            write_artifact_sidecar(result, final)
             return result
 
         # 复验
-        pr2 = probe_file(final)
+        pr2 = probe_file(staged)
         result.probe = {k: v for k, v in pr2.items() if k != "raw"}
         if not pr2.get("ok") or not pr2.get("has_video"):
+            _safe_unlink(staged)
             result.error = "final_probe_failed"
             result.status = ArtifactStatus.FAILED
+            write_artifact_sidecar(result, final)
             return result
         if not pr2.get("has_audio"):
+            if pr.get("has_audio"):
+                _safe_unlink(staged)
+                result.error = "audio_track_lost_during_remux"
+                result.status = ArtifactStatus.FAILED
+                result.health = "failed"
+                write_artifact_sidecar(result, final)
+                return result
             result.warnings.append("final_no_audio")
             result.status = ArtifactStatus.WARNING
-            result.final_path = final
             result.duration = float(pr2.get("duration") or 0)
             result.size = int(pr2.get("size") or 0)
+            published, publish_error = publish_staged_artifact(staged, final)
+            if not published:
+                _safe_unlink(staged)
+                result.error = f"publish_failed:{publish_error}"
+                result.status = ArtifactStatus.FAILED
+                write_artifact_sidecar(result, final)
+                return result
+            result.final_path = final
+            write_artifact_sidecar(result, final)
             # 无损优先策略：无音频不作为 success 交付
             return result
 
-        ok2, err2 = sampled_decode(final, duration=float(pr2.get("duration") or 0))
+        audio_report, audio_probe_error = inspect_audio_integrity(staged, pr2)
+        result.probe.update(
+            {
+                "audio_declared_sample_rate": audio_report.declared_sample_rate,
+                "audio_observed_sample_rate": audio_report.observed_sample_rate,
+                "audio_timing_frame_count": audio_report.frame_count,
+                "audio_extradata_size": audio_report.extradata_size,
+                "audio_profile": audio_report.profile,
+                "audio_integrity_fatal_reasons": list(audio_report.fatal_reasons),
+                "audio_integrity_warnings": list(audio_report.warnings),
+            }
+        )
+        if audio_report.fatal_reasons:
+            result.error = "audio_integrity_failed:" + ",".join(audio_report.fatal_reasons)
+            result.status = ArtifactStatus.FAILED
+            result.health = "failed"
+            _safe_unlink(staged)
+            write_artifact_sidecar(result, final)
+            return result
+        if self.strict and audio_probe_error:
+            result.error = f"audio_timing_probe_failed:{audio_probe_error[:500]}"
+            result.status = ArtifactStatus.FAILED
+            result.health = "failed"
+            _safe_unlink(staged)
+            write_artifact_sidecar(result, final)
+            return result
+        if self.strict and audio_report.warnings:
+            result.error = "audio_integrity_inconclusive:" + ",".join(audio_report.warnings)
+            result.status = ArtifactStatus.FAILED
+            result.health = "failed"
+            _safe_unlink(staged)
+            write_artifact_sidecar(result, final)
+            return result
+        if audio_probe_error:
+            result.warnings.append(f"audio_timing_probe_warn:{audio_probe_error[:200]}")
+        result.warnings.extend(f"audio_integrity_warn:{reason}" for reason in audio_report.warnings)
+
+        ok2, err2 = sampled_decode(staged, duration=float(pr2.get("duration") or 0))
         if not ok2 and self.strict:
+            _safe_unlink(staged)
             result.error = f"final_sample_decode_failed:{err2[:500]}"
             result.status = ArtifactStatus.FAILED
+            write_artifact_sidecar(result, final)
             return result
         if not ok2:
             result.warnings.append(f"sample_decode_warn:{err2[:200]}")
@@ -426,6 +557,16 @@ class MediaPipeline:
         result.size = int(pr2.get("size") or 0)
         result.health = result.health or "healthy"
 
+        published, publish_error = publish_staged_artifact(staged, final)
+        if not published:
+            _safe_unlink(staged)
+            result.error = f"publish_failed:{publish_error}"
+            result.status = ArtifactStatus.FAILED
+            result.final_path = ""
+            result.health = "failed"
+            write_artifact_sidecar(result, final)
+            return result
+
         if not self.keep_source and result.status == ArtifactStatus.SUCCESS:
             # 首期默认 keep；仅显式关闭时删除
             try:
@@ -434,12 +575,7 @@ class MediaPipeline:
                 result.warnings.append(f"delete_source_failed:{e}")
 
         # 写结果 sidecar
-        try:
-            side = final + ".artifact.json"
-            with open(side, "w", encoding="utf-8") as f:
-                json.dump(result.to_dict(), f, ensure_ascii=False, indent=2)
-        except Exception:
-            pass
+        write_artifact_sidecar(result, final)
         return result
 
     @staticmethod

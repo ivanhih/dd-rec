@@ -396,6 +396,9 @@ class MainWindow(QMainWindow):
         self._dying_threads = []  # [(thread, recorder), ...]
         self._stopping_recorders = {}  # room_id -> (thread, recorder)
         self._pending_recorder_restarts = set()
+        # auto-heal: room_id -> [restart_timestamps]
+        self._heal_restart_times = {}
+        self._heal_blocked = set()  # rooms that exceeded restart budget
 
         # 通知队列
         self.notifications = []
@@ -566,6 +569,8 @@ class MainWindow(QMainWindow):
         main_fade.start()
 
         def _on_revealed():
+            if self._startup_overlay is overlay:
+                self._startup_overlay = None
             self._log_startup("main window interactive")
             self.main_content.setGraphicsEffect(None)
             self._startup_start_recorders_in_batches()
@@ -685,6 +690,8 @@ class MainWindow(QMainWindow):
             self._nav_channels_tip.setText(t("nav.channels"))
         if hasattr(self, "_nav_settings_tip") and self._nav_settings_tip is not None:
             self._nav_settings_tip.setText(t("nav.settings"))
+        if hasattr(self, "_nav_history_tip") and self._nav_history_tip is not None:
+            self._nav_history_tip.setText(t("nav.history"))
         if hasattr(self, "_nav_about_tip") and self._nav_about_tip is not None:
             self._nav_about_tip.setText(t("nav.about"))
         if hasattr(self, "channels_title_label") and self.channels_title_label is not None:
@@ -699,6 +706,8 @@ class MainWindow(QMainWindow):
                 self._btn_add_tip.setText(t("channels.add_tip"))
         if hasattr(self, "about_title_label") and self.about_title_label is not None:
             self.about_title_label.setText(t("about.title"))
+        if hasattr(self, "history_page") and self.history_page is not None and hasattr(self.history_page, "retranslate_ui"):
+            self.history_page.retranslate_ui()
         if hasattr(self, "_tray_show_action") and self._tray_show_action is not None:
             self._tray_show_action.setText(t("tray.show"))
         if hasattr(self, "_tray_quit_action") and self._tray_quit_action is not None:
@@ -727,6 +736,8 @@ class MainWindow(QMainWindow):
             self._about_logs_desc.setText(t("about.logs_desc"))
         if hasattr(self, "_about_check_update_btn") and self._about_check_update_btn is not None:
             self._about_check_update_btn.setText(t("about.check_update"))
+        if hasattr(self, "_about_help_btn") and self._about_help_btn is not None:
+            self._about_help_btn.setText("📖 " + t("help.open"))
         if hasattr(self, "_refresh_about_info_label"):
             self._refresh_about_info_label()
 
@@ -793,6 +804,7 @@ class MainWindow(QMainWindow):
     def _sidebar_nav_buttons(self):
         return (
             ("channels", self.nav_channels_btn),
+            ("history", self.nav_history_btn),
             ("settings", self.nav_settings_btn),
             ("about", self.nav_about_btn),
         )
@@ -896,6 +908,9 @@ class MainWindow(QMainWindow):
         self.nav_channels_btn = self._create_sidebar_nav_button("📋", "")
         self._nav_channels_tip = self._wire_hover(self.nav_channels_btn, "", attr_name="_nav_channels_tip")
         self.nav_channels_btn.clicked.connect(self.show_channels_page)
+        self.nav_history_btn = self._create_sidebar_nav_button("🎞️", "")
+        self._nav_history_tip = self._wire_hover(self.nav_history_btn, "", attr_name="_nav_history_tip")
+        self.nav_history_btn.clicked.connect(self.show_history_page)
         self.nav_settings_btn = self._create_sidebar_nav_button("⚙️", "")
         self._nav_settings_tip = self._wire_hover(self.nav_settings_btn, "", attr_name="_nav_settings_tip")
         self.nav_settings_btn.clicked.connect(self.show_global_settings_page)
@@ -904,6 +919,7 @@ class MainWindow(QMainWindow):
         self.nav_about_btn.clicked.connect(self.show_about_page)
 
         sidebar_layout.addWidget(self.nav_channels_btn)
+        sidebar_layout.addWidget(self.nav_history_btn)
         sidebar_layout.addWidget(self.nav_settings_btn)
         sidebar_layout.addStretch()
         sidebar_layout.addWidget(self.nav_about_btn)
@@ -1002,7 +1018,9 @@ class MainWindow(QMainWindow):
         self.page_stack.addWidget(self.channels_page)
         self.page_stack.addWidget(self.settings_page)
 
-        # 关于页面延迟创建
+        # 最近录制 / 关于：延迟创建
+        self.history_page = None
+        self._history_page_index = -1
         self.about_page = None
         self._about_page_index = -1
 
@@ -1053,10 +1071,36 @@ class MainWindow(QMainWindow):
         if self.global_settings_page is not None:
             return
         self.global_settings_page = GlobalSettingsOldStyleReplicaPage(self.settings_page)
-        self.global_settings_page.saved.connect(
-            lambda: self.show_notification("全局设置已保存", "保存成功", "success", merge_key="global-settings:saved")
-        )
+        self.global_settings_page.saved.connect(self._on_global_setting_saved)
         self.settings_page.layout().addWidget(self.global_settings_page)
+
+    def _on_global_setting_saved(self, key=""):
+        from ui.i18n import t
+        self.show_notification(
+            t("common.success"),
+            t("common.save_settings"),
+            "success",
+            merge_key="global-settings:saved",
+        )
+        if key == "tag_library":
+            for card in self.cards.values():
+                if hasattr(card, "refresh_custom_tags"):
+                    card.refresh_custom_tags()
+            # 如果当前筛选引用的标签刚被删除，回退到全部
+            if self.filter_mode.startswith("tag:"):
+                from core.config import get_tag
+                if get_tag(self.filter_mode.split(":", 1)[1]) is None:
+                    self.filter_mode = "all"
+            self._setup_filter_menu()
+            self.request_rearrange_cards(0)
+
+    def _ensure_history_page(self):
+        """延迟创建最近录制页面。"""
+        if self.history_page is not None:
+            return
+        from ui.recent_recordings import RecentRecordingsPage
+        self.history_page = RecentRecordingsPage(self)
+        self._history_page_index = self.page_stack.addWidget(self.history_page)
 
     def _ensure_about_page(self):
         """延迟创建关于页面。"""
@@ -1228,6 +1272,10 @@ class MainWindow(QMainWindow):
             card.update_status,
             Qt.QueuedConnection,
         )
+        recorder.segment_health_updated.connect(
+            self._on_segment_health_updated,
+            Qt.QueuedConnection,
+        )
         recorder.cut_completed.connect(self.on_cut_completed, Qt.QueuedConnection)
         recorder.cut_failed.connect(self.on_cut_failed, Qt.QueuedConnection)
 
@@ -1245,6 +1293,65 @@ class MainWindow(QMainWindow):
         self.threads[room_id] = thread
         thread.start()
 
+    def _on_segment_health_updated(self, room_id: str, health: str, detail: str = ""):
+        card = self.cards.get(str(room_id))
+        if card is None:
+            return
+        if hasattr(card, "update_health"):
+            card.update_health(health, detail)
+
+    def _heal_settings(self):
+        from core.config import get_global_setting
+        enabled = bool(get_global_setting("recorder_auto_heal"))
+        try:
+            max_restarts = int(get_global_setting("recorder_auto_heal_max_restarts") or 3)
+        except (TypeError, ValueError):
+            max_restarts = 3
+        try:
+            window_sec = float(get_global_setting("recorder_auto_heal_window_sec") or 600)
+        except (TypeError, ValueError):
+            window_sec = 600.0
+        return enabled, max(1, max_restarts), max(60.0, window_sec)
+
+    def _should_auto_heal(self, room_id: str) -> bool:
+        """Decide whether an unexpected recorder exit should restart this room."""
+        if self._is_shutting_down:
+            return False
+        if room_id in self._heal_blocked:
+            return False
+        card = self.cards.get(room_id)
+        if card is None:
+            return False
+        # 用户已关监听：不重启
+        if not card.room_info.get("enabled", False):
+            return False
+        if hasattr(card, "is_monitoring_enabled") and not card.is_monitoring_enabled():
+            return False
+        enabled, max_restarts, window_sec = self._heal_settings()
+        if not enabled:
+            return False
+        now = time.time()
+        times = [t for t in self._heal_restart_times.get(room_id, []) if now - t < window_sec]
+        if len(times) >= max_restarts:
+            self._heal_blocked.add(room_id)
+            self._heal_restart_times[room_id] = times
+            logging.error(
+                f"[heal] room={room_id} auto-heal circuit open: "
+                f"{len(times)} restarts within {int(window_sec)}s (max={max_restarts})"
+            )
+            if hasattr(card, "update_status"):
+                card.update_status(
+                    "❌ 出错", "🌙 未开播", "❌ 自愈熔断",
+                    card.room_info.get("title", ""),
+                    "", "", "",
+                    card.room_info.get("parent_area_name", ""),
+                    card.room_info.get("area_name", ""),
+                )
+            return False
+        times.append(now)
+        self._heal_restart_times[room_id] = times
+        return True
+
     def _on_recorder_thread_finished(self, room_id, recorder, thread):
         if self.recorders.get(room_id) is recorder:
             self.recorders.pop(room_id, None)
@@ -1252,7 +1359,8 @@ class MainWindow(QMainWindow):
             self.threads.pop(room_id, None)
 
         stopping = self._stopping_recorders.get(room_id)
-        if stopping == (thread, recorder):
+        user_stop = stopping == (thread, recorder)
+        if user_stop:
             self._stopping_recorders.pop(room_id, None)
 
         self._dying_threads = [
@@ -1261,15 +1369,35 @@ class MainWindow(QMainWindow):
         ]
 
         should_restart = room_id in self._pending_recorder_restarts
+        was_pending_restart = should_restart
         self._pending_recorder_restarts.discard(room_id)
+
+        # 用户主动关监听/删除：不自愈
+        # 用户在 stopping 期间又打开：走 pending restart
+        # 其它意外 finished：尝试 auto-heal
+        if not should_restart and not user_stop and not self._is_shutting_down:
+            exit_reason = str(getattr(recorder, "exit_reason", "") or "")
+            if exit_reason in ("requested_stop", "disabled"):
+                logging.info(
+                    f"[heal] room={room_id} recorder exit not eligible: reason={exit_reason}"
+                )
+            elif self._should_auto_heal(room_id):
+                should_restart = True
+                logging.warning(
+                    f"[heal] room={room_id} unexpected recorder exit; "
+                    f"reason={exit_reason or 'unknown'}; scheduling restart"
+                )
+
         if (
             should_restart
             and not self._is_shutting_down
             and room_id in self.cards
             and self.cards[room_id].room_info.get("enabled", False)
         ):
+            # 用户主动重开：立即；意外自愈：延迟 3s 避开瞬时抖动
+            delay_ms = 0 if was_pending_restart else 3000
             QTimer.singleShot(
-                0,
+                delay_ms,
                 lambda rid=room_id: self._start_recorder(rid, self.cards[rid].room_info)
                 if rid in self.cards else None,
             )
@@ -1406,10 +1534,13 @@ class MainWindow(QMainWindow):
 
     def _matches_search_and_filter(self, card):
         text = self.search_input.text().strip().lower()
+        tags = card.custom_tags() if hasattr(card, "custom_tags") else []
+        tag_names = [str(tag.get("name") or "") for tag in tags if isinstance(tag, dict)]
         search_hit = (
             text in card.room_info.get("uname", "").lower() or
-            text in card.room_id or
-            text in card.room_info.get("title", "").lower()
+            text in card.room_id.lower() or
+            text in card.room_info.get("title", "").lower() or
+            any(text in name.lower() for name in tag_names)
         )
         if not search_hit:
             return False
@@ -1424,6 +1555,11 @@ class MainWindow(QMainWindow):
             return card.is_live()
         if self.filter_mode == "paused":
             return not card.is_monitoring_enabled()
+        if self.filter_mode == "untagged":
+            return not tags
+        if self.filter_mode.startswith("tag:"):
+            wanted = self.filter_mode.split(":", 1)[1]
+            return any(str(tag.get("id") or "") == wanted for tag in tags if isinstance(tag, dict))
         return True
 
     def _sort_cards(self, cards_list):
@@ -1467,6 +1603,25 @@ class MainWindow(QMainWindow):
             action.setChecked(key == self.filter_mode)
             action.triggered.connect(lambda checked=False, mode=key: self._set_filter_mode(mode))
             group.addAction(action)
+
+        from core.config import get_tag_library
+        tags = get_tag_library()
+        if tags:
+            menu.addSeparator()
+            tag_section = menu.addAction(t("channels.filter.tags"))
+            tag_section.setEnabled(False)
+            untagged = menu.addAction(t("channels.filter.untagged"))
+            untagged.setCheckable(True)
+            untagged.setChecked(self.filter_mode == "untagged")
+            untagged.triggered.connect(lambda checked=False: self._set_filter_mode("untagged"))
+            group.addAction(untagged)
+            for tag in tags:
+                action = menu.addAction(f"● {tag['name']}")
+                action.setCheckable(True)
+                mode = f"tag:{tag['id']}"
+                action.setChecked(mode == self.filter_mode)
+                action.triggered.connect(lambda checked=False, m=mode: self._set_filter_mode(m))
+                group.addAction(action)
 
         self.filter_btn.setMenu(menu)
         self._update_filter_button()
@@ -1513,11 +1668,17 @@ class MainWindow(QMainWindow):
             "recording": t("channels.filter_tip.recording"),
             "live": t("channels.filter_tip.live"),
             "paused": t("channels.filter_tip.paused"),
+            "untagged": t("channels.filter_tip.untagged"),
         }
+        label = labels.get(self.filter_mode)
+        if self.filter_mode.startswith("tag:"):
+            from core.config import get_tag
+            tag = get_tag(self.filter_mode.split(":", 1)[1])
+            label = t("channels.filter_tip.tag", name=(tag or {}).get("name", "?"))
         # 关键: 不再 setToolTip — 系统 tooltip 在 Win11 暗色主题下是黑底黑字。
         # 改用 _filter_tip / _sort_tip(由 _wire_hover 创建)动态更新文字。
         if hasattr(self, "_filter_tip"):
-            self._filter_tip.setText(labels.get(self.filter_mode, t("channels.filter")))
+            self._filter_tip.setText(label or t("channels.filter"))
 
     def _update_sort_button(self):
         from ui.i18n import t
@@ -1566,6 +1727,9 @@ class MainWindow(QMainWindow):
 
         uname = self.cards[room_id].room_info.get("uname", room_id) if room_id in self.cards else room_id
         if enabled:
+            # 用户手动重新启用时重置自愈熔断与计数；自动重启不会经过这里
+            self._heal_blocked.discard(room_id)
+            self._heal_restart_times.pop(room_id, None)
             # 启监听 — 创建 QThread
             if room_id in self.cards:
                 room_info = self.cards[room_id].room_info
@@ -1752,6 +1916,15 @@ class MainWindow(QMainWindow):
     def show_global_settings(self):
         self.show_global_settings_page()
 
+    def show_history_page(self):
+        """切换到最近录制独立页面。"""
+        self.current_page = "history"
+        self._ensure_history_page()
+        if self.history_page is not None and hasattr(self.history_page, "refresh"):
+            self.history_page.refresh()
+        self.page_stack.slide_to(self.history_page)
+        self._update_sidebar_nav_styles()
+
     def show_about_page(self):
         """切换到关于页面（用 page_stack，和其他页面一致，不弹 dialog）"""
         self.current_page = "about"
@@ -1870,6 +2043,11 @@ class MainWindow(QMainWindow):
         btn_layout = QHBoxLayout()
         btn_layout.setSpacing(12)
 
+        self._about_help_btn = QPushButton("📖 " + t("help.open"))
+        self._about_help_btn.setFixedHeight(40)
+        self._about_help_btn.setCursor(Qt.PointingHandCursor)
+        self._about_help_btn.setProperty("variant", "secondary")
+
         github_btn = QPushButton("🌐 GitHub")
         github_btn.setFixedHeight(40)
         github_btn.setCursor(Qt.PointingHandCursor)
@@ -1880,12 +2058,17 @@ class MainWindow(QMainWindow):
         self._about_check_update_btn.setCursor(Qt.PointingHandCursor)
         self._about_check_update_btn.setProperty("variant", "primary")
 
+        btn_layout.addWidget(self._about_help_btn)
         btn_layout.addWidget(github_btn)
         btn_layout.addWidget(self._about_check_update_btn)
         btn_layout.addStretch()
         layout.addLayout(btn_layout)
 
         layout.addStretch()
+
+        def open_help():
+            from ui.help_dialog import open_help_overlay
+            open_help_overlay(self)
 
         def open_github():
             QDesktopServices.openUrl(QUrl("https://github.com/ivanhih/dd-rec"))
@@ -1939,6 +2122,7 @@ class MainWindow(QMainWindow):
             threading.Thread(target=_do_check, daemon=True).start()
 
         github_btn.clicked.connect(open_github)
+        self._about_help_btn.clicked.connect(open_help)
         self._about_check_update_btn.clicked.connect(check_for_update)
 
         self.retranslate_ui()

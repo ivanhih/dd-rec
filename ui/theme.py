@@ -528,6 +528,30 @@ QLabel[statusTone="warning"]  {{ color: {t['warning']}; }}
 QLabel[statusTone="danger"]   {{ color: {t['danger']}; }}
 QLabel[statusTone="info"]     {{ color: {t['info']}; }}
 
+/* ===== 最近录制：保存盘占用条 ===== */
+QProgressBar#historyDiskBar {{
+    border: 1px solid {t['control_border']};
+    border-radius: 9px;
+    background-color: {t['surface_input']};
+    text-align: center;
+    color: {t['text']};
+    min-height: 16px;
+    max-height: 20px;
+}}
+QProgressBar#historyDiskBar::chunk {{
+    border-radius: 8px;
+    background-color: {t['success']};
+}}
+QProgressBar#historyDiskBar[diskLevel="ok"]::chunk {{
+    background-color: {t['success']};
+}}
+QProgressBar#historyDiskBar[diskLevel="warning"]::chunk {{
+    background-color: {t['warning']};
+}}
+QProgressBar#historyDiskBar[diskLevel="critical"]::chunk {{
+    background-color: {t['danger']};
+}}
+
 /* ===== 输入控件 ===== */
 QLineEdit, QComboBox, QTextEdit, QPlainTextEdit, QTextBrowser, QSpinBox {{
     background-color: {t['surface_input']};
@@ -776,19 +800,45 @@ QTabBar::tab:selected:hover {{
 QWidget#modalOverlay {{
     background: {t['overlay_scrim']};
 }}
-QFrame#settingsOverlayPanel, QFrame#logViewerPanel {{
+QFrame#settingsOverlayPanel, QFrame#logViewerPanel, QFrame#helpViewerPanel {{
     background-color: {t['surface_raised']};
     border: 1px solid {t['border']};
     border-radius: 14px;
 }}
-QFrame#settingsOverlayPanel QLabel, QFrame#logViewerPanel QLabel {{
+QFrame#settingsOverlayPanel QLabel, QFrame#logViewerPanel QLabel, QFrame#helpViewerPanel QLabel {{
     background: transparent;
 }}
-QWidget#logViewerTopBar {{
+QWidget#logViewerTopBar, QWidget#helpViewerTopBar {{
     background-color: {t['panel']};
     border-top-left-radius: 14px;
     border-top-right-radius: 14px;
     border-bottom: 1px solid {t['border']};
+}}
+QListWidget#helpTocList {{
+    background-color: {t['surface_input']};
+    border: 1px solid {t['border']};
+    border-radius: 10px;
+    padding: 6px;
+    outline: none;
+    color: {t['text']};
+}}
+QListWidget#helpTocList::item {{
+    padding: 8px 10px;
+    border-radius: 8px;
+}}
+QListWidget#helpTocList::item:selected {{
+    background-color: {t['primary']};
+    color: {t['text_on_accent']};
+}}
+QListWidget#helpTocList::item:hover:!selected {{
+    background-color: {t['surface_hover']};
+}}
+QTextBrowser#helpTextBrowser {{
+    background-color: {t['surface_code']};
+    color: {t['text']};
+    border: 1px solid {t['border']};
+    border-radius: 10px;
+    padding: 0;
 }}
 QFrame#accountFrame {{
     background-color: {t['surface_input']};

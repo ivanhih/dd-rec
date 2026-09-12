@@ -14,7 +14,10 @@ import os
 block_cipher = None
 
 _binaries = []
-_datas = [('assets/icon.ico', 'assets')]  # 运行时窗口/托盘图标
+_datas = [
+    ('assets/icon.ico', 'assets'),  # 运行时窗口/托盘图标
+    ('docs/wiki', 'docs/wiki'),     # 应用内本地帮助
+]
 
 a = Analysis(
     ['main.py'],

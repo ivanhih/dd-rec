@@ -26,6 +26,10 @@ from typing import Any
 _ROOT = Path(__file__).resolve().parents[1]
 _LOCAL_FFMPEG = _ROOT / "ffmpeg" / ("ffmpeg.exe" if os.name == "nt" else "ffmpeg")
 _LOCAL_FFPROBE = _ROOT / "ffmpeg" / ("ffprobe.exe" if os.name == "nt" else "ffprobe")
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+
+from core.media_validation import assess_aac_integrity
 
 FATAL_RE = re.compile(
     r"Invalid NAL unit size|missing picture in access unit|"
@@ -123,6 +127,34 @@ def first_keyframe_time(path: str, ffprobe: str) -> float | None:
     return None
 
 
+def audio_timing_frames(path: str, ffprobe: str, sample_seconds: float = 10.0) -> tuple[list[dict], str]:
+    code, out, err = run_cmd(
+        [
+            ffprobe,
+            "-v",
+            "error",
+            "-read_intervals",
+            f"%+{max(1.0, float(sample_seconds)):.3f}",
+            "-select_streams",
+            "a:0",
+            "-show_frames",
+            "-show_entries",
+            "frame=pts_time,best_effort_timestamp_time,nb_samples",
+            "-of",
+            "json",
+            path,
+        ],
+        timeout=120,
+    )
+    if code != 0:
+        return [], err.strip() or f"ffprobe exit {code}"
+    try:
+        data = json.loads(out)
+    except json.JSONDecodeError as exc:
+        return [], str(exc)
+    return list(data.get("frames") or []), ""
+
+
 def strict_decode(path: str, ffmpeg: str, stream: str) -> dict[str, Any]:
     """stream: 'v' | 'a' | 'both'"""
     cmd = [ffmpeg, "-hide_banner", "-nostdin", "-v", "error", "-xerror", "-i", path]
@@ -175,6 +207,7 @@ def classify(path: str, ffmpeg: str, ffprobe: str) -> dict[str, Any]:
     streams = (pr.get("raw") or {}).get("streams") or []
     vstreams = [s for s in streams if s.get("codec_type") == "video"]
     astreams = [s for s in streams if s.get("codec_type") == "audio"]
+    audio_integrity_warning = False
     if not vstreams:
         result["reasons"].append("no_video_stream")
     if not astreams:
@@ -204,6 +237,29 @@ def classify(path: str, ffmpeg: str, ffprobe: str) -> dict[str, Any]:
             "start_time": a.get("start_time"),
             "extradata_size": a.get("extradata_size"),
         }
+        if str(a.get("codec_name") or "").lower() == "aac":
+            frames, timing_error = audio_timing_frames(path, ffprobe)
+        else:
+            frames, timing_error = [], ""
+        audio_report = assess_aac_integrity(a, frames)
+        result["audio"].update(
+            {
+                "observed_sample_rate": audio_report.observed_sample_rate,
+                "timing_frame_count": audio_report.frame_count,
+                "integrity_fatal_reasons": list(audio_report.fatal_reasons),
+                "integrity_warnings": list(audio_report.warnings),
+            }
+        )
+        if audio_report.fatal_reasons:
+            result["reasons"].extend(audio_report.fatal_reasons)
+            result["status"] = "red"
+            return result
+        if timing_error:
+            result["reasons"].append(f"audio_timing_probe_warn:{timing_error[:200]}")
+            audio_integrity_warning = True
+        if audio_report.warnings:
+            result["reasons"].extend(audio_report.warnings)
+            audio_integrity_warning = True
 
     result["first_keyframe_time"] = first_keyframe_time(path, ffprobe)
 
@@ -226,6 +282,10 @@ def classify(path: str, ffmpeg: str, ffprobe: str) -> dict[str, Any]:
 
     if dec_v.get("warn_match") or dec_a.get("warn_match"):
         result["reasons"].append("timestamp_or_ref_warning")
+        result["status"] = "yellow"
+        return result
+
+    if audio_integrity_warning:
         result["status"] = "yellow"
         return result
 

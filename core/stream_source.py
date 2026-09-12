@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import socket
 import threading
 import time
 from dataclasses import dataclass
@@ -94,9 +95,9 @@ class StreamSource:
                 hdrs[k] = v
             req = Request(self.url, headers=hdrs)
             resp = urlopen(req, timeout=self.timeout)
-            # 缩短读超时，便于 stop() 仅置位后快速退出，无需跨线程 close
+            # Keep the network timeout long enough to tolerate brief media stalls.
             try:
-                resp.fp.raw._sock.settimeout(min(float(self.timeout), 2.0))
+                resp.fp.raw._sock.settimeout(float(self.timeout))
             except Exception:
                 pass
             with self._resp_lock:
@@ -104,6 +105,12 @@ class StreamSource:
             while not self._stop.is_set():
                 try:
                     chunk = resp.read(self.read_size)
+                except (TimeoutError, socket.timeout) as e:
+                    if self._stop.is_set():
+                        reason = "stop"
+                        break
+                    reason = f"read_timeout:{e}"
+                    break
                 except Exception as e:
                     if self._stop.is_set():
                         reason = "stop"

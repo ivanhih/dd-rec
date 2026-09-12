@@ -126,8 +126,17 @@ class DanmakuRecorder:
         # 只置位停止标记；recv 侧 settimeout(1.0) 会自行退出。
         # 禁止从其他线程 shutdown/close SSL socket（Windows OpenSSL 会 access violation）。
         self._stop_event.set()
-        if self._thread:
-            self._thread.join(timeout=8)
+        t = self._thread
+        if t and t.is_alive():
+            t.join(timeout=8)
+            if t.is_alive():
+                logging.warning(
+                    f"💬 {self.room_id} 弹幕线程 stop 超时仍存活；"
+                    f"recv 将在下一轮 timeout 后自行退出"
+                )
+        # 仅在线程结束后清引用，避免 stop 中途并发碰 socket
+        with self._sock_lock:
+            self._sock = None
         self._finalize()
         logging.info(f"💬 {self.room_id} 弹幕录制已停止，共 {self._danmaku_count} 条弹幕")
 
@@ -577,7 +586,15 @@ class DanmakuRecorder:
                 continue
             except OSError as e:
                 # stop 时主动 close/shutdown socket 唤醒 recv，是预期行为
-                logging.debug(f"💬 {self.room_id} recv OSError: {e}")
+                if self._stop_event.is_set():
+                    logging.debug(f"💬 {self.room_id} recv OSError during stop: {e}")
+                else:
+                    # 10038/10054 等在非 stop 路径也常见于对端重置；降为 debug 减少刷屏
+                    winerr = getattr(e, "winerror", None)
+                    if winerr in (10038, 10054, 10053):
+                        logging.debug(f"💬 {self.room_id} recv OSError: {e}")
+                    else:
+                        logging.warning(f"💬 {self.room_id} recv OSError: {e}")
                 break
             if not chunk:
                 logging.warning(f"💬 {self.room_id} 服务器关闭连接（recv 返回空）")

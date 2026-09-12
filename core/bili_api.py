@@ -1,6 +1,7 @@
 # core/bili_api.py
 import re
 import logging
+from urllib.parse import urlparse
 from curl_cffi import requests
 from .config import get_headers, get_global_setting, get_room_config, get_effective_format, get_room_setting, reload_config
 
@@ -13,6 +14,104 @@ def extract_room_id(url_or_id):
         return match.group(1)
     match = re.search(r"\d+", s)
     return match.group(0) if match else None
+
+
+def build_endpoint_identity(host: str, base_url: str) -> str:
+    """Stable CDN identity without stream paths or signed fields."""
+    host = (host or "").strip()
+    raw = host if "://" in host else f"https://{host.lstrip('/')}"
+    try:
+        parsed = urlparse(raw)
+    except Exception:
+        parsed = None
+    if parsed and (parsed.scheme or parsed.netloc or parsed.path):
+        scheme = (parsed.scheme or "https").lower()
+        hostname = (parsed.hostname or parsed.netloc or "").lower()
+        port = parsed.port
+        host_part = hostname
+        if port and not (
+            (scheme == "https" and port == 443)
+            or (scheme == "http" and port == 80)
+        ):
+            host_part = f"{hostname}:{port}"
+        if not host_part:
+            host_part = host.lower()
+    else:
+        scheme = "https"
+        host_part = host.lower()
+    return f"{scheme}://{host_part}"
+
+
+def build_cdn_candidate(host: str, base_url: str, extra: str = "") -> dict:
+    host = host or ""
+    base_url = base_url or ""
+    extra = extra or ""
+    return {
+        "url": f"{host}{base_url}{extra}",
+        "host": host,
+        "extra": extra,
+        "endpoint_id": build_endpoint_identity(host, base_url),
+    }
+
+
+def build_cdn_candidates(base_url: str, url_info: list, *, cfg_url_priority: str = "") -> list[dict]:
+    """Expand every url_info entry with its own host/extra pair."""
+    candidates: list[dict] = []
+    for item in url_info or []:
+        if not isinstance(item, dict):
+            continue
+        host = item.get("host", "") or ""
+        extra = item.get("extra", "") or ""
+        if not host and not base_url:
+            continue
+        candidates.append(build_cdn_candidate(host, base_url, extra))
+    return prefer_cdn_candidates(candidates, cfg_url_priority)
+
+
+def prefer_cdn_candidates(candidates: list[dict], cfg_url_priority: str = "") -> list[dict]:
+    """Stable reorder only; never drop non-matching candidates."""
+    items = [dict(c) for c in (candidates or []) if isinstance(c, dict) and c.get("url")]
+    pref = (cfg_url_priority or "").strip()
+    if not pref or not items:
+        return items
+    matched = []
+    others = []
+    for c in items:
+        hay = " ".join(
+            str(c.get(k) or "")
+            for k in ("url", "host", "endpoint_id")
+        )
+        if pref in hay:
+            matched.append(c)
+        else:
+            others.append(c)
+    return matched + others if matched else items
+
+
+def build_stream_entry(
+    *,
+    base_url: str,
+    url_info: list,
+    codec: str,
+    format_name: str,
+    qn: int | str = 0,
+    fps: str = "",
+    bitrate: str = "",
+    cfg_url_priority: str = "",
+) -> dict | None:
+    candidates = build_cdn_candidates(base_url, url_info, cfg_url_priority=cfg_url_priority)
+    if not candidates:
+        return None
+    return {
+        "url": candidates[0]["url"],
+        "base_url": base_url,
+        "codec": codec,
+        "format": format_name,
+        "qn": qn,
+        "fps": str(fps),
+        "bitrate": str(bitrate),
+        "cdn_candidates": candidates,
+    }
 
 
 def get_bili_info(url_or_id, room_id_for_cookie=None, silent=False):
@@ -115,6 +214,7 @@ def select_best_stream(
 
     返回带 match_kind / requested_* 元数据的 stream dict；strict 且无匹配时返回 None。
     不会在无提示情况下静默回到无关编码：非 exact 匹配都会打 warning/error。
+    URL 偏好只重排已选规格内部的 CDN 候选，不参与规格排名、不丢弃备选。
     """
     if not available_streams:
         return None
@@ -124,11 +224,6 @@ def select_best_stream(
     cfg_format = (cfg_format or "flv").strip().lower()
     fallback_policy = (fallback_policy or "compatible").strip().lower()
     rid = room_id or "?"
-
-    if cfg_url_priority:
-        filtered = [s for s in streams if cfg_url_priority in (s.get("url") or "")]
-        if filtered:
-            streams = filtered
 
     def sort_stream(s):
         score = 0
@@ -164,9 +259,7 @@ def select_best_stream(
                     score += max(0, 5000 - int(abs(stream_kbps - target_kbps)))
             except (ValueError, IndexError, TypeError):
                 pass
-        elif priority_param == "网址" and cfg_url_priority and cfg_url_priority in (s.get("url") or ""):
-            score += 10000
-        # 目标编码优先级远高于 qn
+        # 目标编码优先级远高于 qn。URL 偏好不参与规格打分。
         if s.get("codec") == cfg_codec_api:
             score += 100000
         if s.get("format") == cfg_format:
@@ -208,12 +301,27 @@ def select_best_stream(
         )
 
     best = dict(best)
+    candidates = list(best.get("cdn_candidates") or [])
+    if not candidates and best.get("url"):
+        candidates = [
+            {
+                "url": best.get("url"),
+                "host": "",
+                "extra": "",
+                "endpoint_id": build_endpoint_identity("", best.get("base_url") or ""),
+            }
+        ]
+    candidates = prefer_cdn_candidates(candidates, cfg_url_priority)
+    if candidates:
+        best["cdn_candidates"] = candidates
+        best["url"] = candidates[0]["url"]
     best["match_kind"] = match_kind
     best["requested_codec"] = cfg_codec_api
     best["requested_format"] = cfg_format
     logging.info(
         f"👉 {rid} 匹配最优[{match_kind}]: 画质qn[{best.get('qn')}], "
-        f"编码[{best.get('codec')}], 格式[{best.get('format')}]"
+        f"编码[{best.get('codec')}], 格式[{best.get('format')}], "
+        f"CDN候选[{len(best.get('cdn_candidates') or [])}]"
     )
     return best
 
@@ -261,17 +369,18 @@ def get_stream_info(real_room_id):
                 for codec_obj in format_obj.get("codec", []):
                     base_url = codec_obj.get("base_url", "")
                     url_info = codec_obj.get("url_info", [])
-                    if url_info and base_url:
-                        full_url = url_info[0].get("host", "") + base_url + url_info[0].get("extra", "")
-                        available_streams.append({
-                            "url": full_url,
-                            "base_url": base_url,
-                            "codec": codec_obj.get("codec_name", ""),
-                            "format": format_obj.get("format_name", ""),
-                            "qn": codec_obj.get("current_qn", 0),
-                            "fps": str(codec_obj.get("frame_rate", "")),
-                            "bitrate": str(codec_obj.get("bitrate", "")),
-                        })
+                    entry = build_stream_entry(
+                        base_url=base_url,
+                        url_info=url_info,
+                        codec=codec_obj.get("codec_name", ""),
+                        format_name=format_obj.get("format_name", ""),
+                        qn=codec_obj.get("current_qn", 0),
+                        fps=str(codec_obj.get("frame_rate", "")),
+                        bitrate=str(codec_obj.get("bitrate", "")),
+                        cfg_url_priority=cfg_url_priority,
+                    )
+                    if entry is not None:
+                        available_streams.append(entry)
 
         return select_best_stream(
             available_streams,
