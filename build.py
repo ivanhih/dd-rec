@@ -41,6 +41,7 @@ dd-rec 打包脚本（Portable 方案）
   python build.py
 """
 
+import ast
 import os
 import sys
 import shutil
@@ -181,6 +182,13 @@ def find_pyinstaller() -> str | None:
             capture_output=True, text=True, timeout=10,
         )
         if out.returncode == 0 and "OK" in out.stdout:
+            resolved = subprocess.run(
+                ["py", "-3.13", "-c", "import sys; print(sys.executable)"],
+                capture_output=True, text=True, timeout=10,
+            )
+            python_exe = (resolved.stdout or "").strip().splitlines()[-1:]
+            if python_exe and os.path.isfile(python_exe[0]):
+                return python_exe[0]
             return "py -3.13"
     except Exception:
         pass
@@ -251,6 +259,142 @@ def run(cmd: list, **kwargs) -> int:
     return subprocess.run(cmd, check=True, **kwargs).returncode
 
 
+def _pyinstaller_env() -> dict[str, str]:
+    """返回用于 PyInstaller 的干净 DLL 搜索环境。
+
+    PyInstaller 会根据 PATH 解析 Qt6Core.dll 的未带版本 ICU 依赖。
+    Codex 的运行时会把 Poppler 的 native/bin 放到 PATH 前面，其中的
+    ICU 78 导出名带 ``_78``，与 PySide6/Qt 需要的 Windows ICU ABI 不兼容。
+    如果直接继承该 PATH，错误的 icuuc.dll 会被打进安装包，运行时就会在
+    ``from PySide6 import QtWidgets`` 处报 WinError 127。
+
+    只保留当前 Python/Conda 和 Windows 系统目录，避免其它 native
+    运行时目录参与依赖解析。
+    """
+    env = os.environ.copy()
+
+    python_exe = PYTHON_EXE
+    if isinstance(python_exe, str) and python_exe.startswith("py "):
+        try:
+            resolved = subprocess.run(
+                python_exe.split() + ["-c", "import sys; print(sys.executable)"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            resolved_path = (resolved.stdout or "").strip().splitlines()[-1:]
+            if resolved.returncode == 0 and resolved_path:
+                python_exe = resolved_path[0]
+        except (OSError, subprocess.SubprocessError):
+            pass
+    if not isinstance(python_exe, str) or not os.path.isfile(python_exe):
+        python_exe = sys.executable
+
+    python_dir = os.path.dirname(os.path.abspath(python_exe))
+    system_root = os.environ.get("SystemRoot", r"C:\Windows")
+    preferred = [
+        python_dir,
+        os.path.join(python_dir, "Library", "bin"),
+        os.path.join(python_dir, "DLLs"),
+        os.path.join(python_dir, "Scripts"),
+        os.path.join(system_root, "System32"),
+        system_root,
+        os.path.join(system_root, "System32", "Wbem"),
+        os.path.join(system_root, "System32", "WindowsPowerShell", "v1.0"),
+        os.path.join(system_root, "System32", "OpenSSH"),
+    ]
+
+    entries = []
+    for entry in preferred:
+        if not entry:
+            continue
+        normalized = os.path.normcase(os.path.normpath(entry)).replace("/", "\\")
+        if normalized not in entries:
+            entries.append(normalized)
+    env["PATH"] = os.pathsep.join(entries)
+    return env
+
+
+def _assert_no_accidental_poppler_dlls() -> None:
+    """阻止把外部 Poppler native DLL 误打进正式包。"""
+    analysis_toc = os.path.join(BUILD_DIR, "app", "Analysis-00.toc")
+    if not os.path.isfile(analysis_toc):
+        raise RuntimeError(
+            f"PyInstaller 分析结果不存在，拒绝继续打包: {analysis_toc}"
+        )
+    with open(analysis_toc, "r", encoding="utf-8", errors="replace") as f:
+        try:
+            analysis_toc_data = ast.literal_eval(f.read())
+        except (SyntaxError, ValueError) as e:
+            raise RuntimeError(
+                f"无法解析 PyInstaller 分析结果，拒绝继续打包: {analysis_toc}"
+            ) from e
+
+    def _strings(value):
+        if isinstance(value, str):
+            yield value
+        elif isinstance(value, (list, tuple, set)):
+            for item in value:
+                yield from _strings(item)
+        elif isinstance(value, dict):
+            for item in value.values():
+                yield from _strings(item)
+
+    sources = []
+    for source in _strings(analysis_toc_data):
+        normalized = source.lower().replace("/", "\\")
+        if "\\poppler\\library\\bin\\" in normalized or "\\codex-runtimes\\" in normalized:
+            sources.append(source)
+    if sources:
+        raise RuntimeError(
+            "PyInstaller 解析到了外部 Poppler/Codex native DLL；"
+            "已拒绝继续打包，避免生成 QtWidgets DLL 启动错误的安装器。"
+            f" 首个来源: {sources[0]}"
+        )
+
+
+def _assert_qt_runtime_loadable(bundle_root: str) -> None:
+    """直接加载打包后的 Qt DLL，阻止 QtWidgets 启动回归。"""
+    if os.name != "nt":
+        return
+
+    internal = os.path.join(bundle_root, "_internal")
+    qt_dir = os.path.join(internal, "PySide6")
+    shiboken_dir = os.path.join(internal, "shiboken6")
+    required = (
+        os.path.join(qt_dir, "Qt6Core.dll"),
+        os.path.join(qt_dir, "Qt6Gui.dll"),
+        os.path.join(qt_dir, "Qt6Widgets.dll"),
+    )
+    missing = [path for path in required if not os.path.isfile(path)]
+    if missing:
+        raise RuntimeError(
+            "Qt runtime 文件不完整，拒绝继续打包: "
+            + ", ".join(missing)
+        )
+
+    import ctypes
+
+    dll_dirs = []
+    try:
+        for directory in (internal, qt_dir, shiboken_dir):
+            if os.path.isdir(directory):
+                dll_dirs.append(os.add_dll_directory(directory))
+
+        # LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS
+        load_flags = 0x00000100 | 0x00001000
+        for path in required:
+            try:
+                ctypes.WinDLL(path, winmode=load_flags)
+            except OSError as e:
+                raise RuntimeError(
+                    f"Qt runtime 加载失败，拒绝继续打包: {path}: {e}"
+                ) from e
+    finally:
+        for directory in dll_dirs:
+            directory.close()
+
+
 def clean() -> None:
     """清理旧构建产物，并移除 installer/ 中当前版本的旧发布文件。"""
     print("\n[1/10] 清理旧构建...")
@@ -290,13 +434,13 @@ def clean() -> None:
 def build_app() -> None:
     """PyInstaller 打包主程序"""
     print(f"\n[2/10] PyInstaller 打包主程序...")
-    if isinstance(PYTHON_EXE, str) and " " in PYTHON_EXE and not PYTHON_EXE.startswith("py "):
-        cmd = PYTHON_EXE.split() + ["-m", "PyInstaller", APP_SPEC, "--noconfirm"]
-    elif PYTHON_EXE.startswith("py "):
+    if isinstance(PYTHON_EXE, str) and PYTHON_EXE.startswith("py "):
         cmd = PYTHON_EXE.split() + ["-m", "PyInstaller", APP_SPEC, "--noconfirm"]
     else:
         cmd = [PYTHON_EXE, "-m", "PyInstaller", APP_SPEC, "--noconfirm"]
-    run(cmd, cwd=PROJECT_ROOT)
+    run(cmd, cwd=PROJECT_ROOT, env=_pyinstaller_env())
+    _assert_no_accidental_poppler_dlls()
+    _assert_qt_runtime_loadable(os.path.join(DIST_DIR, "dd_rec_app"))
 
 
 def assemble_portable_dir() -> None:
