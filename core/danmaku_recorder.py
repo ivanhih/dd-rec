@@ -63,10 +63,11 @@ class DanmakuRecorder:
         22, 25, 54, 21, 56, 59, 6, 63, 57, 62, 11, 36, 20, 34, 44, 52,
     ]
 
-    def __init__(self, room_id: str, save_dir: str, filename_base: str):
+    def __init__(self, room_id: str, save_dir: str, filename_base: str, *, credential_provider=None):
         self.room_id = room_id
         self.save_dir = save_dir
         self.filename_base = filename_base
+        self._credential_provider = credential_provider
 
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
@@ -101,20 +102,12 @@ class DanmakuRecorder:
 
     def _parse_credential(self, cred: str):
         """解析凭证：支持纯 SESSDATA 或完整 cookie 串"""
-        self._cookies = {}
-        cred = (cred or "").strip()
-        if not cred:
-            return
-        if "=" in cred and ";" in cred or "SESSDATA=" in cred:
-            # 完整 cookie 串
-            for part in cred.split(";"):
-                if "=" in part:
-                    k, _, v = part.strip().partition("=")
-                    self._cookies[k.strip()] = v.strip()
-        else:
-            # 纯 SESSDATA 值
-            self._cookies["SESSDATA"] = cred
-        self._uid = int(self._cookies.get("DedeUserID", "0") or "0")
+        from core.cookies import parse_cookie
+        self._cookies = parse_cookie(cred)
+        try:
+            self._uid = int(self._cookies.get("DedeUserID", "0") or "0")
+        except ValueError:
+            self._uid = 0
         if self._cookies.get("buvid3"):
             self._buvid3 = self._cookies["buvid3"]
         if self._cookies.get("buvid4"):
@@ -316,6 +309,8 @@ class DanmakuRecorder:
     # ─── getDanmuInfo ──────────────────────────
 
     def _get_danmaku_info(self):
+        if self._credential_provider is not None:
+            self._parse_credential(self._credential_provider())
         if not self._buvid3:
             buvid3, buvid4 = self._ensure_buvid()
             self._buvid3 = buvid3

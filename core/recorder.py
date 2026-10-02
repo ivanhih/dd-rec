@@ -18,7 +18,7 @@ from PySide6.QtCore import QObject, Signal, QThread
 
 from core.config import (
     get_global_setting, get_room_setting, get_room_config, get_effective_format,
-    get_effective_save_dir, VIDEO_SAVE_DIR, RESOURCE_DIR
+    get_effective_save_dir, VIDEO_SAVE_DIR, RESOURCE_DIR, get_headers, get_effective_cookie
 )
 from core.bili_api import build_endpoint_identity, get_bili_info, get_stream_info
 from core.utils import format_size, render_path_template
@@ -1059,10 +1059,7 @@ class BiliRecorder(QObject):
             stream_url,
             on_data=on_data,
             on_disconnected=on_disconnected,
-            headers={
-                "User-Agent": "Mozilla/5.0",
-                "Referer": "https://live.bilibili.com/",
-            },
+            headers=get_headers(self.room_id, media=True),
         )
 
     @staticmethod
@@ -1534,7 +1531,7 @@ class BiliRecorder(QObject):
         source_gen = self._source_gen
         session.set_active_source_generation(source_gen)
 
-        headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://live.bilibili.com/"}
+        headers = get_headers(self.room_id, media=True)
         if bridge:
             def on_data(chunk: bytes):
                 if source_gen != getattr(self, "_source_gen", -1):
@@ -1560,6 +1557,7 @@ class BiliRecorder(QObject):
                 env=self._get_proxy_env(),
                 log_path=save_path + ".bridge.ffmpeg.log",
                 ffmpeg_cmd=FFMPEG_CMD,
+                headers_provider=lambda: get_headers(self.room_id, media=True),
             )
         else:
             if stream_info:
@@ -2194,6 +2192,11 @@ class BiliRecorder(QObject):
 
     def _start_ffmpeg(self, save_path):
         """启动 ffmpeg 进程，stderr 写入 sidecar。"""
+        from core.cookies import ffmpeg_headers
+        headers = get_headers(self.room_id, media=True)
+        from core.media_http import MediaRelay, loopback_process_env
+        relay = MediaRelay(self.stream_url, lambda: get_headers(self.room_id, media=True))
+        relay.start()
         log_path = save_path + ".ffmpeg.log"
         self._ffmpeg_stderr_path = log_path
         try:
@@ -2206,15 +2209,15 @@ class BiliRecorder(QObject):
             "-reconnect_streamed", "1",
             "-reconnect_delay_max", "5",
             "-rw_timeout", "15000000",
-            "-user_agent", "Mozilla/5.0",
-            "-headers", "Referer: https://live.bilibili.com/\r\n",
-            "-i", self.stream_url,
+            "-user_agent", headers["User-Agent"],
+            "-headers", ffmpeg_headers({"Referer": headers["Referer"]}),
+            "-i", relay.url,
             "-c", "copy",
             # 关键：+empty_moov 让 ffmpeg 写一个**空** moov atom 在文件开头
             "-movflags", "+empty_moov",
             save_path
         ]  # noqa
-        proxy_env = self._get_proxy_env()
+        proxy_env = loopback_process_env(self._get_proxy_env())
         _popen_kwargs = dict(
             stdin=subprocess.PIPE,
             stdout=subprocess.DEVNULL,
@@ -2222,7 +2225,14 @@ class BiliRecorder(QObject):
             env=proxy_env,
         )
         _popen_kwargs.update(hidden_subprocess_kwargs(new_process_group=True))
-        proc = subprocess.Popen(cmd, **_popen_kwargs)
+        try:
+            proc = subprocess.Popen(cmd, **_popen_kwargs)
+        except Exception:
+            relay.stop()
+            if stderr_f != subprocess.DEVNULL:
+                stderr_f.close()
+            raise
+        relay.stop_when(proc, on_exit=stderr_f.close if stderr_f != subprocess.DEVNULL else None)
         self._capture_mode = "ffmpeg"
         return proc
 
@@ -2683,12 +2693,15 @@ class BiliRecorder(QObject):
                     # 启动弹幕录制
                     if get_room_setting(self.room_id, "chat_record_enabled"):
                         fname_base = os.path.splitext(os.path.basename(save_path))[0]
-                        sessdata = get_room_setting(self.room_id, "chat_credential") or ""
+                        sessdata = get_effective_cookie(self.room_id, chat=True)
                         chat_fmt = get_room_setting(self.room_id, "chat_format") or "xml"
                         save_dir = os.path.dirname(save_path)
                         if self._danmaku_recorder:
                             self._danmaku_recorder.stop()
-                        self._danmaku_recorder = DanmakuRecorder(self.room_id, save_dir, fname_base)
+                        self._danmaku_recorder = DanmakuRecorder(
+                            self.room_id, save_dir, fname_base,
+                            credential_provider=lambda: get_effective_cookie(self.room_id, chat=True),
+                        )
                         self._danmaku_recorder.start(chat_fmt, sessdata)
 
                     self.last_check_time = time.time()

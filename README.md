@@ -2,13 +2,14 @@
 
 B 站直播自动录制桌面客户端。支持多房间监控、FLV 原生捕获、弹幕落盘、按时长/大小切割、Webhook 通知，以及 Portable 自动更新。
 
-当前版本：**1.0.5**（见 [`version.py`](version.py)）
+当前版本：**1.0.8**（见 [`version.py`](version.py)）
 
 ---
 
 ## 功能
 
 - **多房间监控**：卡片式房间列表，独立开关监听
+- **可选扫码登录**：内置 B站扫码登录，全局账号供房间共用；可按房间选择匿名或手填 Cookie
 - **流选择**：分辨率 / 帧率 / 码率 / 编码 / 格式优先级；支持房间级覆盖
 - **原生 FLV 捕获**：`avc + flv` 走 single-input 原生捕获与分段写盘；其他格式走 FFmpeg 桥接
 - **后处理**：验证 → 无损 remux → 可选删除源文件（`media_pipeline`）
@@ -58,6 +59,7 @@ python main.py
 ```text
 <项目或 portable 根>/userdata/
   config.json
+  bili_account.json     # 扫码登录凭据，仅保存在本机
   log/bilirec.log
   log/crash.log
 ```
@@ -79,6 +81,11 @@ python main.py
 | `auto_start` / `prevent_sleep` | 开机自启、防止休眠 |
 
 房间级设置可覆盖全局项（Cookie、流参数、自定义目录等）。
+
+扫码登录入口：**全局设置 → B站账号 → 扫码登录**，使用哔哩哔哩 App 扫码并确认。
+新房间自动使用已登录账号，已有手填 Cookie 优先保留；点击“全部房间使用此账号”可统一已有房间。
+不登录仍可匿名录制公开直播。房间设置中的“录制账号”可选择匿名模式，即使全局已登录也不会发送账号 Cookie。
+账号失效时默认账号回退为匿名并提示重新登录。详情见 [扫码登录与录制账号](docs/bili-account.md)。
 
 ---
 

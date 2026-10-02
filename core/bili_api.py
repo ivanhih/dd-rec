@@ -6,6 +6,25 @@ from curl_cffi import requests
 from .config import get_headers, get_global_setting, get_room_config, get_effective_format, get_room_setting, reload_config
 
 
+def _get_json(url, headers):
+    """Only an explicit login expiry permits an anonymous retry."""
+    request_headers = dict(headers)
+    proxy = request_headers.pop("_proxy", None)
+    result = requests.get(url, headers=request_headers, proxy=proxy,
+                          impersonate="chrome110", timeout=10).json()
+    if result.get("code") == -101 and request_headers.get("Cookie"):
+        from core.bili_auth import account_service
+        if account_service().store.invalidate(request_headers["Cookie"]):
+            logging.warning("B站账号已失效，本次请求改用匿名模式")
+        # Every failed request may fall back, even if another room already
+        # invalidated the account. Never invalidate an unrelated manual Cookie.
+        headers.pop("Cookie", None)
+        request_headers.pop("Cookie", None)
+        result = requests.get(url, headers=request_headers, proxy=proxy,
+                              impersonate="chrome110", timeout=10).json()
+    return result
+
+
 
 def extract_room_id(url_or_id):
     s = str(url_or_id).strip()
@@ -126,10 +145,10 @@ def get_bili_info(url_or_id, room_id_for_cookie=None, silent=False):
         headers = get_headers(room_id_for_cookie or room_id, monitor=silent)
 
         # room_init
-        res_init = requests.get(
+        res_init = _get_json(
             f"https://api.live.bilibili.com/room/v1/Room/room_init?id={room_id}",
-            headers=headers, impersonate="chrome110", timeout=10
-        ).json()
+            headers
+        )
         if res_init.get("code") != 0:
             return None
 
@@ -137,10 +156,10 @@ def get_bili_info(url_or_id, room_id_for_cookie=None, silent=False):
         live_status = res_init.get("data", {}).get("live_status", 0)
 
         # get_info
-        res_info = requests.get(
+        res_info = _get_json(
             f"https://api.live.bilibili.com/room/v1/Room/get_info?room_id={real_room_id}",
-            headers=headers, impersonate="chrome110", timeout=10
-        ).json()
+            headers
+        )
 
         title = "未知标题"
         parent_area_name = "未知分区"
@@ -156,10 +175,10 @@ def get_bili_info(url_or_id, room_id_for_cookie=None, silent=False):
             cover = (data.get("user_cover") or data.get("keyframe") or "").strip()
 
         # anchor info
-        res_anchor = requests.get(
+        res_anchor = _get_json(
             f"https://api.live.bilibili.com/live_user/v1/UserInfo/get_anchor_in_room?roomid={real_room_id}",
-            headers=headers, impersonate="chrome110", timeout=10
-        ).json()
+            headers
+        )
 
         uname = f"主播_{real_room_id}"
         face = ""
@@ -354,7 +373,7 @@ def get_stream_info(real_room_id):
     try:
         headers = get_headers(real_room_id, monitor=True)
 
-        res = requests.get(url, headers=headers, impersonate="chrome110", timeout=10).json()
+        res = _get_json(url, headers)
         if res.get("code") != 0:
             return None
 

@@ -376,6 +376,7 @@ def _assert_qt_runtime_loadable(bundle_root: str) -> None:
     import ctypes
 
     dll_dirs = []
+    loaded_handles = []
     try:
         for directory in (internal, qt_dir, shiboken_dir):
             if os.path.isdir(directory):
@@ -385,14 +386,26 @@ def _assert_qt_runtime_loadable(bundle_root: str) -> None:
         load_flags = 0x00000100 | 0x00001000
         for path in required:
             try:
-                ctypes.WinDLL(path, winmode=load_flags)
+                library = ctypes.WinDLL(path, winmode=load_flags)
+                loaded_handles.append(library._handle)
             except OSError as e:
                 raise RuntimeError(
                     f"Qt runtime 加载失败，拒绝继续打包: {path}: {e}"
                 ) from e
     finally:
-        for directory in dll_dirs:
-            directory.close()
+        try:
+            # CDLL does not unload libraries automatically on Windows. Release
+            # the Qt handles so their shared runtime DLLs can be removed when
+            # the PyInstaller staging directory is flattened below.
+            free_library = ctypes.windll.kernel32.FreeLibrary
+            free_library.argtypes = [ctypes.c_void_p]
+            free_library.restype = ctypes.c_int
+            for handle in reversed(loaded_handles):
+                if not free_library(ctypes.c_void_p(handle)):
+                    raise ctypes.WinError(ctypes.get_last_error())
+        finally:
+            for directory in dll_dirs:
+                directory.close()
 
 
 def clean() -> None:

@@ -85,6 +85,12 @@ SETTING_HELP_LINKS = {
 
 
 SETTING_COMBO_OPTIONS = {
+    "auth_mode": (
+        ("inherit", "account.mode.inherit"),
+        ("account", "account.mode.account"),
+        ("anonymous", "account.mode.anonymous"),
+        ("manual", "account.mode.manual"),
+    ),
     "language": (
         ("简体中文", "settings.option.language.zh_cn"),
         ("繁體中文", "settings.option.language.zh_tw"),
@@ -747,6 +753,7 @@ class GlobalSettingsOldStyleReplicaPage(QWidget):
         left_col = QVBoxLayout()
         left_col.setSpacing(18)
         left_col.addWidget(self._build_appearance_card())
+        left_col.addWidget(self._build_account_card())
         left_col.addWidget(self._build_file_split_card())
         left_col.addWidget(self._build_network_card())
         left_col.addWidget(self._build_stream_record_card())
@@ -778,6 +785,13 @@ class GlobalSettingsOldStyleReplicaPage(QWidget):
         root.addWidget(scroll, 1)
         # 非默认语言启动时，外观卡/页头按当前语言显示
         self.retranslate_ui()
+
+    def _build_account_card(self):
+        from ui.account_panel import AccountPanel
+        panel = AccountPanel(self)
+        panel.saved.connect(self.saved.emit)
+        self._account_panel = panel
+        return self._setting_card("account.title", "#00A1D6", [panel])
 
     def _build_tag_manager_card(self):
         from ui.i18n import t
@@ -947,13 +961,16 @@ class GlobalSettingsOldStyleReplicaPage(QWidget):
             widget.setPlaceholderText(text)
         else:
             widget.setText(text)
+            if isinstance(widget, QPushButton) and widget.property("settingsCompact"):
+                widget.ensurePolished()
+                widget.setMinimumWidth(max(widget.minimumWidth(), widget.fontMetrics().horizontalAdvance(text) + 20))
 
     @staticmethod
     def _compact_button(button, *, height, min_width=0):
         button.setProperty("settingsCompact", True)
         button.setFixedHeight(height)
-        if min_width:
-            button.setMinimumWidth(min_width)
+        button.ensurePolished()
+        button.setMinimumWidth(max(min_width, button.fontMetrics().horizontalAdvance(button.text()) + 20))
         return button
 
     def _setting_card(self, title_key, color, items, title_prefix=""):
@@ -1627,14 +1644,15 @@ class GlobalSettingsOldStyleReplicaPage(QWidget):
         cred_summary = QLabel()
         cred_summary.setProperty("role", "muted")
         cred_summary.setStyleSheet("font-size: 13px;")
-        cred_summary.setText(self._format_credential_summary(get_global_setting("chat_credential") or ""))
-        self._cred_summary_label = cred_summary
+        room_id = getattr(self, "room_id", None)
+        cred_summary.setText(self._format_credential_summary(get_room_setting(room_id, "chat_credential") or ""))
+        self._chat_cred_summary_label = cred_summary
 
         edit_btn = self._compact_button(QPushButton(), height=30, min_width=52)
         self._bind_i18n(edit_btn, "settings.action.edit")
         edit_btn.setProperty("variant", "secondary")
         edit_btn.setStyleSheet("border: none;")
-        edit_btn.clicked.connect(self._open_cookie_overlay)
+        edit_btn.clicked.connect(self._open_chat_cookie_overlay)
 
         cred_row.addWidget(cred_summary)
         cred_row.addStretch()
@@ -1643,7 +1661,7 @@ class GlobalSettingsOldStyleReplicaPage(QWidget):
         # 凭据重置按钮（清除 cookie）
         def _do_cred_reset():
             self._save_setting("chat_credential", "")
-            self._cred_summary_label.setText(self._format_credential_summary(""))
+            self._chat_cred_summary_label.setText(self._format_credential_summary(""))
         cred_reset = self._reset_button("chat_credential", "")
 
         return self._setting_card("settings.group.chat", "#BB6BD9", [
@@ -1673,10 +1691,14 @@ class GlobalSettingsOldStyleReplicaPage(QWidget):
 
     def _open_cookie_overlay(self):
         """全局聊天凭据 cookie 编辑面板。"""
+        self._open_chat_cookie_overlay()
+
+    def _open_chat_cookie_overlay(self):
+        room_id = getattr(self, "room_id", None)
         self._open_cookie_overlay_impl(
-            load_value=lambda: get_global_setting("chat_credential") or "",
+            load_value=lambda: get_room_setting(room_id, "chat_credential") or "",
             save_value=lambda val: self._save_setting("chat_credential", val),
-            summary_label=getattr(self, "_cred_summary_label", None),
+            summary_label=getattr(self, "_chat_cred_summary_label", None),
         )
 
     def _open_cookie_overlay_impl(self, load_value, save_value, summary_label=None):
@@ -1771,6 +1793,11 @@ class GlobalSettingsOldStyleReplicaPage(QWidget):
         account_layout.addWidget(account_mid)
         vbox.addWidget(account_frame, 1)
 
+        from ui.account_panel import AsyncRunner
+        from core.bili_auth import BiliAuthClient
+        from core.cookies import parse_cookie
+        runner = AsyncRunner(panel)
+
         def _set_account_tone(tone):
             from ui.theme import repolish
             account_name.setProperty("statusTone", tone)
@@ -1789,37 +1816,18 @@ class GlobalSettingsOldStyleReplicaPage(QWidget):
             account_mid.setText("")
             _set_account_tone("neutral")
 
-            def _do_verify():
-                import urllib.request, json as _json
-                from core.http_ssl import urlopen as _ssl_urlopen
-                try:
-                    url = "https://api.bilibili.com/x/web-interface/nav"
-                    req = urllib.request.Request(url, headers={
-                        "User-Agent": "Mozilla/5.0",
-                        "Cookie": f"SESSDATA={sessdata}"
-                    })
-                    with _ssl_urlopen(req, timeout=10) as resp:
-                        data = _json.loads(resp.read())
-                    if data["code"] == 0 and data["data"]["isLogin"]:
-                        uname = data["data"]["uname"]
-                        mid = data["data"]["mid"]
-                        account_name.setText(f"✅  {uname}")
-                        account_mid.setText(f"UID: {mid}")
-                        _set_account_tone("success")
-                        account_name.setStyleSheet("font-size:14px; font-weight:600;")
-                    else:
-                        account_name.setText(t("settings.overlay.cookie_invalid"))
-                        account_mid.setText("")
-                        _set_account_tone("danger")
-                except Exception as e:
-                    account_name.setText(t("settings.overlay.network_error", error=e))
-                    account_mid.setText("")
+            def _verified(profile, error):
+                verify_btn.setEnabled(True)
+                verify_btn.setText(t("settings.overlay.verify_cookie"))
+                if error:
+                    account_name.setText(t("settings.overlay.cookie_invalid") if error == "expired" else t("account.network" if error == "network" else "account.response"))
                     _set_account_tone("danger")
-                finally:
-                    verify_btn.setEnabled(True)
-                    verify_btn.setText(t("settings.overlay.verify_cookie"))
+                else:
+                    account_name.setText(f"✅  {profile['uname']}")
+                    account_mid.setText(f"UID: {profile['uid']}")
+                    _set_account_tone("success")
 
-            threading.Thread(target=_do_verify, daemon=True).start()
+            runner.submit(lambda: BiliAuthClient().profile(parse_cookie(sessdata)), _verified)
 
         verify_btn.clicked.connect(_verify)
 
@@ -1839,11 +1847,18 @@ class GlobalSettingsOldStyleReplicaPage(QWidget):
         save_btn.setProperty("variant", "primary")
 
         def _close():
+            runner.cancel()
             panel.hide(); panel.deleteLater()
             mask.hide(); mask.deleteLater()
 
         def _save():
             val = inp.text().strip()
+            try:
+                parse_cookie(val)
+            except ValueError:
+                account_name.setText(t("account.response"))
+                _set_account_tone("danger")
+                return
             save_value(val)
             if summary_label is not None:
                 summary_label.setText(self._format_credential_summary(val))
@@ -2610,6 +2625,17 @@ class RoomSettingsPage(GlobalSettingsOldStyleReplicaPage):
     # ------------------------------------------------------------------
     def _build_cookie_card(self):
         from core.config import get_room_config as _grc
+        from core.config import set_room_auth_mode
+
+        mode = NoWheelComboBox()
+        mode.setObjectName("roomAuthMode")
+        _populate_combo(mode, "auth_mode")
+        _set_combo_value(mode, _grc(self.room_id).get("auth_mode", "inherit"))
+        self._combo_bindings.append((mode, "auth_mode", None))
+        self._auth_mode_combo = mode
+        mode.currentIndexChanged.connect(
+            lambda _index: (set_room_auth_mode(self.room_id, mode.currentData(Qt.UserRole)), self.saved.emit("auth_mode"))
+        )
 
         cred_widget = QWidget()
         cred_row = QHBoxLayout(cred_widget)
@@ -2632,6 +2658,7 @@ class RoomSettingsPage(GlobalSettingsOldStyleReplicaPage):
         cred_row.addStretch()
         cred_row.addWidget(edit_btn)
         return self._setting_card("settings.group.cookie", "#F59E0B", [
+            self._setting_item("account.room_mode", "account.room_mode_hint", mode),
             self._setting_item(
                 "SESSDATA",
                 "settings.room.cookie_desc",

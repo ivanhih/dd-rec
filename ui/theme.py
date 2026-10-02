@@ -489,6 +489,20 @@ QFrame#sidebarNavIndicator {{
     border: none;
     border-radius: 2px;
 }}
+QWidget#sidebar QToolButton#sidebarAccount {{
+    background-color: {t['control']};
+    border: 1px solid {t['control_border']};
+    border-radius: 12px;
+    font-size: 11px;
+    padding: 0;
+}}
+QWidget#sidebar QToolButton#sidebarAccount:hover {{
+    background-color: {t['control_hover']};
+    border-color: {t['primary']};
+}}
+QWidget#sidebar QToolButton#sidebarAccount:focus {{
+    border-color: {t['primary']};
+}}
 
 /* ===== 频道页工具栏 ===== */
 QToolButton#toolbarButton {{

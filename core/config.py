@@ -594,16 +594,14 @@ def _extract_sessdata(raw):
     return s
 
 
-def get_headers(room_id=None, monitor=False):
+def get_headers(room_id=None, monitor=False, *, media=False):
     headers = {
         "User-Agent": "Mozilla/5.0",
         "Referer": "https://live.bilibili.com/"
     }
-    if room_id:
-        room_cfg = CONFIG["rooms"].get(str(room_id), {})
-        sessdata = _extract_sessdata(room_cfg.get("sessdata", ""))
-        if sessdata:
-            headers["Cookie"] = f"SESSDATA={sessdata};"
+    credential = get_effective_cookie(room_id)
+    if credential:
+        headers["Cookie"] = credential
     # 如果为监控请求且专用监控代理已设置，则优先使用之
     if monitor:
         mon = get_global_setting("monitor_proxy") or ""
@@ -611,9 +609,10 @@ def get_headers(room_id=None, monitor=False):
             headers["_proxy"] = mon
             return headers
     # 根据代理模式决定是否使用代理
-    proxy_mode = get_global_setting("proxy_mode") or "禁用"
+    setting = (lambda key: get_room_setting(room_id, key)) if media and room_id is not None else get_global_setting
+    proxy_mode = setting("proxy_mode") or "禁用"
     if proxy_mode == "自定义":
-        proxy = get_global_setting("proxy") or ""
+        proxy = setting("proxy") or ""
         if proxy:
             headers["_proxy"] = proxy
     elif proxy_mode == "系统":
@@ -624,6 +623,44 @@ def get_headers(room_id=None, monitor=False):
         if proxy:
             headers["_proxy"] = proxy
     return headers
+
+
+def get_effective_cookie(room_id=None, *, chat=False):
+    """Resolve one account for API, media and chat, preserving legacy overrides."""
+    from core.cookies import cookie_header
+    from core.bili_auth import account_service
+
+    room = CONFIG["rooms"].get(str(room_id), {}) if room_id is not None else {}
+    mode = room.get("auth_mode", "inherit")
+    if mode == "anonymous":
+        return ""
+    if mode == "account":
+        return account_service().store.cookie()
+    manual = room.get("sessdata", "")
+    chat_override = room.get("overrides", {}).get("chat_credential", "")
+    if mode == "manual":
+        return cookie_header((chat_override or manual) if chat else manual)
+    if chat and "chat_credential" in room.get("overrides", {}):
+        return cookie_header(chat_override)
+    if manual:
+        return cookie_header(manual)
+    shared = account_service().store.cookie()
+    return shared or (cookie_header(get_global_setting("chat_credential")) if chat else "")
+
+
+def set_room_auth_mode(room_id, mode):
+    if mode not in {"inherit", "account", "anonymous", "manual"}:
+        raise ValueError("Invalid recording account mode")
+    get_room_config(room_id)["auth_mode"] = mode
+    save_config()
+
+
+def bind_all_rooms_to_account():
+    """Use the shared account without deleting any saved manual credentials."""
+    for room in CONFIG["rooms"].values():
+        if isinstance(room, dict):
+            room["auth_mode"] = "account"
+    save_config()
 
 
 # ==================== 应用数据存储 (channels) ====================

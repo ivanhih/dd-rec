@@ -501,10 +501,26 @@ class MainWindow(QMainWindow):
     def _startup_setup_timers(self):
         try:
             self.start_refresh_timer()
+            from ui.account_panel import AccountMonitor
+            self._account_monitor = AccountMonitor(self)
+            self._account_monitor.changed.connect(self._on_account_changed)
+            self._account_monitor.start()
         except Exception:
             logging.exception("start_refresh_timer 失败")
         self._startup_report(92)
         QTimer.singleShot(0, self._startup_setup_power)
+
+    def _on_account_changed(self):
+        from core.bili_auth import account_service
+        from ui.i18n import t
+        account = account_service().store.snapshot()
+        self.nav_account_btn.refresh()
+        status = account.get("status", "")
+        previous = getattr(self, "_account_status", "")
+        self._account_status = status
+        if status == "expired" and previous != "expired":
+            self.show_notification(t("account.expired_account"), t("account.title"),
+                                   "warning", merge_key="bili-account:expired")
 
     def _startup_setup_power(self):
         try:
@@ -905,6 +921,10 @@ class MainWindow(QMainWindow):
         sidebar_layout.setContentsMargins(8, 20, 8, 20)
         sidebar_layout.setSpacing(16)
 
+        from ui.account_panel import SidebarAccountButton
+        self.nav_account_btn = SidebarAccountButton(sidebar)
+        self._wire_hover(self.nav_account_btn, "", attr_name="_nav_account_tip")
+        self.nav_account_btn.clicked.connect(self.show_account_page)
         self.nav_channels_btn = self._create_sidebar_nav_button("📋", "")
         self._nav_channels_tip = self._wire_hover(self.nav_channels_btn, "", attr_name="_nav_channels_tip")
         self.nav_channels_btn.clicked.connect(self.show_channels_page)
@@ -918,6 +938,7 @@ class MainWindow(QMainWindow):
         self._nav_about_tip = self._wire_hover(self.nav_about_btn, "", attr_name="_nav_about_tip")
         self.nav_about_btn.clicked.connect(self.show_about_page)
 
+        sidebar_layout.addWidget(self.nav_account_btn)
         sidebar_layout.addWidget(self.nav_channels_btn)
         sidebar_layout.addWidget(self.nav_history_btn)
         sidebar_layout.addWidget(self.nav_settings_btn)
@@ -1076,6 +1097,8 @@ class MainWindow(QMainWindow):
 
     def _on_global_setting_saved(self, key=""):
         from ui.i18n import t
+        if key == "bili_account":
+            self._on_account_changed()
         self.show_notification(
             t("common.success"),
             t("common.save_settings"),
@@ -1912,6 +1935,17 @@ class MainWindow(QMainWindow):
         self.global_settings_page.load_settings()
         self.page_stack.slide_to(self.settings_page)
         self._update_sidebar_nav_styles()
+
+    def show_account_page(self):
+        from core.bili_auth import account_service
+        self.show_global_settings_page()
+        panel = self.global_settings_page._account_panel
+        panel.refresh()
+        scroll = self.global_settings_page.findChild(QScrollArea)
+        if scroll is not None:
+            scroll.ensureWidgetVisible(panel, 0, 24)
+        if account_service().store.snapshot().get("status") != "active":
+            panel.login()
 
     def show_global_settings(self):
         self.show_global_settings_page()

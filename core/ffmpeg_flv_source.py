@@ -37,6 +37,7 @@ class FfmpegFlvSource:
         log_path: str = "",
         read_size: int = 64 * 1024,
         ffmpeg_cmd: str = FFMPEG_CMD,
+        headers_provider=None,
     ):
         self.url = url
         self.on_data = on_data
@@ -46,6 +47,8 @@ class FfmpegFlvSource:
         self.log_path = log_path
         self.read_size = read_size
         self.ffmpeg_cmd = ffmpeg_cmd
+        self.headers_provider = headers_provider
+        self._relay = None
         self.stats = FfmpegFlvSourceStats()
 
         self._stop = threading.Event()
@@ -54,7 +57,9 @@ class FfmpegFlvSource:
         self._stderr_file = None
 
     def build_command(self) -> list[str]:
-        user_agent = self.headers.get("User-Agent", "Mozilla/5.0")
+        from core.cookies import ffmpeg_headers
+        active_headers = {} if self._relay is not None else self.headers
+        user_agent = active_headers.get("User-Agent", "Mozilla/5.0")
         referer = self.headers.get("Referer", "https://live.bilibili.com/")
         return [
             self.ffmpeg_cmd,
@@ -73,9 +78,9 @@ class FfmpegFlvSource:
             "-user_agent",
             user_agent,
             "-headers",
-            f"Referer: {referer}\r\n",
+            ffmpeg_headers({"Referer": referer, **active_headers}),
             "-i",
-            self.url,
+            self._relay.url if self._relay is not None else self.url,
             "-map",
             "0:v:0",
             "-map",
@@ -94,6 +99,10 @@ class FfmpegFlvSource:
             return
         self._stop.clear()
         self.stats = FfmpegFlvSourceStats(started_at=time.time())
+        if self.headers_provider is not None:
+            from core.media_http import MediaRelay
+            self._relay = MediaRelay(self.url, self.headers_provider)
+            self._relay.start()
         stderr_target = subprocess.DEVNULL
         if self.log_path:
             try:
@@ -111,9 +120,15 @@ class FfmpegFlvSource:
             bufsize=0,
         )
         kwargs.update(hidden_subprocess_kwargs(new_process_group=True))
+        if self._relay is not None:
+            from core.media_http import loopback_process_env
+            kwargs["env"] = loopback_process_env(self.env)
         try:
             self._process = subprocess.Popen(self.build_command(), **kwargs)
         except Exception:
+            if self._relay is not None:
+                self._relay.stop()
+                self._relay = None
             self._close_stderr()
             raise
         self._thread = threading.Thread(
@@ -150,6 +165,9 @@ class FfmpegFlvSource:
             thread.join(timeout=2.0)
         self.stats.stopped_at = time.time()
         self._close_stderr()
+        if self._relay is not None:
+            self._relay.stop()
+            self._relay = None
 
     @property
     def is_running(self) -> bool:
@@ -202,6 +220,8 @@ class FfmpegFlvSource:
                     self.stats.returncode = proc.returncode
             self.stats.stopped_at = time.time()
             self._close_stderr()
+            if self._relay is not None:
+                self._relay.stop()
             if not self._stop.is_set():
                 try:
                     self.on_disconnected(reason)

@@ -39,6 +39,7 @@ ffprobe
 # User runtime state (跨机器，含真实房间号/路径)
 data.json
 config.json
+userdata/
 .codegraph/
 
 # ==================== 打包构建产物 ====================
