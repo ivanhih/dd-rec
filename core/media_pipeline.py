@@ -49,6 +49,7 @@ class ArtifactResult:
     error: str = ""
     health: str = ""
     probe: dict = field(default_factory=dict)
+    continuity: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         d = asdict(self)
@@ -427,6 +428,17 @@ class MediaPipeline:
             close_reason=job.get("close_reason", ""),
             health=job.get("health_hint", ""),
         )
+        try:
+            with open(src + ".media.json", "r", encoding="utf-8") as handle:
+                media_manifest = json.load(handle)
+            result.continuity = {key: media_manifest[key] for key in (
+                "diagnostics_version", "wall_duration_ms", "media_progress_gap_ms", "health_intervals",
+                "transport_gaps", "recovery_events", "continuity_log_path"
+            ) if key in media_manifest}
+            if media_manifest.get("health") in ("degraded", "failed"):
+                result.health = media_manifest["health"]
+        except (OSError, ValueError, TypeError):
+            pass  # Legacy and non-native recordings do not have this manifest.
         if not src or not os.path.exists(src):
             result.error = "source_missing"
             return result

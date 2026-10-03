@@ -12,6 +12,7 @@ import json
 import urllib.request
 import uuid
 from collections import deque
+from dataclasses import replace
 from typing import Optional
 from urllib.parse import urlparse
 from PySide6.QtCore import QObject, Signal, QThread
@@ -20,13 +21,14 @@ from core.config import (
     get_global_setting, get_room_setting, get_room_config, get_effective_format,
     get_effective_save_dir, VIDEO_SAVE_DIR, RESOURCE_DIR, get_headers, get_effective_cookie
 )
-from core.bili_api import build_endpoint_identity, get_bili_info, get_stream_info
+from core.bili_api import build_endpoint_identity, get_bili_info, get_stream_info, normalize_codec_name
 from core.utils import format_size, render_path_template
 from core.danmaku_recorder import DanmakuRecorder
 from core.ffmpeg_tools import FFMPEG_CMD as _FFMPEG_FROM_TOOLS, hidden_subprocess_kwargs
 from core.media_pipeline import ArtifactResult, ArtifactStatus, get_default_pipeline
 from core.flv.session import FlvCaptureSession, CaptureEvent
 from core.flv.health import FlvHealthConfig, FlvMediaHealth
+from core.flv.cdn_policy import CdnPolicy, REFRESH_SLOTS
 from core.stream_source import StreamSource
 from core.ffmpeg_flv_source import FfmpegFlvSource
 from core.http_ssl import urlopen as _ssl_urlopen
@@ -662,6 +664,18 @@ class BiliRecorder(QObject):
         self._native_recovery_reason = ""
         self._native_recovery_from_endpoint = ""
         self._native_recovery_candidate_endpoint = ""
+        self._cdn_policy = CdnPolicy(self.room_id)
+        self._native_media_ready_generation = None
+        self._native_failed_generation = None
+        self._native_stable_generation = None
+        self._cdn_attempts = 0
+        self._slow_retry_attempts = 0
+        self._candidate_refresh_at = 0.0
+        self._candidate_refresh_failures = 0
+        self._native_no_media_since = None
+        self._native_speed_deadline = 0.0
+        self._native_speed_generation = None
+        self._native_validation_failed_generation = None
 
     @property
     def is_recording(self):
@@ -806,6 +820,7 @@ class BiliRecorder(QObject):
                     "status": str(getattr(result.status, "value", result.status) or "success"),
                     "close_reason": result.close_reason or "",
                     "session_id": result.session_id or self.current_session_id,
+                    "continuity": result.continuity,
                 })
             except Exception:
                 logging.debug("append recording history failed", exc_info=True)
@@ -846,6 +861,7 @@ class BiliRecorder(QObject):
                     "status": str(getattr(result.status, "value", result.status) or "failed"),
                     "close_reason": result.error or ",".join(result.warnings or []) or "artifact_failed",
                     "session_id": result.session_id or self.current_session_id,
+                    "continuity": result.continuity,
                 })
             except Exception:
                 logging.debug("append failed recording history failed", exc_info=True)
@@ -948,16 +964,47 @@ class BiliRecorder(QObject):
                 self.room_id, "flv_cdn_failover_recovery_lag_sec"
             ),
             "cooldown_s": get_room_setting(self.room_id, "flv_cdn_failover_cooldown_sec"),
+            "speed_window_s": get_room_setting(self.room_id, "flv_cdn_speed_window_sec"),
+            "slow_speed_ratio": get_room_setting(self.room_id, "flv_cdn_slow_speed_ratio"),
+            "recovery_speed_ratio": get_room_setting(self.room_id, "flv_cdn_recovery_speed_ratio"),
+            "recovery_sustain_s": get_room_setting(self.room_id, "flv_cdn_recovery_sustain_sec"),
+            "stall_s": get_room_setting(self.room_id, "flv_cdn_media_stall_sec"),
         })
 
     def _endpoint_quarantine_seconds(self) -> float:
         try:
             value = float(
-                get_room_setting(self.room_id, "flv_cdn_endpoint_quarantine_sec") or 300
+                get_room_setting(self.room_id, "flv_cdn_endpoint_quarantine_sec")
             )
         except (TypeError, ValueError):
             value = 300.0
         return max(0.0, min(3600.0, value))
+
+    def _native_policy(self) -> CdnPolicy:
+        if getattr(self, "_cdn_policy", None) is None:
+            self._cdn_policy = CdnPolicy(self.room_id)
+        return self._cdn_policy
+
+    def _active_candidate(self) -> dict:
+        endpoint = str(getattr(self, "_current_endpoint_id", "") or "")
+        return next((dict(item) for item in getattr(self, "_cdn_candidates", [])
+                     if item.get("endpoint_id") == endpoint),
+                    {"endpoint_id": endpoint, "url": endpoint})
+
+    def _record_native_failure(self, now: float, reason: str):
+        generation = getattr(self, "_source_gen", 0)
+        if getattr(self, "_native_failed_generation", None) == generation:
+            return
+        self._native_failed_generation = generation
+        self._native_stable_generation = None
+        candidate = self._active_candidate()
+        endpoint = candidate["endpoint_id"]
+        if endpoint:
+            until = self._native_policy().note_failure(
+                candidate, now, self._endpoint_quarantine_seconds(),
+                "media_stall" if reason == "cdn_failover_slow" else reason,
+            )
+            self._endpoint_quarantine[endpoint] = until
 
     def _native_outage_restart_seconds(self) -> float:
         try:
@@ -983,6 +1030,9 @@ class BiliRecorder(QObject):
         self._native_outage_active = True
         self._native_recovery_pending = False
         self._native_recovery_deadline = 0.0
+        self._native_speed_deadline = 0.0
+        if getattr(self, "_native_no_media_since", None) is None:
+            self._native_no_media_since = float(now)
         self._native_outage_attempts = max(
             1, int(getattr(self, "_native_outage_attempts", 0) or 0)
         )
@@ -1010,7 +1060,7 @@ class BiliRecorder(QObject):
         self._cdn_candidates = candidates
         self._cdn_index = 0
         self._current_endpoint_id = candidates[0].get("endpoint_id", "") if candidates else ""
-        self._locked_codec = str(stream_info.get("codec") or "").lower()
+        self._locked_codec = normalize_codec_name(stream_info.get("codec") or "")
         self._locked_format = str(stream_info.get("format") or "").lower()
         self._locked_qn = str(stream_info.get("qn") or "")
         self._cdn_failovers = 0
@@ -1026,6 +1076,10 @@ class BiliRecorder(QObject):
         self._native_recovery_reason = ""
         self._native_recovery_from_endpoint = ""
         self._native_recovery_candidate_endpoint = ""
+        self._native_media_ready_generation = None
+        self._native_stable_generation = None
+        self._slow_retry_attempts = 0
+        self._clear_native_fault_context()
         with self._source_events_lock:
             self._source_events.clear()
 
@@ -1071,11 +1125,33 @@ class BiliRecorder(QObject):
         except Exception:
             return "unknown"
 
-    def _refresh_native_candidates(self) -> bool:
-        refreshed = get_stream_info(self.room_id)
+    def _refresh_native_candidates(self, now: Optional[float] = None) -> bool:
+        now = time.monotonic() if now is None else float(now)
+        if now < float(getattr(self, "_candidate_refresh_at", 0.0)):
+            return False
+        if not REFRESH_SLOTS.acquire(blocking=False):
+            self._candidate_refresh_at = now + 1.0
+            return False
+        generation = getattr(self, "_source_gen", 0)
+        try:
+            refreshed = get_stream_info(self.room_id)
+        finally:
+            REFRESH_SLOTS.release()
+        try:
+            interval = float(get_room_setting(self.room_id, "flv_cdn_refresh_interval_sec"))
+        except (TypeError, ValueError):
+            interval = 30.0
+        interval = max(5.0, min(120.0, interval))
+        failures = int(getattr(self, "_candidate_refresh_failures", 0))
+        # Deterministic room jitter spreads refreshes without making replay flaky.
+        jitter = 1.0 + (sum(str(self.room_id).encode("utf-8")) % 101) / 1000.0
+        self._candidate_refresh_at = now + min(120.0, interval * 2 ** min(failures, 2) * jitter)
+        self._candidate_refresh_failures = 0 if refreshed else failures + 1
+        if generation != getattr(self, "_source_gen", 0):
+            return False
         if not refreshed:
             return False
-        refreshed_codec = str(refreshed.get("codec") or "").lower()
+        refreshed_codec = normalize_codec_name(refreshed.get("codec") or "")
         refreshed_format = str(refreshed.get("format") or "").lower()
         refreshed_qn = str(refreshed.get("qn") or "")
         if (refreshed_codec, refreshed_format) != (
@@ -1097,6 +1173,12 @@ class BiliRecorder(QObject):
         if not candidates:
             return False
         if refreshed_qn != self._locked_qn:
+            if not get_room_setting(self.room_id, "flv_cdn_allow_quality_change"):
+                logging.warning(
+                    f"[cdn] room={self.room_id} rejected refreshed quality "
+                    f"qn={self._locked_qn or 'unknown'}->{refreshed_qn or 'unknown'}"
+                )
+                return False
             logging.warning(
                 f"[cdn] room={self.room_id} accepting refreshed quality "
                 f"qn={self._locked_qn or 'unknown'}->{refreshed_qn or 'unknown'}"
@@ -1124,7 +1206,9 @@ class BiliRecorder(QObject):
             if float(until) > now
         }
         def eligible_candidates(include_current: bool):
-            for index, candidate in enumerate(self._cdn_candidates):
+            indexed = [dict(item, _index=index) for index, item in enumerate(self._cdn_candidates)]
+            for candidate in self._native_policy().ranked(indexed, now):
+                index = candidate["_index"]
                 endpoint = str(candidate.get("endpoint_id") or "")
                 if (
                     not endpoint
@@ -1132,7 +1216,8 @@ class BiliRecorder(QObject):
                     or (not include_current and endpoint == self._current_endpoint_id)
                     or (
                         not allow_quarantined
-                        and float(self._endpoint_quarantine.get(endpoint, 0.0)) > now
+                        and max(float(self._endpoint_quarantine.get(endpoint, 0.0)),
+                                self._native_policy().blocked_until(candidate)) > now
                     )
                 ):
                     continue
@@ -1149,7 +1234,7 @@ class BiliRecorder(QObject):
                 item = dict(candidate)
                 item["_index"] = index
                 return item, allow_refresh
-        if allow_refresh and self._refresh_native_candidates():
+        if allow_refresh and self._refresh_native_candidates(now):
             return self._next_native_candidate(
                 now,
                 attempted,
@@ -1172,6 +1257,8 @@ class BiliRecorder(QObject):
         if self._capture_mode != "flv" or self._flv_session is None or self._source_transition:
             return False
         now = time.monotonic() if now is None else float(now)
+        if getattr(self, "_stream_source", None) is not None:
+            self._record_native_failure(now, reason)
         attempted: set = set()
         candidate, refresh_available = self._next_native_candidate(
             now,
@@ -1180,39 +1267,24 @@ class BiliRecorder(QObject):
             allow_current=allow_current,
             allow_quarantined=allow_quarantined,
         )
-        if candidate is None and reason == "cdn_failover_slow" and not allow_quarantined:
-            candidate, refresh_available = self._next_native_candidate(
-                now,
-                attempted,
-                allow_refresh=False,
-                allow_current=False,
-                allow_quarantined=True,
-            )
-            if candidate is not None:
-                candidate["_quarantine_override"] = True
-                logging.warning(
-                    f"[cdn] room={self.room_id} overriding endpoint quarantine "
-                    f"for stalled stream host={self._candidate_host(candidate)}"
-                )
         if candidate is None:
             logging.warning(f"[cdn] room={self.room_id} same-spec candidates exhausted")
             return False
 
-        recovery_allow_quarantined = allow_quarantined or bool(
-            candidate.get("_quarantine_override")
-        )
         self._source_transition = True
         session = self._flv_session
         old_source = self._stream_source
-        old_endpoint = self._current_endpoint_id
         reset_done = False
         try:
             self._source_gen = getattr(self, "_source_gen", 0) + 1
             self._stream_source = None
-            if old_endpoint:
-                self._endpoint_quarantine[old_endpoint] = (
-                    now + self._endpoint_quarantine_seconds()
-                )
+            self._native_media_ready_generation = None
+            self._native_speed_deadline = 0.0
+            self._native_speed_generation = None
+            self._native_validation_failed_generation = None
+            if getattr(self, "_native_no_media_since", None) is None:
+                self._native_no_media_since = now
+            self._cdn_attempts = int(getattr(self, "_cdn_attempts", 0)) + 1
 
             while candidate is not None:
                 endpoint = str(candidate.get("endpoint_id") or "")
@@ -1251,20 +1323,21 @@ class BiliRecorder(QObject):
                         source.stop(wait=0)
                     except Exception:
                         pass
-                    self._endpoint_quarantine[endpoint] = (
-                        now + self._endpoint_quarantine_seconds()
-                    )
+                    self._record_native_failure(now, "source_start_failed")
                     logging.warning(
                         f"[cdn] room={self.room_id} source start failed "
                         f"host={self._candidate_host(candidate)} error={type(exc).__name__}"
                     )
                     self._source_gen += 1
+                    if allow_quarantined:
+                        # An outage gets one emergency probe per retry budget.
+                        return False
                     candidate, refresh_available = self._next_native_candidate(
                         now,
                         attempted,
                         allow_refresh=refresh_available,
                         allow_current=allow_current,
-                        allow_quarantined=recovery_allow_quarantined,
+                        allow_quarantined=False,
                     )
                     continue
 
@@ -1272,7 +1345,7 @@ class BiliRecorder(QObject):
                     f"[cdn] room={self.room_id} recovery attempt launched reason={reason} "
                     f"host={self._candidate_host(candidate)} "
                     f"candidate={self._cdn_index + 1}/{len(self._cdn_candidates)} "
-                    f"quarantine_override={bool(candidate.get('_quarantine_override'))}"
+                    f"emergency_probe={bool(allow_quarantined)}"
                 )
                 return True
             return False
@@ -1281,7 +1354,13 @@ class BiliRecorder(QObject):
 
     def _publish_flv_health(self, decision, now: float):
         state = str(decision.state or "")
-        display = "degraded" if state in ("degraded", "failover_pending") else "healthy"
+        verifying = bool(getattr(self, "_native_recovery_pending", False))
+        display = "degraded" if state in ("degraded", "failover_pending") or verifying else "healthy"
+        detail = ("verifying media speed; " if verifying else "") + decision.detail
+        self._last_segment_health = display
+        self._last_capture_issue = detail if display == "degraded" else ""
+        if verifying:
+            state = "verifying:" + state
         if state in ("startup", "disabled"):
             return
         if self._suppress_segment_healthy and display == "healthy":
@@ -1293,14 +1372,61 @@ class BiliRecorder(QObject):
             return
         self._health_ui_last_state = state
         self._health_ui_last_emit = now
-        self._last_segment_health = display
-        self._last_capture_issue = decision.detail if display == "degraded" else ""
         try:
             self.segment_health_updated.emit(
-                self.room_id, display, str(decision.detail or state)[:160]
+                self.room_id, display, str(detail or state)[:160]
             )
         except Exception:
             pass
+
+    def _complete_native_recovery(self, now: float, generation: int):
+        with self._native_state_guard():
+            if (generation != getattr(self, "_source_gen", -1)
+                    or generation != getattr(self, "_native_media_ready_generation", None)
+                    or not getattr(self, "_native_recovery_pending", False)):
+                return
+            started = float(getattr(self, "_native_outage_started_at", now) or now)
+            reason = self._native_recovery_reason
+            previous = self._native_recovery_from_endpoint
+            candidate = self._active_candidate()
+            self._native_outage_active = False
+            self._native_recovery_pending = False
+            self._native_outage_attempts = 0
+            self._slow_retry_attempts = 0
+            self._native_retry_at = 0.0
+            self._native_recovery_deadline = 0.0
+            self._native_outage_started_at = 0.0
+            self._native_disconnect_boundary_closed = False
+            self._native_recovery_reason = ""
+            self._native_recovery_from_endpoint = ""
+            self._native_recovery_candidate_endpoint = ""
+            self._clear_native_fault_context()
+            self._native_stable_generation = generation
+            self._native_failed_generation = None
+            self._suppress_segment_healthy = False
+            self._cdn_failovers = int(getattr(self, "_cdn_failovers", 0)) + 1
+            self._reconnects = int(getattr(self, "_reconnects", 0)) + 1
+        self._native_policy().note_stable(candidate, now)
+        self._endpoint_quarantine.pop(candidate["endpoint_id"], None)
+        self._flv_health.complete_failover(now, True)
+        self._flv_session.note_recovery_outcome("recovery_verified", now)
+        logging.warning(
+            f"[cdn] room={self.room_id} recovered reason={reason or 'cdn_recovery'} "
+            f"from_host={urlparse(previous).hostname or 'unknown'} "
+            f"to_host={self._candidate_host(candidate)} "
+            f"recovery_ms={max(0, round((now - started) * 1000))} speed_verified=True"
+        )
+        return True
+
+    def _clear_native_fault_context(self):
+        self._native_outage_started_at = 0.0
+        self._native_recovery_reason = ""
+        self._native_recovery_from_endpoint = ""
+        self._native_recovery_candidate_endpoint = ""
+        self._native_no_media_since = None
+        self._native_speed_deadline = 0.0
+        self._native_speed_generation = None
+        self._native_validation_failed_generation = None
 
     def _poll_native_flv(self, now: Optional[float] = None):
         if self._capture_mode != "flv" or self._flv_session is None:
@@ -1322,24 +1448,26 @@ class BiliRecorder(QObject):
             logging.warning(
                 f"[cdn] room={self.room_id} source disconnected reason={reason}"
             )
+            self._record_native_failure(now, reason)
+            if getattr(self, "_native_no_media_since", None) is None:
+                self._native_no_media_since = now
             with self._native_state_guard():
                 outage_active = bool(getattr(self, "_native_outage_active", False))
                 recovery_pending = bool(getattr(self, "_native_recovery_pending", False))
             if outage_active or recovery_pending:
                 endpoint = str(getattr(self, "_current_endpoint_id", "") or "")
-                if endpoint:
-                    self._endpoint_quarantine[endpoint] = (
-                        now + self._endpoint_quarantine_seconds()
-                    )
                 source = getattr(self, "_stream_source", None)
                 self._stream_source = None
                 self._source_gen = active_generation + 1
-                self._flv_session.set_active_source_generation(self._source_gen)
+                if getattr(self, "_native_media_ready_generation", None) == active_generation:
+                    self._flv_session.reset_for_reconnect(
+                        "cdn_outage", source_generation=self._source_gen
+                    )
+                else:
+                    self._flv_session.set_active_source_generation(self._source_gen)
                 if source is not None:
                     source.stop(wait=0)
-                self._native_outage_attempts = max(
-                    1, int(getattr(self, "_native_outage_attempts", 0) or 0)
-                )
+                self._native_outage_attempts = int(getattr(self, "_native_outage_attempts", 0)) + 1
                 self._schedule_native_outage_retry(now)
                 logging.warning(
                     f"[cdn] room={self.room_id} all candidates unavailable; "
@@ -1360,7 +1488,9 @@ class BiliRecorder(QObject):
             with self._native_state_guard():
                 still_pending = bool(self._native_outage_active and self._native_recovery_pending)
                 if succeeded and still_pending:
-                    self._native_disconnect_boundary_closed = True
+                    self._native_disconnect_boundary_closed = (
+                        getattr(self, "_native_media_ready_generation", None) != self._source_gen
+                    )
                     self._native_recovery_deadline = completed_at + 15.0
             if not succeeded:
                 self._native_recovery_pending = False
@@ -1370,11 +1500,6 @@ class BiliRecorder(QObject):
                         "cdn_outage", source_generation=self._source_gen
                     )
                     self._native_disconnect_boundary_closed = True
-                endpoint = str(getattr(self, "_current_endpoint_id", "") or "")
-                if endpoint:
-                    self._endpoint_quarantine[endpoint] = (
-                        now + self._endpoint_quarantine_seconds()
-                    )
                 retry_base = transition_now()
                 self._native_outage_attempts = 1
                 self._schedule_native_outage_retry(retry_base)
@@ -1385,13 +1510,26 @@ class BiliRecorder(QObject):
                 )
             return
 
+        if (getattr(self, "_native_recovery_pending", False)
+                and getattr(self, "_native_media_ready_generation", None) == active_generation):
+            # A first GOP permits writing and health sampling, not successful recovery.
+            self._native_outage_active = False
+            self._native_recovery_deadline = 0.0
+            self._native_no_media_since = None
+            if getattr(self, "_native_speed_generation", None) != active_generation:
+                self._native_speed_generation = active_generation
+                verification_s = float(self._flv_health.config.recovery_sustain_s) if isinstance(
+                    self._flv_health, FlvMediaHealth
+                ) else 20.0
+                self._native_speed_deadline = now + max(45.0, verification_s * 2.0 + 15.0)
+
         if getattr(self, "_native_outage_active", False):
-            outage_started_at = float(
-                getattr(self, "_native_outage_started_at", 0.0) or 0.0
+            outage_started_at = getattr(
+                self, "_native_no_media_since", getattr(self, "_native_outage_started_at", None)
             )
             if (
-                outage_started_at
-                and now - outage_started_at >= self._native_outage_restart_seconds()
+                outage_started_at is not None
+                and now - float(outage_started_at) >= self._native_outage_restart_seconds()
             ):
                 logging.error(
                     f"[cdn] room={self.room_id} outage persisted "
@@ -1411,13 +1549,9 @@ class BiliRecorder(QObject):
                             and getattr(self, "_native_recovery_pending", False)
                         ):
                             next_generation = generation + 1
+                            self._record_native_failure(now, "first_media_timeout")
                             self._source_gen = next_generation
                             self._stream_source = None
-                            endpoint = str(getattr(self, "_current_endpoint_id", "") or "")
-                            if endpoint:
-                                self._endpoint_quarantine[endpoint] = (
-                                    now + self._endpoint_quarantine_seconds()
-                                )
                             self._native_outage_attempts = max(
                                 1, int(getattr(self, "_native_outage_attempts", 0) or 0)
                             )
@@ -1434,7 +1568,7 @@ class BiliRecorder(QObject):
             self._native_outage_attempts = max(
                 1, int(getattr(self, "_native_outage_attempts", 0) or 0) + 1
             )
-            self._refresh_native_candidates()
+            self._refresh_native_candidates(now)
             self._native_recovery_pending = True
             self._native_recovery_deadline = now + 15.0
             self._native_recovery_reason = "cdn_outage_retry"
@@ -1462,8 +1596,53 @@ class BiliRecorder(QObject):
             return
         decision = self._flv_health.observe(now, self._flv_session.progress_snapshot())
         self._last_flv_health_decision = decision
+        if decision.recovery_ready is True:
+            if getattr(self, "_native_recovery_pending", False):
+                if self._complete_native_recovery(now, active_generation):
+                    decision = replace(decision, state="healthy", state_changed=True,
+                                       detail="speed verified; " + decision.detail)
+                    self._last_flv_health_decision = decision
+            elif getattr(self, "_native_stable_generation", None) != active_generation:
+                self._native_policy().note_stable(self._active_candidate(), now)
+                self._endpoint_quarantine.pop(self._current_endpoint_id, None)
+                self._native_stable_generation = active_generation
+                self._native_failed_generation = None
+                self._slow_retry_attempts = 0
+                self._native_retry_at = 0.0
+                if getattr(self, "_native_outage_started_at", 0.0):
+                    self._flv_session.note_recovery_outcome("same_source_verified", now)
+                self._clear_native_fault_context()
+        deadline = float(getattr(self, "_native_speed_deadline", 0.0))
+        switching_enabled = (not isinstance(self._flv_health, FlvMediaHealth)
+                             or self._flv_health.config.enabled)
+        if (getattr(self, "_native_recovery_pending", False) and deadline
+                and now >= deadline and decision.recovery_ready is not True):
+            self._native_recovery_pending = False
+            self._native_speed_deadline = 0.0
+            self._native_validation_failed_generation = active_generation
+            self._suppress_segment_healthy = False
+            self._flv_session.note_transport_issue(
+                "recovery_speed_timeout", decision.lag_ms, "sustained media speed not verified"
+            )
+            self._flv_session.note_recovery_outcome("recovery_speed_timeout", now)
+            decision = replace(decision, state="degraded", should_failover=switching_enabled,
+                               detail="speed verification timed out; " + decision.detail)
+        elif getattr(self, "_native_validation_failed_generation", None) == active_generation:
+            decision = replace(decision, state="degraded",
+                               should_failover=switching_enabled and now >= float(getattr(self, "_native_retry_at", 0.0)),
+                               detail="speed verification failed; " + decision.detail)
+        self._last_flv_health_decision = decision
         self._publish_flv_health(decision, now)
+        self._flv_session.note_transport_health(
+            "verifying" if getattr(self, "_native_recovery_pending", False) else decision.state,
+            getattr(self, "_last_capture_issue", "") or decision.detail, now,
+        )
         if decision.should_failover:
+            if now < float(getattr(self, "_native_retry_at", 0.0)):
+                self._flv_health.complete_failover(now, False)
+                return
+            previous_generation = active_generation
+            was_verifying = bool(getattr(self, "_native_recovery_pending", False))
             detail = (
                 f"lag_ms={int(decision.lag_ms)} generation={int(decision.transport_generation)} "
                 f"endpoint={self._current_endpoint_id or 'unknown'}"
@@ -1475,7 +1654,8 @@ class BiliRecorder(QObject):
             self._native_outage_active = True
             self._native_recovery_pending = True
             self._native_recovery_deadline = now + 15.0
-            self._native_outage_started_at = now
+            if not getattr(self, "_native_outage_started_at", 0.0):
+                self._native_outage_started_at = now
             self._native_recovery_reason = "cdn_failover_slow"
             self._native_recovery_from_endpoint = str(
                 getattr(self, "_current_endpoint_id", "") or ""
@@ -1485,23 +1665,28 @@ class BiliRecorder(QObject):
             if launched:
                 with self._native_state_guard():
                     if self._native_outage_active and self._native_recovery_pending:
-                        self._native_disconnect_boundary_closed = True
+                        self._native_disconnect_boundary_closed = (
+                            getattr(self, "_native_media_ready_generation", None) != self._source_gen
+                        )
                         self._native_recovery_deadline = completed_at + 15.0
             else:
-                self._native_recovery_pending = False
-                source = getattr(self, "_stream_source", None)
-                self._stream_source = None
-                self._source_gen = getattr(self, "_source_gen", 0) + 1
-                self._flv_session.set_active_source_generation(self._source_gen)
-                if source is not None:
-                    source.stop(wait=0)
-                if not self._native_disconnect_boundary_closed:
-                    self._flv_session.reset_for_reconnect(
-                        "cdn_outage", source_generation=self._source_gen
+                if (getattr(self, "_source_gen", -1) == previous_generation
+                        and getattr(self, "_stream_source", None) is not None):
+                    # No eligible replacement: keep every byte the slow source supplies.
+                    self._native_outage_active = False
+                    self._native_recovery_pending = was_verifying
+                    self._native_recovery_deadline = 0.0
+                    self._slow_retry_attempts = int(getattr(self, "_slow_retry_attempts", 0)) + 1
+                    delay = min(120.0, 30.0 * 2 ** min(self._slow_retry_attempts - 1, 2))
+                    self._native_retry_at = completed_at + delay
+                    self._flv_health.complete_failover(completed_at, False)
+                    logging.warning(
+                        f"[cdn] room={self.room_id} retaining slow source; retry in {delay:.0f}s"
                     )
-                    self._native_disconnect_boundary_closed = True
-                self._native_outage_attempts = 1
-                self._schedule_native_outage_retry(completed_at)
+                else:
+                    self._native_recovery_pending = False
+                    self._native_outage_attempts = int(getattr(self, "_native_outage_attempts", 0)) + 1
+                    self._schedule_native_outage_retry(completed_at)
 
     def _start_flv_capture(
         self,
@@ -1523,6 +1708,7 @@ class BiliRecorder(QObject):
             on_event=self._on_flv_event,
             require_audio=True,
             require_video=True,
+            diagnostics_path=os.path.splitext(save_path)[0] + ".session.jsonl",
         )
         session.start()
         self._flv_session = session
@@ -1670,57 +1856,31 @@ class BiliRecorder(QObject):
                 f"config_size={payload.get('audio_config_size') or 0}"
             )
         elif event == CaptureEvent.RECOVERED:
-            recovered_generation = payload.get("source_generation")
-            recovered_at = time.monotonic()
+            generation = payload.get("source_generation")
             with self._native_state_guard():
-                if (
-                    recovered_generation is None
-                    or int(recovered_generation) != int(getattr(self, "_source_gen", -1))
-                ):
+                if (generation is None or int(generation) != int(getattr(self, "_source_gen", -1))
+                        or generation == getattr(self, "_native_media_ready_generation", None)):
                     return
-                was_recovery_pending = bool(
-                    getattr(self, "_native_outage_active", False)
-                    or getattr(self, "_native_recovery_pending", False)
-                )
-                reason = str(getattr(self, "_native_recovery_reason", "") or "")
-                from_endpoint = str(
-                    getattr(self, "_native_recovery_from_endpoint", "") or ""
-                )
-                to_endpoint = str(
-                    getattr(self, "_native_recovery_candidate_endpoint", "")
-                    or getattr(self, "_current_endpoint_id", "")
-                    or ""
-                )
-                started_at = float(getattr(self, "_native_outage_started_at", 0.0) or 0.0)
-                self._suppress_segment_healthy = False
-                self._native_outage_active = False
-                self._native_recovery_pending = False
-                self._native_outage_attempts = 0
-                self._native_retry_at = 0.0
-                self._native_recovery_deadline = 0.0
-                self._native_outage_started_at = 0.0
+                self._native_media_ready_generation = int(generation)
+                self._native_no_media_since = None
                 self._native_disconnect_boundary_closed = False
-                self._native_recovery_reason = ""
-                self._native_recovery_from_endpoint = ""
-                self._native_recovery_candidate_endpoint = ""
+                verifying = bool(getattr(self, "_native_recovery_pending", False))
+                if verifying:
+                    self._last_segment_health = "degraded"
+                    self._last_capture_issue = "verifying media speed"
+            if verifying:
+                logging.info(f"[cdn] room={self.room_id} media ready; verifying sustained speed")
+                try:
+                    self.segment_health_updated.emit(self.room_id, "degraded", "verifying media speed")
+                except Exception:
+                    pass
+            elif getattr(self, "_capture_mode", None) == "flv_bridge":
                 self._last_segment_health = "healthy"
                 self._last_capture_issue = ""
-            if was_recovery_pending:
-                self._cdn_failovers = int(getattr(self, "_cdn_failovers", 0) or 0) + 1
-                self._reconnects = int(getattr(self, "_reconnects", 0) or 0) + 1
-                flv_health = getattr(self, "_flv_health", None)
-                if flv_health is not None:
-                    flv_health.complete_failover(recovered_at, True)
-                recovery_ms = max(0, int(round((recovered_at - started_at) * 1000.0))) if started_at else 0
-                logging.warning(
-                    f"[cdn] room={self.room_id} recovered reason={reason or 'cdn_recovery'} "
-                    f"from={from_endpoint or 'unknown'} to={to_endpoint or 'unknown'} "
-                    f"recovery_ms={recovery_ms}"
-                )
-            try:
-                self.segment_health_updated.emit(self.room_id, "healthy", "stream recovered")
-            except Exception:
-                pass
+                try:
+                    self.segment_health_updated.emit(self.room_id, "healthy", "stream ready")
+                except Exception:
+                    pass
 
     def _recording_save_root(self) -> str:
         """Directory used for disk free-space checks."""
@@ -1814,15 +1974,25 @@ class BiliRecorder(QObject):
                 snapshot = self._flv_session.progress_snapshot()
                 decision = getattr(self, "_last_flv_health_decision", None)
                 lag_ms = int(decision.lag_ms) if decision is not None else 0
+                media_ms = decision.media_progress_ms if decision is not None else snapshot.media_progress_ms
+                generation = decision.transport_generation if decision is not None else snapshot.transport_generation
+                media_speed = (f"{decision.speed_ratio:.2f}x" if decision is not None
+                               and decision.speed_ratio is not None else "warming")
+                if decision is not None:
+                    health = "degraded" if (decision.state in ("degraded", "failover_pending")
+                        or getattr(self, "_native_recovery_pending", False)) else decision.state
+                    issue = ("verifying media speed; " if getattr(self, "_native_recovery_pending", False)
+                             else "") + decision.detail
                 cooldown = 0
                 if self._flv_health is not None:
                     cooldown = max(
                         0, int(getattr(self._flv_health, "_cooldown_until", 0.0) - time.monotonic())
                     )
                 media_detail = (
-                    f" media_ms={snapshot.media_progress_ms} gen={snapshot.transport_generation} "
+                    f" media_ms={media_ms} gen={generation} media_speed={media_speed} "
                     f"lag_ms={lag_ms} cdn={self._cdn_index + 1}/{len(self._cdn_candidates)} "
-                    f"failovers={self._cdn_failovers} cooldown_s={cooldown}"
+                    f"failovers={self._cdn_failovers} attempts={getattr(self, '_cdn_attempts', 0)} "
+                    f"cooldown_s={cooldown}"
                 )
             except Exception:
                 media_detail = ""
@@ -1863,6 +2033,7 @@ class BiliRecorder(QObject):
         self._native_recovery_deadline = 0.0
         self._native_outage_started_at = 0.0
         self._native_disconnect_boundary_closed = False
+        self._clear_native_fault_context()
         source_events_lock = getattr(self, "_source_events_lock", None)
         source_events = getattr(self, "_source_events", None)
         if source_events_lock is not None and source_events is not None:

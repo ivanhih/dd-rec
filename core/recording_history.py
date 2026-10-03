@@ -35,6 +35,7 @@ def append_recording(entry: dict[str, Any]) -> dict[str, Any]:
         "status": str(entry.get("status") or ""),
         "close_reason": str(entry.get("close_reason") or ""),
         "session_id": str(entry.get("session_id") or ""),
+        "continuity": dict(entry.get("continuity") or {}),
     }
     line = json.dumps(record, ensure_ascii=False)
     with _LOCK:

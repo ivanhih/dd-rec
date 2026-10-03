@@ -27,6 +27,7 @@ class StreamSourceStats:
     last_error: str = ""
     started_at: float = 0.0
     stopped_at: float = 0.0
+    last_data_at: float = 0.0  # monotonic clock, unlike the wall-clock lifecycle dates
 
 
 class StreamSource:
@@ -102,9 +103,12 @@ class StreamSource:
                 pass
             with self._resp_lock:
                 self._resp = resp
+            # read(n) can wait for all n bytes even while a low-bitrate source is
+            # arriving normally. read1 returns the currently available socket data.
+            read_chunk = getattr(resp, "read1", None) or resp.read
             while not self._stop.is_set():
                 try:
-                    chunk = resp.read(self.read_size)
+                    chunk = read_chunk(self.read_size)
                 except (TimeoutError, socket.timeout) as e:
                     if self._stop.is_set():
                         reason = "stop"
@@ -121,6 +125,7 @@ class StreamSource:
                     reason = "eof"
                     break
                 self.stats.bytes_read += len(chunk)
+                self.stats.last_data_at = time.monotonic()
                 try:
                     self.on_data(chunk)
                 except Exception as e:

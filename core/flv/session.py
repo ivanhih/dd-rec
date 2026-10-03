@@ -46,6 +46,13 @@ class SegmentInfo:
     audio_config_present: bool = False
     audio_sample_rate: Optional[int] = None
     audio_config_size: int = 0
+    diagnostics_version: int = 1
+    wall_duration_ms: int = 0
+    media_progress_gap_ms: int = 0
+    health_intervals: List[dict] = field(default_factory=list)
+    transport_gaps: List[dict] = field(default_factory=list)
+    recovery_events: List[dict] = field(default_factory=list)
+    continuity_log_path: str = ""
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -56,6 +63,7 @@ class FlvProgressSnapshot:
     transport_generation: int
     media_progress_ms: int
     has_media: bool
+    bytes_in: int = 0
 
 
 class FlvCaptureSession:
@@ -70,6 +78,7 @@ class FlvCaptureSession:
         max_segment_bytes: int = 0,
         require_audio: bool = True,
         require_video: bool = True,
+        diagnostics_path: Optional[str] = None,
     ):
         self._path_factory = path_factory
         self._on_event = on_event or (lambda e, d: None)
@@ -77,6 +86,10 @@ class FlvCaptureSession:
         self.max_segment_bytes = max_segment_bytes
         self.require_audio = require_audio
         self.require_video = require_video
+        self._diagnostics_path = diagnostics_path or ""
+        self._session_monotonic = time.monotonic()
+        self._transport_gap: Optional[dict] = None
+        self._pending_transport_gaps: List[dict] = []
 
         self._parser = FlvTagParser()
         self._headers = StreamHeaders()
@@ -105,6 +118,8 @@ class FlvCaptureSession:
         self._progress_committed_ms = 0
         self._progress_epoch_ms = 0
         self._progress_has_media = False
+        self._progress_bytes_in = 0
+        self._opened_monotonic = 0.0
 
     # ---- public API ----
     def start(self):
@@ -124,6 +139,10 @@ class FlvCaptureSession:
         """HTTP 重连/源替换：关当前段、清 parser/ts/headers，开启新 transport generation。"""
         with self._lock:
             self._close_writer(reason or "reconnect")
+            if self._transport_gap is None:
+                self._transport_gap = {"start_ms": self._relative_time(time.monotonic()),
+                                       "reason": str(reason)[:120]}
+                self._write_diagnostic(dict(self._transport_gap, event="transport_gap_started"))
             self._transport_generation = max(1, int(self._transport_generation or 0) + 1)
             self._reset_transport_progress()
             if source_generation is not None:
@@ -143,7 +162,63 @@ class FlvCaptureSession:
                 transport_generation=int(self._transport_generation or 0),
                 media_progress_ms=self._media_progress_ms_unlocked(),
                 has_media=bool(self._progress_has_media),
+                bytes_in=int(self._progress_bytes_in),
             )
+
+    def note_transport_health(self, state: str, detail: str, now: float):
+        """Record relative anomaly intervals without cutting a writable segment."""
+        with self._lock:
+            if self._current is None:
+                return
+            elapsed = max(0, round((float(now) - self._opened_monotonic) * 1000))
+            intervals = self._current.health_intervals
+            active = intervals[-1] if intervals and intervals[-1].get("end_ms") is None else None
+            degraded = state in ("degraded", "failover_pending", "verifying")
+            if not degraded:
+                if active:
+                    active["end_ms"] = elapsed
+                return
+            self._current.health = "degraded"
+            if active is None:
+                # Bound manifest growth on an unusually noisy, long segment.
+                if len(intervals) >= 256:
+                    return
+                intervals.append({"state": state, "start_ms": elapsed,
+                                  "end_ms": None, "detail": detail[:240]})
+            else:
+                active["detail"] = detail[:240]
+
+    def _relative_time(self, now: float) -> int:
+        return max(0, round((now - self._session_monotonic) * 1000))
+
+    def _write_diagnostic(self, event: dict):
+        if not self._diagnostics_path:
+            return
+        try:
+            os.makedirs(os.path.dirname(self._diagnostics_path) or ".", exist_ok=True)
+            with open(self._diagnostics_path, "a", encoding="utf-8") as handle:
+                handle.write(json.dumps(event, ensure_ascii=False) + "\n")
+        except OSError:
+            logger.debug("write continuity journal failed", exc_info=True)
+
+    def _finish_transport_gap(self, now: float, outcome: str):
+        if self._transport_gap is None:
+            return
+        gap = dict(self._transport_gap, end_ms=self._relative_time(now), outcome=outcome)
+        gap["duration_ms"] = max(0, gap["end_ms"] - gap["start_ms"])
+        self._pending_transport_gaps.append(gap)
+        self._pending_transport_gaps = self._pending_transport_gaps[-64:]
+        self._write_diagnostic(dict(gap, event="transport_gap_closed"))
+        self._transport_gap = None
+
+    def note_recovery_outcome(self, outcome: str, now: float):
+        with self._lock:
+            event = {"event": outcome, "at_ms": self._relative_time(now),
+                     "source_generation": self._active_source_generation}
+            self._write_diagnostic(event)
+            if self._current is not None:
+                self._current.recovery_events.append(event)
+                self._current.recovery_events = self._current.recovery_events[-64:]
 
     def _media_progress_ms_unlocked(self) -> int:
         return max(0, int(self._progress_committed_ms) + int(self._progress_epoch_ms))
@@ -152,6 +227,7 @@ class FlvCaptureSession:
         self._progress_committed_ms = 0
         self._progress_epoch_ms = 0
         self._progress_has_media = False
+        self._progress_bytes_in = 0
 
     def _commit_epoch_progress(self):
         self._progress_committed_ms = self._media_progress_ms_unlocked()
@@ -196,6 +272,7 @@ class FlvCaptureSession:
             ):
                 return
             self._total_bytes_in += len(data)
+            self._progress_bytes_in += len(data)
             try:
                 header, tags = feed_filter(self._parser, data)
             except FlvParseError as e:
@@ -242,6 +319,7 @@ class FlvCaptureSession:
 
     def close(self, reason: str = "stop") -> List[SegmentInfo]:
         with self._lock:
+            self._finish_transport_gap(time.monotonic(), "stopped")
             self._active = False
             self._pending_cut_reason = None
             self._pending_next_path = None
@@ -463,10 +541,13 @@ class FlvCaptureSession:
             has_video=self._headers.video_seq is not None or not self.require_video,
         )
         self._writer.open(hdr)
+        self._finish_transport_gap(time.monotonic(), "media_ready")
         self._current = SegmentInfo(
             path=path,
             index=self._segment_index,
             opened_at=time.time(),
+            transport_gaps=list(self._pending_transport_gaps),
+            continuity_log_path=self._diagnostics_path,
             video_config_present=self._headers.video_seq is not None,
             audio_config_present=(
                 self._headers.audio_seq is not None
@@ -483,6 +564,8 @@ class FlvCaptureSession:
                 else 0
             ),
         )
+        self._opened_monotonic = time.monotonic()
+        self._pending_transport_gaps.clear()
         self._reset_timestamp_epoch(commit=True)
         self._emit(
             CaptureEvent.SEGMENT_OPENED,
@@ -520,6 +603,14 @@ class FlvCaptureSession:
             logger.warning(f"close flv writer failed: {e}")
         if self._current is not None:
             self._current.closed_at = time.time()
+            self._current.wall_duration_ms = max(0, round(
+                (time.monotonic() - self._opened_monotonic) * 1000
+            ))
+            self._current.media_progress_gap_ms = max(
+                0, self._current.wall_duration_ms - self._current.duration_ms
+            )
+            if self._current.health_intervals and self._current.health_intervals[-1].get("end_ms") is None:
+                self._current.health_intervals[-1]["end_ms"] = self._current.wall_duration_ms
             self._current.close_reason = reason
             self._current.bytes_written = self._writer.bytes_written if self._writer else self._current.bytes_written
             if self._current.tag_count == 0 or not self._current.started_with_keyframe:

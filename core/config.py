@@ -216,6 +216,13 @@ DEFAULT_GLOBAL_SETTINGS = {
     "flv_cdn_failover_cooldown_sec": 60,
     "flv_cdn_endpoint_quarantine_sec": 300,
     "flv_cdn_outage_restart_sec": 300,
+    "flv_cdn_speed_window_sec": 20,
+    "flv_cdn_slow_speed_ratio": 0.8,
+    "flv_cdn_recovery_speed_ratio": 0.95,
+    "flv_cdn_recovery_sustain_sec": 20,
+    "flv_cdn_media_stall_sec": 15,
+    "flv_cdn_refresh_interval_sec": 30,
+    "flv_cdn_allow_quality_change": False,
 
     # 直播监控
     "monitor_delay": "自动",

@@ -2,7 +2,7 @@
 
 B 站直播自动录制桌面客户端。支持多房间监控、FLV 原生捕获、弹幕落盘、按时长/大小切割、Webhook 通知，以及 Portable 自动更新。
 
-当前版本：**1.0.8**（见 [`version.py`](version.py)）
+当前版本：**1.0.9**（见 [`version.py`](version.py)）
 
 ---
 
